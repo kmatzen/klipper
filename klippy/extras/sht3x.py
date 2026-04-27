@@ -89,11 +89,8 @@ class SHT3X:
 
         status = self.i2c.i2c_read(SHT3X_CMD['OTHER']['STATUS']['READ'], 3)
         response = bytearray(status['response'])
-        status = response[0] << 8
-        status |= response[1]
-        checksum = response[2]
 
-        if self._crc8(status) != checksum:
+        if self._crc8(response[0:2]) != response[2]:
             logging.warning("sht3x: Reading status - checksum error!")
 
         # Enable periodic mode
@@ -122,21 +119,19 @@ class SHT3X:
                 raise error
 
             response = bytearray(params['response'])
-            rtemp  = response[0] << 8
-            rtemp |= response[1]
-            if self._crc8(rtemp) != response[2]:
+            if self._crc8(response[0:2]) != response[2]:
                 logging.warning(
                     "sht3x: Checksum error on Temperature reading!"
                 )
             else:
+                rtemp = (response[0] << 8) | response[1]
                 self.temp = -45 + (175 * rtemp / 65535)
                 logging.debug("sht3x: Temperature %.2f " % self.temp)
 
-            rhumid  = response[3] << 8
-            rhumid |= response[4]
-            if self._crc8(rhumid) != response[5]:
+            if self._crc8(response[3:5]) != response[5]:
                 logging.warning("sht3x: Checksum error on Humidity reading!")
             else:
+                rhumid = (response[3] << 8) | response[4]
                 self.humidity = 100 * rhumid / 65535
                 logging.debug("sht3x: Humidity %.2f " % self.humidity)
 
@@ -155,18 +150,10 @@ class SHT3X:
         self._callback(print_time, self.temp)
         return measured_time + self.report_time
 
-    def _split_bytes(self, data):
-        bytes = []
-        for i in range((data.bit_length() + 7) // 8):
-            bytes.append((data >> i*8) & 0xFF)
-        bytes.reverse()
-        return bytes
-
-    def _crc8(self, data):
-        #crc8 polynomial for 16bit value, CRC8 -> x^8 + x^5 + x^4 + 1
-        SHT3X_CRC8_POLYNOMINAL= 0x31
+    def _crc8(self, data_bytes):
+        #crc8 polynomial CRC8 -> x^8 + x^5 + x^4 + 1
+        SHT3X_CRC8_POLYNOMINAL = 0x31
         crc = 0xFF
-        data_bytes = self._split_bytes(data)
         for byte in data_bytes:
             crc ^= byte
             for _ in range(8):
