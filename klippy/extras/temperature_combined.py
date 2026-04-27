@@ -91,7 +91,7 @@ class PrinterSensorCombined:
                 % (self.max_deviation, max(values), min(values),))
 
         temp = self.apply_mode(values)
-        if temp:
+        if temp is not None:
             self.last_temp = temp
 
     def get_temp(self, eventtime):
