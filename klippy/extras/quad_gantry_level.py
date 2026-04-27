@@ -100,7 +100,7 @@ class QuadGantryLevel:
         for z in z_height:
             z_adjust.append(z_ave - z)
 
-        adjust_max = max(z_adjust)
+        adjust_max = max(abs(a) for a in z_adjust)
         if adjust_max > self.max_adjust:
             raise self.gcode.error("Aborting quad_gantry_level"
                                    " required adjustment %0.6f"
