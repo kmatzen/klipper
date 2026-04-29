@@ -3,7 +3,7 @@
 # Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import json, sys, os, optparse, logging, re, subprocess, time
+import json, sys, os, optparse, logging, re, socket, subprocess, time
 
 # Python 2.7 compatibility - test_klippy.py is run under both python2 and
 # python3 in CI.
@@ -63,7 +63,7 @@ class TestCase:
         emulator_fixture = None
         log_required = []
         log_forbidden = []
-        should_fail = multi_tests = False
+        should_fail = multi_tests = allow_shutdown = False
         gcode = []
         f = open(self.fname, 'r')
         for raw_line in f:
@@ -107,6 +107,8 @@ class TestCase:
                 log_forbidden.append(_parse_quoted(parts[1]))
             elif parts[0] == "SHOULD_FAIL":
                 should_fail = True
+            elif parts[0] == "ALLOW_SHUTDOWN":
+                allow_shutdown = True
             else:
                 gcode.append(raw_line.strip())
         f.close()
@@ -126,10 +128,10 @@ class TestCase:
         if not multi_tests:
             self.launch_test(config_fname, dict_fnames, gcode_fname, gcode,
                              should_fail, emulator_fixture, log_required,
-                             log_forbidden)
+                             log_forbidden, allow_shutdown)
     def launch_test(self, config_fname, dict_fnames, gcode_fname, gcode,
                     should_fail, emulator_fixture=None, log_required=None,
-                    log_forbidden=None):
+                    log_forbidden=None, allow_shutdown=False):
         # Under --force-emulator, skip subtests whose dict file isn't
         # present in dictdir. printers.test iterates ~30 MCU configs
         # and the emulator-test Docker image only builds the AVR
@@ -167,8 +169,22 @@ class TestCase:
             res, log_path = self._launch_fileoutput_test(
                 config_fname, dict_fnames, gcode_fname)
         is_fail = (should_fail and not res) or (not should_fail and res)
-        if not is_fail and (log_required or log_forbidden):
-            mismatch = self._check_log(log_path, log_required, log_forbidden)
+        # Emulator-mode tests by default surface silent klippy shutdowns
+        # as failures - the runner's exit-code check alone misses them
+        # because klippy logs "Transition to shutdown state" then exits
+        # cleanly. Tests that legitimately exercise a shutdown path
+        # opt out via ALLOW_SHUTDOWN.
+        effective_forbidden = list(log_forbidden or ())
+        if (emulator_fixture is not None and not should_fail
+                and not allow_shutdown):
+            effective_forbidden.extend([
+                r'Transition to shutdown state',
+                r'Klippy is shutdown',
+                r'Internal error',
+            ])
+        if not is_fail and (log_required or effective_forbidden):
+            mismatch = self._check_log(log_path, log_required,
+                                       effective_forbidden)
             if mismatch is not None:
                 is_fail = True
                 sys.stderr.write("    Log assertion failure: %s\n"
@@ -284,7 +300,7 @@ class TestCase:
         return res, TEMP_LOG_FILE
 
     _STEPPER_RE = re.compile(r'^\[(stepper_[a-z0-9_]+)\]\s*$')
-    _PIN_RE = re.compile(r'^\s*([a-z_]+_pin)\s*:\s*([!^~]*)([A-L]\d+)\s*'
+    _PIN_RE = re.compile(r'^\s*([a-z_]+_pin)\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
                          r'(?:#.*)?$')
 
     @classmethod
@@ -372,6 +388,43 @@ class TestCase:
             steppers.append(current)
         return steppers
 
+    _EXTRUDER_SECTION_RE = re.compile(r'^\[(extruder\d*)\]\s*$')
+
+    @classmethod
+    def _parse_extruder_sensor_pins(cls, config_fname):
+        # Walk [extruder] / [extruder1] / [extruder2] / ... sections
+        # and yield (section_name, sensor_pin) pairs in declaration
+        # order. Used to apply a hot ADC default to extruder pins so
+        # tests with extrusion gcode pass min_extrude_temp without
+        # per-test fixture scripting.
+        out = []
+        current = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return out
+        try:
+            for line in f:
+                m = cls._EXTRUDER_SECTION_RE.match(line)
+                if m:
+                    current = m.group(1)
+                    continue
+                if line.strip().startswith('['):
+                    current = None
+                    continue
+                if current is None:
+                    continue
+                m = cls._PIN_RE.match(line)
+                if not m:
+                    continue
+                key, _flags, bare = m.groups()
+                if key == 'sensor_pin':
+                    out.append((current, bare))
+                    current = None
+        finally:
+            f.close()
+        return out
+
     @staticmethod
     def _adc_channel_for_pin(pin_name):
         # atmega ADC channel layout:
@@ -423,8 +476,8 @@ class TestCase:
                 # home_wait timeout. Triggered = pin_value=1 (klippy
                 # XORs with the `!` invert flag from the cfg).
                 lines.append("step_trigger %s %d 100 %s %d 1" % (
-                    step_p[0], int(step_p[1:]),
-                    end_p[0], int(end_p[1:])))
+                    step_p[1], int(step_p[2:]),
+                    end_p[1], int(end_p[2:])))
         # bltouch + auto_trigger_after_steps: configure the bridge's
         # BLTouch state machine on the [bltouch] control/sensor pins,
         # AND wire a step_trigger from the Z stepper (the one driving
@@ -457,7 +510,7 @@ class TestCase:
                             break
                     if z_step_pin is not None:
                         lines.append("step_trigger %s %d %d %s %d 1" % (
-                            z_step_pin[0], int(z_step_pin[1:]),
+                            z_step_pin[1], int(z_step_pin[2:]),
                             int(ats),
                             sens[1], int(sens[2:])))
         adc_default = raw.get('analog_in_default', {})
@@ -481,6 +534,32 @@ class TestCase:
             if ch is None:
                 continue
             lines.append("adc %d %d" % (ch, _raw_to_mv(raw_value)))
+        # _hot_extruder_N entries in the fixture's analog_in block
+        # apply a hot ADC value (default ~190 C with EPCOS 100K) to
+        # the Nth [extruder*] section's sensor_pin in the cfg, so
+        # tests with extrusion gcode get past klippy's min_extrude_temp
+        # without per-test fixture scripting. N is the section index
+        # in declaration order: extruder=0, extruder1=1, etc.
+        analog_in = raw.get('analog_in', {})
+        if analog_in and config_fname is not None:
+            extruder_pins = self._parse_extruder_sensor_pins(config_fname)
+            for label, spec in analog_in.items():
+                if not label.startswith('_hot_extruder_'):
+                    continue
+                try:
+                    idx = int(label[len('_hot_extruder_'):])
+                except ValueError:
+                    continue
+                if idx < 0 or idx >= len(extruder_pins):
+                    continue
+                _name, pin = extruder_pins[idx]
+                ch = self._adc_channel_for_pin(pin)
+                if ch is None:
+                    continue
+                rv = spec.get('default_value')
+                if rv is None:
+                    continue
+                lines.append("adc %d %d" % (ch, _raw_to_mv(rv)))
         # spi_response: a hex byte stream the bridge round-robins
         # back to klipper as MISO data. Tests with thermocouples or
         # similar SPI-resident sensors use this to keep the firmware
@@ -530,19 +609,25 @@ class TestCase:
         try:
             for line in lines:
                 sock.sendall((line + '\n').encode('ascii'))
+            # Send a barrier and wait for the bridge's "OK" so the
+            # IRQ events we just queued have been dispatched in
+            # simulated time before we let klippy connect. Bound the
+            # wall-clock wait to keep a stuck bridge from hanging
+            # CI - 5 s is far longer than 2 ms of simulated time
+            # ever takes on a working host.
+            try:
+                sock.sendall(b'barrier 200000\n')
+                sock.settimeout(5.0)
+                ack = b''
+                while b'\n' not in ack and len(ack) < 16:
+                    chunk = sock.recv(16 - len(ack))
+                    if not chunk:
+                        break
+                    ack += chunk
+            except (OSError, socket.timeout):
+                pass
         finally:
             sock.close()
-        # Brief settle wait so simavr's IRQ event queue drains before
-        # klippy starts issuing config_analog_in / SPI / I2C reads.
-        # The bridge's control thread queues IRQ events via
-        # avr_raise_irq (thread-safe) but they're only dispatched at
-        # the next AVR cycle. Under load that lag can let klippy's
-        # firmware sample an ADC channel BEFORE our pushed value
-        # lands - klippy's range_check_count tolerates a few stale
-        # zeros, but high-deviation tests like temperature.test trip
-        # right at the boundary. 200 ms gives enough headroom on
-        # contended hosts where simavr falls behind wall-clock pace.
-        time.sleep(0.2)
 
     def _find_elf_for_dict(self, dict_path):
         # The Dockerfile builds a parallel ci_build/elf/<mcu>.elf

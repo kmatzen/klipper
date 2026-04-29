@@ -1,6 +1,7 @@
 # Test case for pwm
 CONFIG pwm.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # Hard PWM
 # Basic test

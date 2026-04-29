@@ -298,9 +298,13 @@ static avr_t *g_avr_for_step = NULL;
 /* Cache of (port,pin) hook registrations to avoid double-registering.
  * Indexed by port_idx*8 + pin. 12 ports * 8 pins = 96 slots. */
 static int g_step_hook_registered[96] = {0};
+/* Same cache for the trigger-pin notify hooks (for auto-rearm on
+ * transitions back to NOT-triggered between multi-sample probes). */
+static int g_trigger_hook_registered[96] = {0};
 
 /* Forward decl - definition lives further down with the SPI hook. */
 static void step_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+static void trigger_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
 struct control_ctx {
     avr_t *avr;
@@ -502,6 +506,22 @@ apply_step_trigger(struct control_ctx *ctx,
         g_step_hook_registered[(step_port_ord - 'A') * 8 + step_pin] = 1;
     }
 
+    /* Hook the trigger pin so we can auto-rearm this entry when the
+     * pin transitions back to NOT-triggered (e.g. the BLTouch state
+     * machine resets the sensor between multi-sample probes). For
+     * one-shot endstops nothing else drives the pin so it stays at
+     * trigger_value forever and never re-arms - that's correct. */
+    avr_irq_t *trig_irq = avr_io_getirq(
+        ctx->avr,
+        AVR_IOCTL_IOPORT_GETIRQ((char)trig_port_ord),
+        trig_pin);
+    if (trig_irq && !g_trigger_hook_registered[(trig_port_ord - 'A') * 8
+                                                + trig_pin]) {
+        g_avr_for_step = ctx->avr;
+        avr_irq_register_notify(trig_irq, trigger_pin_hook, NULL);
+        g_trigger_hook_registered[(trig_port_ord - 'A') * 8 + trig_pin] = 1;
+    }
+
     if (ctx->verbose)
         fprintf(stderr,
             "simavr_bridge: step_trigger step=%c%d count=%u "
@@ -626,6 +646,47 @@ step_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param)
         if (t)
             avr_raise_irq(t, trig_val);
     }
+}
+
+/* Hook on a step_trigger entry's trigger pin. Whenever the pin
+ * transitions back to its NOT-triggered state (the inverse of
+ * trigger_value), reset count_seen and re-arm any matching entries
+ * so the next round of step pulses can fire the trigger again.
+ * Multi-sample probes (screws_tilt_adjust, bed_mesh) need this:
+ * the BLTouch state machine resets the sensor to NOT-triggered
+ * between samples, and we re-arm so the second/third probe can
+ * see another touch.
+ *
+ * For one-shot endstops nothing else drives the trigger pin, so
+ * after the home fires once the pin stays at trigger_value forever
+ * and trigger_pin_hook never re-arms - matching the one-shot
+ * semantics that home loops want. */
+static void
+trigger_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)param;
+    int prev = (int)irq->value;
+    int next = value ? 1 : 0;
+    if (prev == next)
+        return;
+    avr_t *avr = g_avr_for_step;
+    if (!avr)
+        return;
+    pthread_mutex_lock(&step_lock);
+    for (int i = 0; i < step_trigs_count; i++) {
+        avr_irq_t *expect = avr_io_getirq(
+            avr, AVR_IOCTL_IOPORT_GETIRQ(step_trigs[i].trigger_port),
+            step_trigs[i].trigger_pin);
+        if (expect != irq)
+            continue;
+        /* We only re-arm on transitions AWAY from trigger_value.
+         * Transitions TO trigger_value are us firing the trigger. */
+        if (next != step_trigs[i].trigger_value) {
+            step_trigs[i].count_seen = 0;
+            step_trigs[i].armed = 1;
+        }
+    }
+    pthread_mutex_unlock(&step_lock);
 }
 
 /* Hook on the BLTouch control pin. Klippy drives this with software
@@ -910,7 +971,32 @@ control_socket_thread(void *arg)
             char *nl;
             while ((nl = strchr(start, '\n')) != NULL) {
                 *nl = '\0';
-                apply_control_line(ctx, start);
+                /* `barrier <usec>` blocks until simavr's cycle counter
+                 * has advanced <usec> microseconds of simulated time
+                 * past the moment we received the command, then writes
+                 * "OK\n" back to the client. The runner uses this to
+                 * ensure pushed IRQ events (avr_raise_irq) have been
+                 * dispatched by the simavr loop before klippy starts
+                 * sampling - much more reliable than a wall-clock
+                 * sleep, which falls behind under host CPU load. */
+                if (strncmp(start, "barrier", 7) == 0
+                        && (start[7] == '\0' || start[7] == ' ')) {
+                    unsigned int usec = 1000;
+                    if (start[7] == ' ')
+                        sscanf(start + 8, "%u", &usec);
+                    avr_cycle_count_t target = ctx->avr->cycle
+                        + (avr_cycle_count_t)usec
+                          * (ctx->avr->frequency / 1000000ULL);
+                    while (g_running && ctx->avr->cycle < target) {
+                        struct timespec ts = {0, 1000000};  /* 1 ms */
+                        nanosleep(&ts, NULL);
+                    }
+                    const char *ok = "OK\n";
+                    ssize_t w = write(cli, ok, 3);
+                    (void)w;
+                } else {
+                    apply_control_line(ctx, start);
+                }
                 start = nl + 1;
             }
             /* Shift any partial line back to the front of the buffer. */

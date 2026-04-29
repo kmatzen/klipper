@@ -1,5 +1,6 @@
 # Tests for miscellaneous g-code commands
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 CONFIG macros.cfg
 
 # Run TESTIT macro
