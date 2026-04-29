@@ -1,0 +1,33 @@
+# Migration prototype: emulator-mode version of manual_stepper.test.
+# Uses the same manual_stepper.cfg unmodified (test_klippy.py rewrites
+# the [mcu] serial: line at run time).
+CONFIG manual_stepper.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_pwm.fixture.json
+
+# Test basic moves
+MANUAL_STEPPER STEPPER=basic_stepper ENABLE=1
+MANUAL_STEPPER STEPPER=basic_stepper SET_POSITION=0
+MANUAL_STEPPER STEPPER=basic_stepper MOVE=10 SPEED=10
+MANUAL_STEPPER STEPPER=basic_stepper MOVE=5
+MANUAL_STEPPER STEPPER=basic_stepper MOVE=12 SPEED=12 ACCEL=9000.2
+MANUAL_STEPPER STEPPER=basic_stepper ENABLE=0
+
+# Test long move
+MANUAL_STEPPER STEPPER=basic_stepper MOVE=300 SPEED=10 ACCEL=2000
+MANUAL_STEPPER STEPPER=basic_stepper MOVE=100 SPEED=10 ACCEL=2000
+
+# Test motor off
+M84
+
+# Register with g-code
+MANUAL_STEPPER STEPPER=basic_stepper GCODE_AXIS=A
+G1 A10
+GET_POSITION
+
+# Test unregistering
+MANUAL_STEPPER STEPPER=basic_stepper GCODE_AXIS=
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

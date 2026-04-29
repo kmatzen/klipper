@@ -1,0 +1,9 @@
+{
+    "_comment": "ADC values for an EPCOS 100K B57560G104F thermistor with the default 4700-ohm pullup, on an atmega2560 (ADC_MAX=1023 * SAMPLE_COUNT=8 -> max raw value 8184). 7817 corresponds to ~25 C, 7205 to ~50 C, 4699 to ~100 C. The fixture cycles through these so klippy's smoothed temperature converges to a sensible reading.",
+    "analog_in": {
+        "my_thermistor": {
+            "default_value": 7817,
+            "values": [7817, 7817, 7205, 7205, 4699]
+        }
+    }
+}

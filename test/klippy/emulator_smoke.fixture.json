@@ -1,0 +1,15 @@
+{
+    "_comment": "Scripted i2c reads for the SHT3X sensor in the smoke test. The first read is _init_sht3x's status register query: bytes [0x00, 0x10, 0xc2] = (high=0, low=0x10, crc8=0xc2 over [0x00,0x10]); the high byte is 0 because only the SHT3X 'system reset detected' bit (bit 4) is set after soft-reset. Subsequent reads are _sample_sht3x's measurement fetches: temp 0x6666 (~25 C, crc=0x93) followed by humidity 0x8000 (~50% RH, crc=0xa2). All CRCs are SHT3X-spec CCITT-CRC8 (poly 0x31, init 0xff).",
+    "i2c": {
+        "sht3x": {
+            "reads": [
+                [0, 16, 194],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162]
+            ]
+        }
+    }
+}

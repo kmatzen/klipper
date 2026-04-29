@@ -1,0 +1,21 @@
+# End-to-end test of periodic ADC sampling through the emulator.
+#
+# Klippy configures a thermistor temperature_sensor; the emulator
+# answers query_analog_in with periodic analog_in_state responses
+# carrying scripted ADC values. Klippy decodes the values into
+# temperatures via thermistor.py.
+#
+# Asserts klippy connected, configured, and stayed running long
+# enough to consume the periodic ADC stream without erroring out.
+CONFIG emulator_thermistor.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_thermistor.fixture.json
+
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

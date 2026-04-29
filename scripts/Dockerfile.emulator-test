@@ -1,0 +1,71 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    gcc make libffi-dev build-essential \
+    gcc-avr avr-libc \
+    git libelf-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build simavr from upstream rather than using Ubuntu's 1.6 package.
+# The packaged version has a known issue dispatching interrupts across
+# the `sei; nop; cli` pattern that klipper's irq_wait() relies on -
+# IRQs get raised but the I-flag-pending dispatch never happens, so
+# klipper firmware spins in run_tasks waiting for SchedStatus to flip.
+# Upstream master fixed this; we also need uart_pty from
+# examples/parts which the install target doesn't ship.
+RUN git clone --depth 1 \
+        https://github.com/buserror/simavr.git /tmp/simavr \
+    && cd /tmp/simavr \
+    && make build-simavr install RELEASE=1 DESTDIR=/usr/local 2>&1 | tail -5 \
+    && mkdir -p /usr/local/include/simavr/parts \
+    && cp examples/parts/uart_pty.h /usr/local/include/simavr/parts/ \
+    && cp examples/parts/uart_pty.c /usr/local/include/simavr/parts/ \
+    && rm -rf /tmp/simavr \
+    && ldconfig
+
+WORKDIR /klipper
+COPY . /klipper
+
+RUN rm -rf out .config .config.old \
+        klippy/__pycache__ klippy/extras/__pycache__ \
+        klippy/kinematics/__pycache__ klippy/chelper/__pycache__ \
+        test/emulator/__pycache__ test/__pycache__ \
+    || true
+
+RUN python3 -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir \
+        greenlet cffi Jinja2 markupsafe pyserial python-can msgspec \
+        numpy scipy
+
+# Build .dict and .elf files for every AVR config the test harness
+# might reference. The .elf is what the simavr-based bridge will run
+# (cycle-accurate firmware execution), the .dict is what klippy uses
+# to interpret the protocol.
+RUN mkdir -p ci_build/dict ci_build/elf \
+    && for cfg in atmega2560 atmega1280 atmega1284p atmega644p \
+                  at90usb1286; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
+# Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
+# and links against libsimavr; produces the binary that runs the
+# klipper firmware and exposes its UART as a pty for klippy plus a
+# control socket for fixture-driven physical state.
+RUN gcc -O2 -Wall -Wextra \
+        -I/usr/local/include/simavr \
+        -L/usr/local/lib \
+        -o ci_build/simavr_bridge \
+        test/emulator/simavr_bridge.c \
+        /usr/local/include/simavr/parts/uart_pty.c \
+        -lsimavr -lpthread -lutil -lelf
+
+RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi()"
+
+CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", "test/klippy/emulator_smoke.test", "test/klippy/sht3x_crc_regression.test"]

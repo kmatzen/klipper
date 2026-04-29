@@ -1,0 +1,35 @@
+# Migration prototype: same scenario as pwm.test, but driven through
+# the in-process MCU emulator instead of fileoutput mode.
+#
+# Reuses test/klippy/pwm.cfg unchanged - test_klippy.py rewrites the
+# [mcu] serial: line at run time when EMULATOR is set, so existing
+# .cfg files work in emulator mode without modification.
+CONFIG pwm.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_pwm.fixture.json
+
+# Hard PWM
+SET_PIN PIN=hard_pwm_pin VALUE=0
+SET_PIN PIN=hard_pwm_pin VALUE=0.5
+SET_PIN PIN=hard_pwm_pin VALUE=0.5
+SET_PIN PIN=hard_pwm_pin VALUE=0.25
+SET_PIN PIN=hard_pwm_pin VALUE=1
+
+# Soft PWM
+SET_PIN PIN=soft_pwm_pin VALUE=0
+SET_PIN PIN=soft_pwm_pin VALUE=0.5
+SET_PIN PIN=soft_pwm_pin VALUE=1
+
+# Soft PWM with dynamic cycle time
+SET_PIN PIN=cycle_pwm_pin VALUE=0 CYCLE_TIME=0.1
+SET_PIN PIN=cycle_pwm_pin VALUE=1 CYCLE_TIME=0.5
+SET_PIN PIN=cycle_pwm_pin VALUE=0.5 CYCLE_TIME=0.001
+
+# PWM tool
+SET_PIN PIN=test_pwm_tool VALUE=0
+SET_PIN PIN=test_pwm_tool VALUE=0.5
+SET_PIN PIN=test_pwm_tool VALUE=1
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

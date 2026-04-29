@@ -1,0 +1,3 @@
+{
+    "_comment": "PWM commands are write-only and don't need scripted device data; the fixture is intentionally empty."
+}

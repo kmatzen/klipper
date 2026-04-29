@@ -1,6 +1,7 @@
 # Test case for bed screws tilt helper tool
 CONFIG screws_tilt_adjust.cfg
 DICTIONARY atmega2560.dict
+EMULATOR screws_tilt_adjust.fixture.json
 
 # Simple script to test
 G28

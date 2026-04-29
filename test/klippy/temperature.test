@@ -1,6 +1,7 @@
 # Tests for various temperature sensors
 DICTIONARY atmega2560.dict
 CONFIG temperature.cfg
+EMULATOR temperature.fixture.json
 
 # Set various temperatures
 M104 S100
