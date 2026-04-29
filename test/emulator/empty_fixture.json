@@ -15,5 +15,6 @@
             "0x7f": [48, 85]
         }
     },
-    "auto_trsync_trigger_ticks": 160000
+    "auto_trsync_trigger_ticks": 160000,
+    "probe_pin_after_steps": 800
 }

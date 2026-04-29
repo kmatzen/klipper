@@ -389,6 +389,35 @@ class TestCase:
         return steppers
 
     _EXTRUDER_SECTION_RE = re.compile(r'^\[(extruder\d*)\]\s*$')
+    _PROBE_PIN_RE = re.compile(r'^\s*pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
+                               r'(?:#.*)?$')
+
+    @classmethod
+    def _parse_probe_pin(cls, config_fname):
+        # Walk a [probe] section and return (flags, bare_pin) for its
+        # pin: line. Returns None if no [probe] block or no plain GPIO
+        # pin (e.g. virtual endstop). Used to configure a step_trigger
+        # on Z step -> probe pin so tests with `[probe]` get a
+        # firmware-driven touch trigger after Z motion.
+        in_probe = False
+        try:
+            f = open(config_fname)
+        except OSError:
+            return None
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    in_probe = (stripped == '[probe]')
+                    continue
+                if not in_probe:
+                    continue
+                m = cls._PROBE_PIN_RE.match(line)
+                if m:
+                    return m.group(1), m.group(2)
+        finally:
+            f.close()
+        return None
 
     @classmethod
     def _parse_extruder_sensor_pins(cls, config_fname):
@@ -513,6 +542,32 @@ class TestCase:
                             z_step_pin[1], int(z_step_pin[2:]),
                             int(ats),
                             sens[1], int(sens[2:])))
+        # probe_pin_after_steps: for tests with a plain `[probe]` (no
+        # bltouch state machine), configure step_trigger on the Z
+        # stepper's step_pin -> the probe pin after N stepper edges,
+        # which drives a firmware-visible "touch" once the toolhead
+        # has moved into the bed. Pairs with the bridge's auto-rearm
+        # so multi-sample / multi-point probing (bed_mesh, z_tilt,
+        # multi_z) works without per-probe re-configuration. The
+        # `^pin` invert flag from [probe] determines triggered=1 vs 0.
+        probe_steps = raw.get('probe_pin_after_steps')
+        if probe_steps is not None and config_fname is not None:
+            probe = self._parse_probe_pin(config_fname)
+            if probe is not None:
+                flags, bare = probe
+                # ^ = pull-up + active-low? klippy convention: trigger
+                # value is 1 unless `!` invert flag is set.
+                trig_val = 0 if '!' in flags else 1
+                z_step_pin = None
+                for s in self._parse_stepper_endstops_any(config_fname):
+                    if s['name'] == 'stepper_z' and 'step_pin' in s:
+                        z_step_pin = s['step_pin']
+                        break
+                if z_step_pin is not None:
+                    lines.append("step_trigger %s %d %d %s %d %d" % (
+                        z_step_pin[1], int(z_step_pin[2:]),
+                        int(probe_steps),
+                        bare[1], int(bare[2:]), trig_val))
         adc_default = raw.get('analog_in_default', {})
 
         def _raw_to_mv(raw_value):
