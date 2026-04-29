@@ -77,6 +77,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -1042,6 +1043,7 @@ main(int argc, char *argv[])
     const char *mcu_name = "atmega2560";
     double duration_s = 0.0;
     int verbose = 0;
+    const char *sim_time_path = NULL;
 
     static struct option longopts[] = {
         {"elf",            required_argument, NULL, 'e'},
@@ -1050,10 +1052,11 @@ main(int argc, char *argv[])
         {"mcu",            required_argument, NULL, 'm'},
         {"duration",       required_argument, NULL, 'd'},
         {"verbose",        no_argument,       NULL, 'v'},
+        {"sim-time-file",  required_argument, NULL, 't'},
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:l:c:m:d:v", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:l:c:m:d:vt:", longopts, NULL)) != -1) {
         switch (opt) {
         case 'e': elf_path = optarg; break;
         case 'l': slave_link_path = optarg; break;
@@ -1061,6 +1064,7 @@ main(int argc, char *argv[])
         case 'm': mcu_name = optarg; break;
         case 'd': duration_s = atof(optarg); break;
         case 'v': verbose = 1; break;
+        case 't': sim_time_path = optarg; break;
         default:
             fprintf(stderr,
                 "Usage: %s --elf <klipper.elf> --slave-link <path>\n"
@@ -1191,22 +1195,47 @@ main(int argc, char *argv[])
     signal(SIGINT, on_signal);
 
     /* Duration safety net: kills the simulator after N WALL seconds
-     * so a hung firmware test doesn't run forever in CI. Klippy
-     * requires the MCU clock to advance at real-time rate (its
-     * clock-sync regression assumes it), so we throttle the simulator
-     * to wall-time below regardless of duration. Setting --duration=0
-     * disables only the deadline, not the throttling. */
+     * so a hung firmware test doesn't run forever in CI. */
     struct timespec start_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
     uint64_t deadline_wall_ns = duration_s > 0
         ? (uint64_t)(duration_s * 1e9)
         : 0;
 
+    /* Sim-time mode: if --sim-time-file is given, mmap a double and
+     * write avr->cycle/frequency (current MCU time in seconds) on
+     * each periodic check. klippy reads the same file via
+     * KLIPPY_SIM_TIME_FILE so its get_monotonic() returns simulated
+     * time instead of clock_gettime. With this active we DROP the
+     * wall-clock throttle and let simavr free-run as fast as the host
+     * allows; klippy's view of time is consistent with the MCU's
+     * regardless of host load, which makes tests deterministic. */
+    volatile double *sim_time_ptr = NULL;
+    if (sim_time_path) {
+        int fd = open(sim_time_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            fprintf(stderr, "simavr_bridge: open %s: %s\n",
+                    sim_time_path, strerror(errno));
+        } else {
+            double zero = 0.;
+            if (write(fd, &zero, sizeof zero) != (ssize_t)sizeof zero) {
+                fprintf(stderr, "simavr_bridge: write %s: %s\n",
+                        sim_time_path, strerror(errno));
+            }
+            void *p = mmap(NULL, sizeof(double), PROT_READ | PROT_WRITE,
+                           MAP_SHARED, fd, 0);
+            close(fd);
+            if (p == MAP_FAILED) {
+                fprintf(stderr, "simavr_bridge: mmap %s: %s\n",
+                        sim_time_path, strerror(errno));
+            } else {
+                sim_time_ptr = (volatile double *)p;
+                *sim_time_ptr = 0.;
+            }
+        }
+    }
+
     int state = cpu_Running;
-    /* Throttling check is expensive (clock_gettime + arithmetic), so
-     * only do it periodically. Every ~16k MCU cycles is roughly 1ms
-     * of MCU time at 16MHz - tight enough to keep wall vs MCU clocks
-     * within a millisecond, loose enough not to dominate the work. */
     uint64_t throttle_check_interval = avr->frequency / 1000;
     uint64_t next_throttle_cycle = throttle_check_interval;
     while (g_running && state != cpu_Done && state != cpu_Crashed) {
@@ -1214,6 +1243,9 @@ main(int argc, char *argv[])
         if (avr->cycle < next_throttle_cycle)
             continue;
         next_throttle_cycle = avr->cycle + throttle_check_interval;
+        if (sim_time_ptr) {
+            *sim_time_ptr = (double)avr->cycle / (double)avr->frequency;
+        }
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t wall_ns = (uint64_t)(now.tv_sec - start_ts.tv_sec) * 1000000000ULL
@@ -1225,10 +1257,18 @@ main(int argc, char *argv[])
                     (unsigned long long)avr->cycle);
             break;
         }
-        /* Wall-clock the simulator: if MCU cycles are running ahead of
-         * wall time, sleep until they line up. clock_freq cycles
-         * should take exactly 1 wall second. */
-        uint64_t expected_wall_ns = (avr->cycle * 1000000000ULL) / avr->frequency;
+        /* Cap simavr to wall-clock as an upper bound. In wall-clock
+         * mode (no sim-time-file) this is the throttle: klippy's
+         * clock_gettime-based view of time must match the MCU's. In
+         * sim-time mode it's still useful as a CEILING - it prevents
+         * simavr from running ahead of wall-clock, which would let
+         * klippy's heater_verify (and other timer thresholds in
+         * simulated seconds) fire faster than the test runner's
+         * wall-clock deadline. simavr is allowed to fall behind
+         * wall-clock under load; klippy's view of time uses our
+         * simulated cycle counter and adapts. */
+        uint64_t expected_wall_ns =
+            (avr->cycle * 1000000000ULL) / avr->frequency;
         if (expected_wall_ns > wall_ns) {
             uint64_t sleep_ns = expected_wall_ns - wall_ns;
             if (sleep_ns > 0) {

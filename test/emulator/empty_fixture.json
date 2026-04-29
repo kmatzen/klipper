@@ -17,5 +17,6 @@
     },
     "auto_trsync_trigger_ticks": 160000,
     "probe_pin_after_steps": 800,
-    "prepend_gcode": ["M105", "G4 P2000", "M105"]
+    "prepend_gcode": ["M105", "G4 P2000", "M105"],
+    "sim_time": true
 }

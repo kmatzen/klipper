@@ -5,19 +5,54 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <errno.h> // errno
+#include <fcntl.h> // open
 #include <stdarg.h> // va_start
 #include <stdint.h> // uint8_t
 #include <stdio.h> // fprintf
+#include <stdlib.h> // getenv
 #include <string.h> // strerror
+#include <sys/mman.h> // mmap
+#include <sys/stat.h> // fstat
 #include <time.h> // struct timespec
+#include <unistd.h> // close
 #include <sys/prctl.h>  // prctl
 #include "compiler.h" // __visible
 #include "pyhelper.h" // get_monotonic
+
+// Optional sim-time mode: if KLIPPY_SIM_TIME_FILE is set in the
+// environment at process start, get_monotonic() reads its time
+// from a memory-mapped double the simavr bridge updates each tick
+// instead of clock_gettime(). This decouples klippy's view of
+// "time" from wall-clock so deterministic simulation tests run
+// correctly regardless of host CPU load.
+static volatile double *sim_time_ptr = NULL;
+static int sim_time_initialized = 0;
+
+static void
+sim_time_init(void)
+{
+    sim_time_initialized = 1;
+    const char *path = getenv("KLIPPY_SIM_TIME_FILE");
+    if (!path || !*path)
+        return;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return;
+    void *p = mmap(NULL, sizeof(double), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED)
+        return;
+    sim_time_ptr = (volatile double *)p;
+}
 
 // Return the monotonic system time as a double
 double __visible
 get_monotonic(void)
 {
+    if (!sim_time_initialized)
+        sim_time_init();
+    if (sim_time_ptr)
+        return *sim_time_ptr;
     struct timespec ts;
     int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     if (ret) {

@@ -279,6 +279,23 @@ class TestCase:
             os.unlink(ctl_socket)
         except OSError:
             pass
+        # Opt-in sim-time mode: tests with `sim_time: true` in their
+        # fixture get a deterministic-time runtime where klippy reads
+        # MCU clock via a memory-mapped double instead of
+        # clock_gettime, and simavr free-runs without wall-clock
+        # throttling. This eliminates the "rescheduled timer in past"
+        # class of host-load flakiness, but disables the wall-clock
+        # safety net that previously masked heater_verify timeouts in
+        # tests that set heater targets, so it must be opt-in until
+        # the bridge models heater PWM -> ADC heat-up.
+        sim_time_enabled = False
+        try:
+            if fixture_path is not None:
+                with open(fixture_path) as ff:
+                    sim_time_enabled = bool(json.load(ff).get('sim_time'))
+        except (OSError, ValueError):
+            sim_time_enabled = False
+        sim_time_file = None
         emu_args = [
             bridge_path,
             '--elf', elf_path,
@@ -286,6 +303,13 @@ class TestCase:
             '--control-socket', ctl_socket,
             '--duration', str(EMULATOR_KLIPPY_DEADLINE + 5),
         ]
+        if sim_time_enabled:
+            sim_time_file = os.path.join(self.tempdir, 'sim_time')
+            try:
+                os.unlink(sim_time_file)
+            except OSError:
+                pass
+            emu_args += ['--sim-time-file', sim_time_file]
         emu_log_fd = open(emu_log, 'w')
         emu_proc = subprocess.Popen(emu_args, cwd=repo_root,
                                     stdout=emu_log_fd,
@@ -294,14 +318,19 @@ class TestCase:
             slave_path = self._wait_for_slave_link(slave_link, emu_proc)
             if ctl_socket is not None:
                 self._push_fixture_to_control_socket(
-                    ctl_socket, fixture_path, config_fname)
+                    ctl_socket, fixture_path, config_fname,
+                    sim_time_enabled=sim_time_enabled)
             self._materialize_emulator_config(config_fname, cfg_path,
                                               slave_path)
             klippy_args = [sys.executable, './klippy/klippy.py', cfg_path,
                            '-i', gcode_fname, '-l', TEMP_LOG_FILE, '-v']
             for df in dict_fnames:
                 klippy_args += ['-d', df]
-            res = self._run_klippy_with_deadline(klippy_args)
+            klippy_env = None
+            if sim_time_file:
+                klippy_env = dict(os.environ)
+                klippy_env['KLIPPY_SIM_TIME_FILE'] = sim_time_file
+            res = self._run_klippy_with_deadline(klippy_args, env=klippy_env)
         finally:
             self._terminate(emu_proc)
             emu_log_fd.close()
@@ -481,7 +510,8 @@ class TestCase:
         return None
 
     def _push_fixture_to_control_socket(self, socket_path, fixture_path,
-                                        config_fname=None):
+                                        config_fname=None,
+                                        sim_time_enabled=False):
         # Translate the JSON fixture into newline-terminated commands
         # the simavr bridge understands and write them through the
         # control socket. Connection retries briefly because the
@@ -679,7 +709,17 @@ class TestCase:
             # CI - 5 s is far longer than 2 ms of simulated time
             # ever takes on a working host.
             try:
-                sock.sendall(b'barrier 500000\n')
+                # In sim-time mode klippy's reactor reads monotonic
+                # from simavr's cycle counter, so the moment klippy
+                # starts it sees "now" = wherever simavr's clock has
+                # advanced to. We pre-run simavr 2 s of simulated
+                # time before launching klippy so firmware's ADC
+                # peripheral has had time to sample at the
+                # by_pin-overridden values - otherwise the combined
+                # sensor's 1 s post-ready deviation check can fire
+                # before all 3 inputs have updated.
+                barrier_us = 2000000 if sim_time_enabled else 500000
+                sock.sendall(b'barrier %d\n' % barrier_us)
                 sock.settimeout(5.0)
                 ack = b''
                 while b'\n' not in ack and len(ack) < 16:
@@ -744,8 +784,8 @@ class TestCase:
         with open(dest_path, 'w') as f:
             f.write(cfg)
 
-    def _run_klippy_with_deadline(self, args):
-        proc = subprocess.Popen(args)
+    def _run_klippy_with_deadline(self, args, env=None):
+        proc = subprocess.Popen(args, env=env)
         try:
             return proc.wait(timeout=EMULATOR_KLIPPY_DEADLINE)
         except subprocess.TimeoutExpired:
