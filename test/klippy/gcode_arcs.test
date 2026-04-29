@@ -1,5 +1,6 @@
 # Tests for g-code G2/G3 arc commands
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 CONFIG gcode_arcs.cfg
 
 # Home and move in XY arc

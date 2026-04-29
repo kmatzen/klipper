@@ -148,11 +148,19 @@ class TestCase:
                            os.path.basename(path)))
                     return
         gcode_is_temp = False
+        prepend = []
+        if emulator_fixture is not None:
+            try:
+                with open(emulator_fixture) as ff:
+                    raw = json.load(ff)
+                prepend = list(raw.get('prepend_gcode') or ())
+            except (OSError, ValueError):
+                prepend = []
         if gcode_fname is None:
             gcode_fname = self.relpath(TEMP_GCODE_FILE, 'temp')
             gcode_is_temp = True
             f = open(gcode_fname, 'w')
-            f.write('\n'.join(gcode + ['']))
+            f.write('\n'.join(prepend + gcode + ['']))
             f.close()
         elif gcode:
             raise error("Can't specify both a gcode file and gcode commands")
