@@ -1,6 +1,7 @@
 # Test case for basic movement on polar printers
 CONFIG ../../config/example-polar.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 ; Start by homing the printer.
 G28

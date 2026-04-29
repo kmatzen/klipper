@@ -1,6 +1,7 @@
 # Test case for manual_stepper
 CONFIG manual_stepper.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # Test basic moves
 MANUAL_STEPPER STEPPER=basic_stepper ENABLE=1

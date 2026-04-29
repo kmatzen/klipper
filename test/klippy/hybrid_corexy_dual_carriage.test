@@ -1,6 +1,7 @@
 # Test cases on hybrid corexy printers with dual carriage and multiple extruders
 CONFIG hybrid_corexy_dual_carriage.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # First home the printer
 G90

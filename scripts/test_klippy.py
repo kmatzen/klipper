@@ -616,7 +616,7 @@ class TestCase:
             # CI - 5 s is far longer than 2 ms of simulated time
             # ever takes on a working host.
             try:
-                sock.sendall(b'barrier 200000\n')
+                sock.sendall(b'barrier 500000\n')
                 sock.settimeout(5.0)
                 ack = b''
                 while b'\n' not in ack and len(ack) < 16:
