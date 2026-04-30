@@ -660,6 +660,14 @@ class TestCase:
         spi_hex = raw.get('spi_response')
         if spi_hex:
             lines.append("spi %s" % spi_hex.strip())
+        # spi_tmc: switch the bridge's SPI hook into TMC register-file
+        # mode. Each 5-byte SPI datagram is decoded as a TMC SPI
+        # register access; writes update the register file and reads
+        # return the stored value, so klippy's write-then-verify
+        # pattern for tmc2130 / tmc5160 / tmc2240 / tmc2660 init
+        # succeeds. Mutually exclusive with spi_response.
+        if raw.get('spi_tmc'):
+            lines.append("spi_tmc")
         # i2c reads: concatenate per-slave read sequences in fixture
         # order, push as a single bridge i2c queue. The bridge
         # auto-ACKs addressing/writes and serves reads round-robin

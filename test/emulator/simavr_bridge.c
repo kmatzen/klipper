@@ -125,6 +125,26 @@ struct spi_response_state {
     uint8_t bytes[256];
     size_t len;
     size_t pos;
+    /* TMC SPI mode: when enabled, the bridge interprets each 5-byte
+     * SPI datagram as a TMC2130/5160/2240/2660 register access:
+     *   - byte 0: register address (high bit = write/read flag)
+     *   - bytes 1..4: 4-byte register value (big-endian)
+     * On a write the bytes are stored in tmc_regs[addr]; on a read
+     * the next datagram's MISO bytes 1..4 echo back the stored value
+     * for that register (TMC's "shift register" semantics, where the
+     * response carries the PREVIOUSLY-addressed register's data, mean
+     * klippy's read-after-write verify pattern works out as long as
+     * we serve the value tied to the address that was just written
+     * or read in the prior datagram). MISO byte 0 is the SPI status
+     * which we always return as 0 = no error. */
+    int tmc_mode;
+    uint8_t tmc_in_buf[5];     /* MOSI bytes accumulated this datagram */
+    uint8_t tmc_in_pos;        /* 0..4 */
+    uint8_t tmc_out_buf[5];    /* MISO bytes the firmware will see */
+    uint8_t tmc_out_pos;       /* 0..4 */
+    uint32_t tmc_regs[256];    /* register file shared by all TMC chips
+                                * on the bus - klippy writes-then-reads
+                                * each chip sequentially, no contention */
 };
 
 static struct spi_response_state spi_state = {
@@ -382,6 +402,22 @@ apply_control_command(struct control_ctx *ctx, const char *line)
             fprintf(stderr,
                     "simavr_bridge: control spi queue len=%zu\n",
                     set_len);
+    } else if (strcmp(op, "spi_tmc") == 0) {
+        /* spi_tmc: switch the SPI hook into TMC SPI register-file mode.
+         * Each 5-byte SPI datagram is decoded as a TMC2130/5160/2240/
+         * 2660 register access; writes update the shared register file
+         * and reads return the stored value. Klippy's write-then-read
+         * verify pattern matches as a result. */
+        pthread_mutex_lock(&spi_state.lock);
+        spi_state.tmc_mode = 1;
+        spi_state.tmc_in_pos = 0;
+        spi_state.tmc_out_pos = 0;
+        memset(spi_state.tmc_in_buf, 0, sizeof(spi_state.tmc_in_buf));
+        memset(spi_state.tmc_out_buf, 0, sizeof(spi_state.tmc_out_buf));
+        memset(spi_state.tmc_regs, 0, sizeof(spi_state.tmc_regs));
+        pthread_mutex_unlock(&spi_state.lock);
+        if (ctx->verbose)
+            fprintf(stderr, "simavr_bridge: spi_tmc mode enabled\n");
     } else if (strcmp(op, "i2c") == 0) {
         /* i2c <hexbytes>: replace the I2C read response queue. Same
          * round-robin semantics as spi. The hexbytes are returned to
@@ -774,20 +810,42 @@ static void
 spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
 {
     (void)irq;
-    (void)value;
     (void)param;
     if (!g_spi_in_irq)
         return;
-    /* Default to 0x00 rather than 0xff for unscripted bytes. Klipper's
-     * thermocouple drivers compute value=0 fault=0 from all-zero
-     * responses, which passes the firmware's min/max range check
-     * when min_temp=0 (the typical test config). 0xff would set
-     * fault bits in MAX31855 (`value & 0x07`) and produce a huge
-     * value out of range for the others, immediately tripping the
-     * "Thermocouple reader fault" shutdown. */
+    uint8_t mosi = (uint8_t)(value & 0xff);
     uint8_t resp = 0x00;
     pthread_mutex_lock(&spi_state.lock);
-    if (spi_state.len > 0) {
+    if (spi_state.tmc_mode) {
+        /* TMC SPI: 5-byte datagrams. MISO byte_n is the response
+         * we computed at the END of the previous datagram. */
+        resp = spi_state.tmc_out_buf[spi_state.tmc_out_pos];
+        if (spi_state.tmc_out_pos < 4)
+            spi_state.tmc_out_pos++;
+        spi_state.tmc_in_buf[spi_state.tmc_in_pos] = mosi;
+        if (spi_state.tmc_in_pos < 4) {
+            spi_state.tmc_in_pos++;
+        } else {
+            /* Datagram complete: decode address + data. */
+            uint8_t addr = spi_state.tmc_in_buf[0];
+            uint32_t data = ((uint32_t)spi_state.tmc_in_buf[1] << 24)
+                          | ((uint32_t)spi_state.tmc_in_buf[2] << 16)
+                          | ((uint32_t)spi_state.tmc_in_buf[3] << 8)
+                          |  (uint32_t)spi_state.tmc_in_buf[4];
+            uint8_t reg = addr & 0x7f;
+            int is_write = (addr & 0x80) != 0;
+            if (is_write)
+                spi_state.tmc_regs[reg] = data;
+            uint32_t out = spi_state.tmc_regs[reg];
+            spi_state.tmc_out_buf[0] = 0;        /* SPI_STATUS = OK */
+            spi_state.tmc_out_buf[1] = (out >> 24) & 0xff;
+            spi_state.tmc_out_buf[2] = (out >> 16) & 0xff;
+            spi_state.tmc_out_buf[3] = (out >> 8) & 0xff;
+            spi_state.tmc_out_buf[4] = out & 0xff;
+            spi_state.tmc_in_pos = 0;
+            spi_state.tmc_out_pos = 0;
+        }
+    } else if (spi_state.len > 0) {
         resp = spi_state.bytes[spi_state.pos];
         spi_state.pos = (spi_state.pos + 1) % spi_state.len;
     }

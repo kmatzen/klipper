@@ -1,0 +1,5 @@
+{
+    "_comment": "spi_tmc switches the bridge's SPI hook to a TMC register file. Each 5-byte datagram is decoded; writes are stored, reads return the stored value. Klippy's tmc.write_register / tmc.read_register verify pattern (write a value, read it back, compare) passes because we echo the write. Per-CS chip selection is not modeled - the register file is shared - which is fine because klippy initializes each TMC chip sequentially (write all of A's regs, then read; then move to B).",
+    "spi_tmc": true,
+    "auto_trsync_trigger_ticks": 160000
+}
