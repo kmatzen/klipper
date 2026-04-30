@@ -65,6 +65,24 @@
  *
  * Lines that don't parse are silently ignored to avoid breaking the
  * simulator on a fixture typo.
+ *
+ * Time-base policy
+ * ----------------
+ * Every state machine in this file (BLTouch pulse decoder, probe_step
+ * ramp, step_trigger counter, sw_i2c bit-bang, the SPI/TWI queues, and
+ * the cycle-timer-driven BLTouch self-pulse end) timestamps events in
+ * MCU sim time -- `avr->cycle` -- never host wall clock. The firmware
+ * itself reads `timer_read_time()` off simavr's emulated TCNT, which
+ * is also driven by `avr->cycle`, so any windowed/timed comparison the
+ * bridge does against firmware-observed events is in the same time
+ * base regardless of how fast simavr is running on the host.
+ *
+ * The only `clock_gettime(CLOCK_MONOTONIC)` calls are the bridge's
+ * main-loop wall-clock throttle (caps simavr at host wall-clock; in
+ * sim_time mode it acts as a CEILING only) and the `--duration`
+ * deadline safety net. Both are intentionally host-time. Control
+ * socket select() timeouts are host-time too; they're polling, not
+ * state-machine timing.
  */
 
 #include <errno.h>
