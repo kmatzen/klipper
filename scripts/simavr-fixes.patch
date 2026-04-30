@@ -1,0 +1,22 @@
+Patch for upstream simavr applied at docker build time.
+
+avr_ioport_ioctl: AVR_IOCTL_IOPORT_SET_EXTERNAL stores the new
+pull_mask / pull_value but doesn't fire the IRQ chain, so the
+external value only propagates to PIN reads on the next firmware
+PORT/DDR write. Fix: call avr_ioport_update_irqs() to fan out
+the new values immediately, the same way ddr_write does. Without
+this fix, the bridge's software-I2C bit-bang ACK pulse and any
+other "drive an input pin externally during firmware input+pullup
+mode" usage is invisible to the firmware until the next time it
+writes PORT/DDR for that port.
+
+--- a/simavr/sim/avr_ioport.c
++++ b/simavr/sim/avr_ioport.c
+@@ -298,6 +298,7 @@ avr_ioport_ioctl(struct avr_io_t * port, uint32_t ctl, void * io_param)
+ 				avr_ioport_external_t * m = (avr_ioport_external_t*)io_param;
+ 				p->external.pull_mask = m->mask;
+ 				p->external.pull_value = m->value;
++				avr_ioport_update_irqs(p);
+ 				res = 0;
+ 			}
+ 		}

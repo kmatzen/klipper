@@ -340,7 +340,15 @@ static int g_trigger_hook_registered[96] = {0};
 static void step_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static void trigger_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
-/* Software I2C bit-bang slave-side ACK emulation. */
+/* Software I2C bit-bang slave-side ACK emulation. self_driving
+ * suppresses recursive SDA/SCL hook fires while we're inside our own
+ * sw_i2c_drive_sda call - simavr's avr_raise_irq updates irq->value
+ * AFTER running notify hooks, so any update_irqs we trigger
+ * synchronously (e.g. via the patched SET_EXTERNAL) re-raises the
+ * unchanged-but-currently-being-dispatched value, retriggering our
+ * own hooks. Without the flag this counts an extra SCL falling
+ * inside the 8th-edge handler and prematurely fires release before
+ * the firmware reads the ACK slot. */
 struct sw_i2c_state {
     int configured;
     char scl_port; int scl_pin;
@@ -919,6 +927,11 @@ sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     int next = value ? 1 : 0;
     int drive_low = 0, release = 0;
     pthread_mutex_lock(&sw_i2c_lock);
+    if (sw_i2c.self_driving) {
+        sw_i2c.last_scl = next;
+        pthread_mutex_unlock(&sw_i2c_lock);
+        return;
+    }
     int prev = sw_i2c.last_scl;
     sw_i2c.last_scl = next;
     if (prev == next || !sw_i2c.active) {
@@ -930,7 +943,15 @@ sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param)
         if (sw_i2c.bit_count == 8)
             drive_low = 1;
         else if (sw_i2c.bit_count == 9) {
-            release = 1;
+            /* DON'T release SDA on the 9th SCL falling. simavr's
+             * non-FILTERED IRQ chain re-fires our SCL hook on
+             * unchanged-value raises during firmware PORT/DDR writes
+             * that hit the same pin, which can spuriously advance
+             * bit_count past 8 before the firmware actually samples
+             * the ACK slot. Holding SDA low until the next START
+             * keeps the ACK valid through the firmware's read; the
+             * SDA hook releases via the STOP path or the next START
+             * resets the counter. */
             sw_i2c.bit_count = 0;
         }
     }

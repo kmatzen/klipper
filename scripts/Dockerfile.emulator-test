@@ -15,17 +15,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # klipper firmware spins in run_tasks waiting for SchedStatus to flip.
 # Upstream master fixed this; we also need uart_pty from
 # examples/parts which the install target doesn't ship.
+COPY scripts/simavr-fixes.patch /tmp/simavr-fixes.patch
 RUN git clone --depth 1 \
         https://github.com/buserror/simavr.git /tmp/simavr \
     && cd /tmp/simavr \
-    && sed -i 's|p->external.pull_value = m->value;|p->external.pull_value = m->value;\n\t\t\t\tavr_ioport_update_irqs(p);|' \
-        simavr/sim/avr_ioport.c \
-    && grep -A1 "p->external.pull_value = m->value" simavr/sim/avr_ioport.c \
+    && patch -p1 < /tmp/simavr-fixes.patch \
     && make build-simavr install RELEASE=1 DESTDIR=/usr/local 2>&1 | tail -5 \
     && mkdir -p /usr/local/include/simavr/parts \
     && cp examples/parts/uart_pty.h /usr/local/include/simavr/parts/ \
     && cp examples/parts/uart_pty.c /usr/local/include/simavr/parts/ \
-    && rm -rf /tmp/simavr \
+    && rm -rf /tmp/simavr /tmp/simavr-fixes.patch \
     && ldconfig
 
 WORKDIR /klipper
