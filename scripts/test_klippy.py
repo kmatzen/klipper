@@ -703,6 +703,33 @@ class TestCase:
         # succeeds. Mutually exclusive with spi_response.
         if raw.get('spi_tmc'):
             lines.append("spi_tmc")
+        # spi_ads1220: switch the bridge's SPI hook into ADS1220
+        # register-file mode. Each command is decoded as RREG / WREG /
+        # RESET and the bridge maintains a small register file so the
+        # ads1220 driver's write-then-verify init pattern succeeds in
+        # emulator mode (where MCU.is_fileoutput() is False so the
+        # verify mismatch becomes a fatal error). Mutually exclusive
+        # with spi_response and spi_tmc.
+        if raw.get('spi_ads1220'):
+            lines.append("spi_ads1220")
+        # load_cell_probe_trigger: hook the configured Z step pin and
+        # synthesize an ADC sample on every read - spike_sample if a
+        # step edge fired within the last window_us microseconds, 0
+        # otherwise. Lets PROBE / BED_MESH_CALIBRATE trigger and
+        # return in emulator mode where the load_cell_probe driver
+        # waits for an analog-trigger trsync that real hardware would
+        # close via physical force. Time-windowed so the two ADS1220
+        # chips that share the SPI hook each observe the same answer.
+        probe_trig = raw.get('load_cell_probe_trigger')
+        if probe_trig:
+            step_pin = probe_trig.get('z_step_pin', '')
+            window_us = int(probe_trig.get('window_us', 5000))
+            spike_sample = int(probe_trig.get('spike_sample', 10000))
+            if (len(step_pin) >= 3 and step_pin[0] == 'P'
+                    and step_pin[1].isalpha()):
+                lines.append("probe_step %s %d %d %d" % (
+                    step_pin[1], int(step_pin[2:]),
+                    window_us, spike_sample))
         # Software I2C: scan the cfg for any
         # i2c_software_scl_pin / i2c_software_sda_pin pairs and
         # configure the bridge's bit-bang ACK emulator on each. The

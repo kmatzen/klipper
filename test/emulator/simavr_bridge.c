@@ -145,6 +145,26 @@ struct spi_response_state {
     uint32_t tmc_regs[256];    /* register file shared by all TMC chips
                                 * on the bus - klippy writes-then-reads
                                 * each chip sequentially, no contention */
+    /* ADS1220 mode: byte 0 is a command. Top nibble selects:
+     *   0x4n WREG: write bytes to register n>>2, count = (n & 3) + 1
+     *   0x2n RREG: read bytes from register n>>2, count = (n & 3) + 1
+     *   0x0n other: NOOP / commands that don't care about MISO
+     * Register data is stored in ads_regs[reg][byte_idx] (4 bytes
+     * per register max - the chip has 4 8-bit config registers).
+     * On RREG, the bridge serves register bytes back over the
+     * subsequent NOOP transfers; the first response byte after the
+     * cmd is don't-care from klippy's POV (params['response'][1:]). */
+    int ads_mode;
+    uint8_t ads_remaining;     /* bytes still to send/recv this cmd */
+    uint8_t ads_reg;           /* register index for active RREG/WREG */
+    uint8_t ads_byte_idx;      /* offset into the register payload */
+    uint8_t ads_is_read;       /* 1 = RREG (serving), 0 = WREG (storing) */
+    uint8_t ads_streaming;     /* 1 = currently serving 3-byte ADC sample */
+    uint8_t ads_sample[3];     /* current 3-byte ADC reading being served */
+    uint8_t ads_regs[16][4];   /* register file: 4 regs x 4 bytes (the
+                                * chip only has 4 8-bit config regs;
+                                * shared across all ADS1220 chips on
+                                * the bus, klippy probes them in turn) */
 };
 
 static struct spi_response_state spi_state = {
@@ -368,6 +388,35 @@ static int g_sw_i2c_hook_registered[96] = {0};
 static void sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static void sw_i2c_sda_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
+/* Load-cell-probe analog-trigger emulation. The load_cell_probe driver
+ * arms a trigger_analog on the MCU and waits for an ADC sample to
+ * cross a force threshold. Real hardware closes that loop through the
+ * physical force on the cell; the bridge synthesizes it by holding
+ * data_ready_pin low (so the firmware reads the ADC continuously) and
+ * timestamping every Z step rising edge: when the firmware reads the
+ * ADC, the bridge serves spike_sample if a step edge occurred within
+ * the last `window_us` microseconds, otherwise 0. Time-windowed (not
+ * delta-based) so multiple ADS1220 chips sharing the SPI hook each
+ * see the same answer. step_threshold is unused but kept in the
+ * control protocol for forward compatibility. */
+struct probe_step_state {
+    pthread_mutex_t lock;
+    int active;
+    int step_port_ord;        /* (int)(unsigned char)'L' etc. */
+    int step_pin;
+    uint64_t last_step_us;        /* monotonic clock at last rising edge */
+    uint32_t window_us;           /* spike-active window after each edge */
+    int32_t spike_sample;         /* raw 24-bit ADC counts during spike */
+};
+
+static struct probe_step_state probe_step = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+static int g_probe_step_hook_registered[96] = {0};
+
+static void probe_step_hook(struct avr_irq_t *irq, uint32_t value,
+                            void *param);
+
 struct control_ctx {
     avr_t *avr;
     char socket_path[PATH_MAX];
@@ -481,6 +530,20 @@ apply_control_command(struct control_ctx *ctx, const char *line)
             twi_state.reg_count++;
         }
         pthread_mutex_unlock(&twi_state.lock);
+    } else if (strcmp(op, "spi_ads1220") == 0) {
+        /* spi_ads1220: switch the SPI hook into ADS1220 mode. The
+         * bridge decodes WREG/RREG commands and maintains a 4x4 byte
+         * register file so klippy's write-then-verify pattern in
+         * setup_chip succeeds. RESET clears the file so the post-
+         * reset readback returns zeros as the driver expects. */
+        pthread_mutex_lock(&spi_state.lock);
+        spi_state.ads_mode = 1;
+        spi_state.ads_remaining = 0;
+        spi_state.ads_byte_idx = 0;
+        memset(spi_state.ads_regs, 0, sizeof(spi_state.ads_regs));
+        pthread_mutex_unlock(&spi_state.lock);
+        if (ctx->verbose)
+            fprintf(stderr, "simavr_bridge: spi_ads1220 mode enabled\n");
     } else if (strcmp(op, "spi_tmc") == 0) {
         /* spi_tmc: switch the SPI hook into TMC SPI register-file mode.
          * Each 5-byte SPI datagram is decoded as a TMC2130/5160/2240/
@@ -655,6 +718,77 @@ apply_step_trigger(struct control_ctx *ctx,
             (char)step_port_ord, step_pin,
             (unsigned)count_threshold,
             (char)trig_port_ord, trig_pin, trig_val);
+}
+
+/* probe_step <step_port> <step_pin> <window_us> <spike_sample>
+ * Wire up the load-cell-probe analog-trigger emulation: hook a step
+ * pin (typically Z) and timestamp rising edges. On each ADS1220 ADC
+ * read the bridge serves spike_sample if a step edge occurred within
+ * the last window_us microseconds, otherwise 0. Time-windowed so
+ * multiple ADS1220 chips on the same SPI bus each observe the same
+ * answer. window_us should bracket several ADC sample periods so the
+ * spike is sustained long enough for the firmware's SOS filter to
+ * push the filtered value past the trigger threshold. */
+static void
+apply_probe_step(struct control_ctx *ctx,
+                 int step_port_ord, int step_pin,
+                 int32_t window_us,
+                 int32_t spike_sample)
+{
+    if (step_port_ord < 'A' || step_port_ord > 'L')
+        return;
+    if (step_pin < 0 || step_pin > 7)
+        return;
+    pthread_mutex_lock(&probe_step.lock);
+    probe_step.active = 1;
+    probe_step.step_port_ord = step_port_ord;
+    probe_step.step_pin = step_pin;
+    probe_step.last_step_us = 0;
+    probe_step.window_us = window_us > 0 ? (uint32_t)window_us : 5000;
+    probe_step.spike_sample = spike_sample;
+    pthread_mutex_unlock(&probe_step.lock);
+
+    avr_irq_t *step_irq = avr_io_getirq(
+        ctx->avr,
+        AVR_IOCTL_IOPORT_GETIRQ((char)step_port_ord),
+        step_pin);
+    if (step_irq && !g_probe_step_hook_registered[(step_port_ord - 'A') * 8
+                                                  + step_pin]) {
+        avr_irq_register_notify(step_irq, probe_step_hook, NULL);
+        g_probe_step_hook_registered[(step_port_ord - 'A') * 8
+                                     + step_pin] = 1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr,
+            "simavr_bridge: probe_step step=%c%d window_us=%d spike=%d\n",
+            (char)step_port_ord, step_pin,
+            (int)window_us, (int)spike_sample);
+}
+
+static uint64_t
+monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+static void
+probe_step_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)param;
+    /* Timestamp the rising edges of the configured Z step pin. simavr
+     * passes the new value as `value` while irq->value still holds
+     * the previous value (notify hooks fire before the IRQ updates). */
+    int prev = (int)irq->value;
+    int next = value ? 1 : 0;
+    if (prev == next || next == 0)
+        return;
+    uint64_t now = monotonic_us();
+    pthread_mutex_lock(&probe_step.lock);
+    if (probe_step.active)
+        probe_step.last_step_us = now;
+    pthread_mutex_unlock(&probe_step.lock);
 }
 
 /* bltouch <ctrl_port> <ctrl_pin> <sensor_port> <sensor_pin> <invert>
@@ -1062,7 +1196,79 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     uint8_t mosi = (uint8_t)(value & 0xff);
     uint8_t resp = 0x00;
     pthread_mutex_lock(&spi_state.lock);
-    if (spi_state.tmc_mode) {
+    if (spi_state.ads_mode) {
+        /* ADS1220 SPI: variable-length commands.
+         * Byte 0 is the command:
+         *   0x40|(reg<<2)|(n-1) WREG  : write n bytes (1..4) to reg
+         *   0x20|(reg<<2)|(n-1) RREG  : read n bytes (1..4) from reg
+         *   0x06 RESET  : clear all regs (klippy reads back zeros)
+         *   0x08 START_SYNC : starts continuous conversion mode
+         *   0x00 NOOP : when seen as the first byte of an isolated
+         *               3-byte transfer, klippy's continuous-mode ADC
+         *               read - the bridge synthesizes the 24-bit
+         *               sample from probe_step delta-since-last-read.
+         * On RREG we serve subsequent MOSI cycles with stored register
+         * bytes; on WREG we capture them.  MISO during the command
+         * byte itself is don't-care (klippy slices response[1:]). */
+        if (spi_state.ads_remaining > 0 && spi_state.ads_streaming) {
+            /* Continue serving an ADC sample started on the cmd byte. */
+            resp = spi_state.ads_sample[spi_state.ads_byte_idx];
+            spi_state.ads_byte_idx++;
+            spi_state.ads_remaining--;
+            if (spi_state.ads_remaining == 0)
+                spi_state.ads_streaming = 0;
+        } else if (spi_state.ads_remaining == 0) {
+            /* Command byte. Decode and prime any follow-on phase. */
+            uint8_t cmd = mosi;
+            uint8_t hi = cmd & 0xf0;
+            if (hi == 0x40 || hi == 0x20) {
+                /* ADS1220 RREG/WREG layout: 0010_rrnn / 0100_rrnn
+                 * where rr is the register (0..3) and nn is byte
+                 * count - 1 (0..3). Reg field is just bits 3..2. */
+                spi_state.ads_reg = (cmd >> 2) & 0x03;
+                spi_state.ads_remaining = (cmd & 0x03) + 1;
+                spi_state.ads_byte_idx = 0;
+                spi_state.ads_is_read = (hi == 0x20);
+            } else if (cmd == 0x06) {
+                /* RESET: zero the register file so the post-reset
+                 * read returns the expected all-zero state. */
+                memset(spi_state.ads_regs, 0,
+                       sizeof(spi_state.ads_regs));
+            } else if (cmd == 0x00 && probe_step.active) {
+                /* Continuous-mode ADC read.  Sample is spike if a Z
+                 * step edge fired within the last window_us; else 0.
+                 * Time-windowed so both ADS1220 chips on the SPI bus
+                 * see the same answer when they read in turn. */
+                pthread_mutex_lock(&probe_step.lock);
+                uint64_t last_step = probe_step.last_step_us;
+                uint32_t window = probe_step.window_us;
+                int32_t spike_val = probe_step.spike_sample;
+                pthread_mutex_unlock(&probe_step.lock);
+                uint64_t now = monotonic_us();
+                int32_t sample = (last_step != 0
+                                  && now - last_step <= window)
+                                 ? spike_val : 0;
+                spi_state.ads_sample[0] = (uint8_t)((sample >> 16) & 0xff);
+                spi_state.ads_sample[1] = (uint8_t)((sample >> 8) & 0xff);
+                spi_state.ads_sample[2] = (uint8_t)(sample & 0xff);
+                resp = spi_state.ads_sample[0];
+                spi_state.ads_byte_idx = 1;
+                spi_state.ads_remaining = 2;
+                spi_state.ads_streaming = 1;
+            }
+        } else if (spi_state.ads_is_read) {
+            resp = spi_state.ads_regs[spi_state.ads_reg]
+                                     [spi_state.ads_byte_idx];
+            spi_state.ads_byte_idx++;
+            spi_state.ads_remaining--;
+        } else {
+            spi_state.ads_regs[spi_state.ads_reg]
+                              [spi_state.ads_byte_idx] = mosi;
+            spi_state.ads_byte_idx++;
+            spi_state.ads_remaining--;
+            resp = 0;
+        }
+    } else if (spi_state.tmc_mode) {
         /* TMC SPI: 5-byte datagrams. MISO byte_n is the response
          * we computed at the END of the previous datagram. */
         resp = spi_state.tmc_out_buf[spi_state.tmc_out_pos];
@@ -1271,6 +1477,20 @@ apply_control_line(struct control_ctx *ctx, char *line)
             apply_sw_i2c(ctx,
                 (int)(unsigned char)scl_port, scl_pin,
                 (int)(unsigned char)sda_port, sda_pin);
+        }
+        return;
+    }
+    if (strncmp(line, "probe_step ", 11) == 0) {
+        char step_port = 0;
+        int step_pin = -1;
+        int step_threshold = 0, spike_sample = 0;
+        int got = sscanf(line + 11, "%c %d %d %d",
+                         &step_port, &step_pin,
+                         &step_threshold, &spike_sample);
+        if (got == 4) {
+            apply_probe_step(ctx,
+                (int)(unsigned char)step_port, step_pin,
+                step_threshold, spike_sample);
         }
         return;
     }
