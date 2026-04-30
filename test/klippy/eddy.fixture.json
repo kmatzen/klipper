@@ -1,0 +1,16 @@
+{
+    "_comment": "LDC1612 i2c register-aware responses with intb pin held low so the firmware sees the chip as always having data ready. The simavr patch makes SET_EXTERNAL propagate immediately, so driving an input pin externally now works for sensor data-ready / interrupt pins.\n\n  REG_MANUFACTURER_ID 0x7e -> 0x5449 (TI)\n  REG_DEVICE_ID       0x7f -> 0x3055 (LDC1612)\n  REG_DATA0_MSB       0x00 -> 0x0147  (top 16 bits of measurement)\n  REG_DATA0_LSB       0x01 -> 0xa65e  (bottom 16 bits)\nThe combined 32-bit value 0x0147a65e has error_bits=0 and a non-zero magnitude that maps via the cfg's calibration table to a stable z-position around 1.0 mm.",
+    "i2c_default": {
+        "register_responses": {
+            "0x7e": [84, 73],
+            "0x7f": [48, 85],
+            "0x00": [1, 71],
+            "0x01": [166, 94]
+        }
+    },
+    "auto_trsync_trigger_ticks": 160000,
+    "probe_pin_after_steps": 800,
+    "analog_in_default": {"default_value": 5000},
+    "prepend_gcode": ["M105", "G4 P2000", "M105"],
+    "gpio": [["K", 7, 0]]
+}

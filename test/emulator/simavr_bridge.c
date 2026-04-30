@@ -538,13 +538,23 @@ apply_control_command(struct control_ctx *ctx, const char *line)
     } else if (strcmp(op, "gpio") == 0 && n >= 4) {
         /* gpio <port> <pin> <level>: drive PORT<port> pin<pin> high
          * (level=1) or low (level=0). port is 'A' encoded as ASCII.
-         * Used by tests that need to simulate a "physical touch" -
-         * e.g. dropping a bltouch sensor pin to trigger a probe. */
+         * Sets external.pull_mask / pull_value via SET_EXTERNAL so
+         * the drive PERSISTS across firmware PORT/DDR writes (a
+         * bare avr_raise_irq update only stays put until the next
+         * update_irqs from the firmware overwrites r_pin from
+         * PORT). Also raises the per-pin IRQ for an immediate
+         * effect. */
         char port = (char)a;
         if (port < 'A' || port > 'L')
             return;
         if (b < 0 || b > 7)
             return;
+        avr_ioport_external_t ext = {
+            .name = (uint8_t)port,
+            .mask = (uint8_t)(1U << b),
+            .value = c ? (uint8_t)(1U << b) : 0,
+        };
+        avr_ioctl(ctx->avr, AVR_IOCTL_IOPORT_SET_EXTERNAL(port), &ext);
         avr_irq_t *irq = avr_io_getirq(
             ctx->avr, AVR_IOCTL_IOPORT_GETIRQ(port), b);
         if (irq)

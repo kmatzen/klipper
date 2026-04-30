@@ -1,6 +1,7 @@
 # Test case for probe_eddy_current support
 CONFIG eddy.cfg
 DICTIONARY atmega2560.dict
+EMULATOR eddy.fixture.json
 
 # Start by homing the printer.
 G28
