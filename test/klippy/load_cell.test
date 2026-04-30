@@ -1,5 +1,6 @@
 # Tests for loadcell sensors
 DICTIONARY atmega2560.dict
+EMULATOR load_cell.fixture.json
 CONFIG load_cell.cfg
 
 # Start by homing the printer.

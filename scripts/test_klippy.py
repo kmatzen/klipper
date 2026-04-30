@@ -713,23 +713,27 @@ class TestCase:
         if raw.get('spi_ads1220'):
             lines.append("spi_ads1220")
         # load_cell_probe_trigger: hook the configured Z step pin and
-        # synthesize an ADC sample on every read - spike_sample if a
-        # step edge fired within the last window_us microseconds, 0
-        # otherwise. Lets PROBE / BED_MESH_CALIBRATE trigger and
-        # return in emulator mode where the load_cell_probe driver
-        # waits for an analog-trigger trsync that real hardware would
-        # close via physical force. Time-windowed so the two ADS1220
-        # chips that share the SPI hook each observe the same answer.
+        # synthesize a ramped ADC sample = (steps_in_burst *
+        # force_per_step) raw counts. A step burst starts on the
+        # first rising edge after a quiet stretch of reset_us in MCU
+        # sim time, so each tare->descent cycle starts from zero and
+        # the firmware's drift HPF / buzz LPF / notch SOS filter sees
+        # a sustained ramp it can pass through to fire trigger_analog
+        # at the configured trigger_force grams. Lets PROBE /
+        # BED_MESH_CALIBRATE actually trigger and return in emulator
+        # mode where the load_cell_probe driver waits for an analog-
+        # trigger trsync that real hardware would close via the load
+        # cell flexing under physical contact.
         probe_trig = raw.get('load_cell_probe_trigger')
         if probe_trig:
             step_pin = probe_trig.get('z_step_pin', '')
-            window_us = int(probe_trig.get('window_us', 5000))
-            spike_sample = int(probe_trig.get('spike_sample', 10000))
+            reset_us = int(probe_trig.get('reset_quiet_us', 50000))
+            force_per_step = int(probe_trig.get('force_per_step', 50))
             if (len(step_pin) >= 3 and step_pin[0] == 'P'
                     and step_pin[1].isalpha()):
                 lines.append("probe_step %s %d %d %d" % (
                     step_pin[1], int(step_pin[2:]),
-                    window_us, spike_sample))
+                    reset_us, force_per_step))
         # Software I2C: scan the cfg for any
         # i2c_software_scl_pin / i2c_software_sda_pin pairs and
         # configure the bridge's bit-bang ACK emulator on each. The

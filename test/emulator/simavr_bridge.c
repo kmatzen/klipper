@@ -390,23 +390,30 @@ static void sw_i2c_sda_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
 /* Load-cell-probe analog-trigger emulation. The load_cell_probe driver
  * arms a trigger_analog on the MCU and waits for an ADC sample to
- * cross a force threshold. Real hardware closes that loop through the
- * physical force on the cell; the bridge synthesizes it by holding
- * data_ready_pin low (so the firmware reads the ADC continuously) and
- * timestamping every Z step rising edge: when the firmware reads the
- * ADC, the bridge serves spike_sample if a step edge occurred within
- * the last `window_us` microseconds, otherwise 0. Time-windowed (not
- * delta-based) so multiple ADS1220 chips sharing the SPI hook each
- * see the same answer. step_threshold is unused but kept in the
- * control protocol for forward compatibility. */
+ * cross a force threshold. Real hardware closes that loop by the
+ * probe physically pushing into the bed - force grows over many ms
+ * as the load cell flexes. The bridge synthesizes that by holding
+ * data_ready_pin low (firmware reads continuously) and counting Z
+ * step rising edges: each ADC read returns
+ *   sample = (step_count - step_count_at_burst_start) * force_per_step
+ * for a linear ramp that builds while Z is descending. When no step
+ * has fired for `reset_cycles` (a quiet stretch i.e. a tare phase),
+ * the next edge starts a fresh burst with sample=0, so each probe
+ * point begins from zero. All timing is in MCU sim cycles
+ * (`avr->cycle`) so behaviour is deterministic regardless of host
+ * load - the firmware's SOS filter sees the same sequence of samples
+ * in the same MCU time base every run. */
 struct probe_step_state {
     pthread_mutex_t lock;
     int active;
     int step_port_ord;        /* (int)(unsigned char)'L' etc. */
     int step_pin;
-    uint64_t last_step_us;        /* monotonic clock at last rising edge */
-    uint32_t window_us;           /* spike-active window after each edge */
-    int32_t spike_sample;         /* raw 24-bit ADC counts during spike */
+    avr_t *avr;                            /* for cycle access in hooks */
+    uint64_t last_step_cycle;              /* avr->cycle at last edge */
+    uint64_t reset_cycles;                 /* quiet -> burst reset */
+    uint32_t step_count;                   /* total rising edges */
+    uint32_t step_count_at_burst_start;    /* baseline for current ramp */
+    int32_t force_per_step;                /* raw 24-bit counts per step */
 };
 
 static struct probe_step_state probe_step = {
@@ -720,32 +727,40 @@ apply_step_trigger(struct control_ctx *ctx,
             (char)trig_port_ord, trig_pin, trig_val);
 }
 
-/* probe_step <step_port> <step_pin> <window_us> <spike_sample>
+/* probe_step <step_port> <step_pin> <reset_us> <force_per_step>
  * Wire up the load-cell-probe analog-trigger emulation: hook a step
- * pin (typically Z) and timestamp rising edges. On each ADS1220 ADC
- * read the bridge serves spike_sample if a step edge occurred within
- * the last window_us microseconds, otherwise 0. Time-windowed so
- * multiple ADS1220 chips on the same SPI bus each observe the same
- * answer. window_us should bracket several ADC sample periods so the
- * spike is sustained long enough for the firmware's SOS filter to
- * push the filtered value past the trigger threshold. */
+ * pin (typically Z) and synthesize a ramped ADC sample on each
+ * continuous-mode ADS1220 read. Each rising edge after a quiet
+ * stretch of `reset_us` microseconds starts a new burst with sample
+ * baseline 0; subsequent reads return (steps_in_burst *
+ * force_per_step) raw counts. force_per_step is in raw ADC counts
+ * per step - pick it so the trigger threshold (counts_per_gram *
+ * trigger_force grams) is reached after enough probe-descent steps
+ * for the SOS filter to settle, but stays well below the safety
+ * range (counts_per_gram * force_safety_limit). */
 static void
 apply_probe_step(struct control_ctx *ctx,
                  int step_port_ord, int step_pin,
-                 int32_t window_us,
-                 int32_t spike_sample)
+                 int32_t reset_us,
+                 int32_t force_per_step)
 {
     if (step_port_ord < 'A' || step_port_ord > 'L')
         return;
     if (step_pin < 0 || step_pin > 7)
         return;
+    uint64_t cycles_per_us = ctx->avr->frequency / 1000000ULL;
+    uint64_t reset_cycles = (uint64_t)(reset_us > 0 ? reset_us : 50000)
+                            * cycles_per_us;
     pthread_mutex_lock(&probe_step.lock);
     probe_step.active = 1;
     probe_step.step_port_ord = step_port_ord;
     probe_step.step_pin = step_pin;
-    probe_step.last_step_us = 0;
-    probe_step.window_us = window_us > 0 ? (uint32_t)window_us : 5000;
-    probe_step.spike_sample = spike_sample;
+    probe_step.avr = ctx->avr;
+    probe_step.last_step_cycle = 0;
+    probe_step.reset_cycles = reset_cycles;
+    probe_step.step_count = 0;
+    probe_step.step_count_at_burst_start = 0;
+    probe_step.force_per_step = force_per_step;
     pthread_mutex_unlock(&probe_step.lock);
 
     avr_irq_t *step_irq = avr_io_getirq(
@@ -760,34 +775,36 @@ apply_probe_step(struct control_ctx *ctx,
     }
     if (ctx->verbose)
         fprintf(stderr,
-            "simavr_bridge: probe_step step=%c%d window_us=%d spike=%d\n",
+            "simavr_bridge: probe_step step=%c%d reset_us=%d"
+            " force_per_step=%d\n",
             (char)step_port_ord, step_pin,
-            (int)window_us, (int)spike_sample);
-}
-
-static uint64_t
-monotonic_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+            (int)reset_us, (int)force_per_step);
 }
 
 static void
 probe_step_hook(struct avr_irq_t *irq, uint32_t value, void *param)
 {
     (void)param;
-    /* Timestamp the rising edges of the configured Z step pin. simavr
-     * passes the new value as `value` while irq->value still holds
-     * the previous value (notify hooks fire before the IRQ updates). */
+    /* Z step rising edges drive the load-cell ramp. simavr passes
+     * the new value as `value` while irq->value still holds the
+     * previous value (notify hooks fire before the IRQ updates).
+     * After a quiet stretch (reset_cycles with no edges) the next
+     * edge restarts the burst from sample=0, so each tare->descent
+     * cycle starts fresh. */
     int prev = (int)irq->value;
     int next = value ? 1 : 0;
     if (prev == next || next == 0)
         return;
-    uint64_t now = monotonic_us();
     pthread_mutex_lock(&probe_step.lock);
-    if (probe_step.active)
-        probe_step.last_step_us = now;
+    if (probe_step.active && probe_step.avr) {
+        uint64_t now = probe_step.avr->cycle;
+        uint64_t last = probe_step.last_step_cycle;
+        if (last == 0 || now - last > probe_step.reset_cycles) {
+            probe_step.step_count_at_burst_start = probe_step.step_count;
+        }
+        probe_step.step_count++;
+        probe_step.last_step_cycle = now;
+    }
     pthread_mutex_unlock(&probe_step.lock);
 }
 
@@ -1235,19 +1252,29 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
                 memset(spi_state.ads_regs, 0,
                        sizeof(spi_state.ads_regs));
             } else if (cmd == 0x00 && probe_step.active) {
-                /* Continuous-mode ADC read.  Sample is spike if a Z
-                 * step edge fired within the last window_us; else 0.
-                 * Time-windowed so both ADS1220 chips on the SPI bus
-                 * see the same answer when they read in turn. */
+                /* Continuous-mode ADC read.  Serve a ramped 24-bit
+                 * sample = (steps_since_burst_start * force_per_step)
+                 * while a step burst is active (last edge within
+                 * reset_cycles), or 0 during quiet (tare) stretches.
+                 * All timing is in MCU sim cycles so the firmware's
+                 * SOS filter sees the same ramp profile every run
+                 * regardless of host load. */
                 pthread_mutex_lock(&probe_step.lock);
-                uint64_t last_step = probe_step.last_step_us;
-                uint32_t window = probe_step.window_us;
-                int32_t spike_val = probe_step.spike_sample;
+                int32_t sample = 0;
+                if (probe_step.avr) {
+                    uint64_t now = probe_step.avr->cycle;
+                    uint64_t last = probe_step.last_step_cycle;
+                    if (last != 0 && now - last <= probe_step.reset_cycles) {
+                        uint32_t steps = probe_step.step_count
+                            - probe_step.step_count_at_burst_start;
+                        int64_t v = (int64_t)steps
+                            * (int64_t)probe_step.force_per_step;
+                        if (v > 0x7fffff) v = 0x7fffff;
+                        if (v < -0x800000) v = -0x800000;
+                        sample = (int32_t)v;
+                    }
+                }
                 pthread_mutex_unlock(&probe_step.lock);
-                uint64_t now = monotonic_us();
-                int32_t sample = (last_step != 0
-                                  && now - last_step <= window)
-                                 ? spike_val : 0;
                 spi_state.ads_sample[0] = (uint8_t)((sample >> 16) & 0xff);
                 spi_state.ads_sample[1] = (uint8_t)((sample >> 8) & 0xff);
                 spi_state.ads_sample[2] = (uint8_t)(sample & 0xff);
@@ -1483,14 +1510,14 @@ apply_control_line(struct control_ctx *ctx, char *line)
     if (strncmp(line, "probe_step ", 11) == 0) {
         char step_port = 0;
         int step_pin = -1;
-        int step_threshold = 0, spike_sample = 0;
+        int reset_us = 0, force_per_step = 0;
         int got = sscanf(line + 11, "%c %d %d %d",
                          &step_port, &step_pin,
-                         &step_threshold, &spike_sample);
+                         &reset_us, &force_per_step);
         if (got == 4) {
             apply_probe_step(ctx,
                 (int)(unsigned char)step_port, step_pin,
-                step_threshold, spike_sample);
+                reset_us, force_per_step);
         }
         return;
     }
