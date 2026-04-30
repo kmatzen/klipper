@@ -340,6 +340,26 @@ static int g_trigger_hook_registered[96] = {0};
 static void step_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static void trigger_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
+/* Software I2C bit-bang slave-side ACK emulation. */
+struct sw_i2c_state {
+    int configured;
+    char scl_port; int scl_pin;
+    char sda_port; int sda_pin;
+    int active;
+    int bit_count;
+    int last_sda;
+    int last_scl;
+    int self_driving;
+    avr_t *avr;
+};
+
+static pthread_mutex_t sw_i2c_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sw_i2c_state sw_i2c = {0};
+static int g_sw_i2c_hook_registered[96] = {0};
+
+static void sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+static void sw_i2c_sda_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+
 struct control_ctx {
     avr_t *avr;
     char socket_path[PATH_MAX];
@@ -663,6 +683,54 @@ apply_bltouch(struct control_ctx *ctx,
             (char)sensor_port_ord, sensor_pin, invert);
 }
 
+/* Configure the software-I2C bit-bang ACK emulator on the given
+ * SCL/SDA pin pair. Hooks both pins; on each ACK slot the bridge
+ * drives SDA low. */
+static void
+apply_sw_i2c(struct control_ctx *ctx,
+             int scl_port_ord, int scl_pin,
+             int sda_port_ord, int sda_pin)
+{
+    if (scl_port_ord < 'A' || scl_port_ord > 'L'
+            || sda_port_ord < 'A' || sda_port_ord > 'L')
+        return;
+    if (scl_pin < 0 || scl_pin > 7 || sda_pin < 0 || sda_pin > 7)
+        return;
+    pthread_mutex_lock(&sw_i2c_lock);
+    sw_i2c.configured = 1;
+    sw_i2c.scl_port = (char)scl_port_ord;
+    sw_i2c.scl_pin = scl_pin;
+    sw_i2c.sda_port = (char)sda_port_ord;
+    sw_i2c.sda_pin = sda_pin;
+    sw_i2c.active = 0;
+    sw_i2c.bit_count = 0;
+    sw_i2c.last_sda = 1;
+    sw_i2c.last_scl = 1;
+    sw_i2c.avr = ctx->avr;
+    pthread_mutex_unlock(&sw_i2c_lock);
+
+    avr_irq_t *scl_irq = avr_io_getirq(
+        ctx->avr, AVR_IOCTL_IOPORT_GETIRQ((char)scl_port_ord), scl_pin);
+    if (scl_irq && !g_sw_i2c_hook_registered[(scl_port_ord - 'A') * 8
+                                              + scl_pin]) {
+        avr_irq_register_notify(scl_irq, sw_i2c_scl_hook, NULL);
+        g_sw_i2c_hook_registered[(scl_port_ord - 'A') * 8 + scl_pin] = 1;
+    }
+    avr_irq_t *sda_irq = avr_io_getirq(
+        ctx->avr, AVR_IOCTL_IOPORT_GETIRQ((char)sda_port_ord), sda_pin);
+    if (sda_irq && !g_sw_i2c_hook_registered[(sda_port_ord - 'A') * 8
+                                              + sda_pin]) {
+        avr_irq_register_notify(sda_irq, sw_i2c_sda_hook, NULL);
+        g_sw_i2c_hook_registered[(sda_port_ord - 'A') * 8 + sda_pin] = 1;
+    }
+
+    if (ctx->verbose)
+        fprintf(stderr,
+            "simavr_bridge: sw_i2c scl=%c%d sda=%c%d\n",
+            (char)scl_port_ord, scl_pin,
+            (char)sda_port_ord, sda_pin);
+}
+
 static avr_irq_t *g_spi_in_irq = NULL;
 
 /* Hook on the configured step pin. Fires every time simavr propagates
@@ -775,6 +843,102 @@ trigger_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param)
         }
     }
     pthread_mutex_unlock(&step_lock);
+}
+
+/* Drive the SDA pin to a value (0 = ACK, 1 = release). The two-step
+ * dance is required because simavr models per-pin IRQs vs. an
+ * external-pull table separately:
+ *   - SET_EXTERNAL persists across the firmware's PORT/DDR writes
+ *     (the next update_irqs reads pull_value through external) so
+ *     the firmware's "release SDA via input + pull-up" doesn't snap
+ *     the line back high mid-ACK-slot. With the bridge's vendored
+ *     simavr patch SET_EXTERNAL ALSO calls update_irqs immediately,
+ *     so the new value lands in r_pin without waiting for a future
+ *     PORT/DDR write
+ *   - avr_raise_irq still updates the per-pin IRQ chain immediately
+ *     (belt-and-suspenders for cases where the firmware reads PIN
+ *     before any update_irqs has fired)
+ * Sets self_driving so our SDA hook ignores the resulting IRQ
+ * notification (otherwise our own ACK pulse looks like a START or
+ * STOP and resets the bit counter). */
+static void
+sw_i2c_drive_sda(int value)
+{
+    if (!sw_i2c.avr || !sw_i2c.configured)
+        return;
+    pthread_mutex_lock(&sw_i2c_lock);
+    sw_i2c.self_driving = 1;
+    pthread_mutex_unlock(&sw_i2c_lock);
+    avr_ioport_external_t ext = {
+        .name = sw_i2c.sda_port,
+        .mask = (uint8_t)(1U << sw_i2c.sda_pin),
+        .value = value ? (uint8_t)(1U << sw_i2c.sda_pin) : 0,
+    };
+    avr_ioctl(sw_i2c.avr,
+              AVR_IOCTL_IOPORT_SET_EXTERNAL(sw_i2c.sda_port), &ext);
+    avr_irq_t *sda = avr_io_getirq(
+        sw_i2c.avr,
+        AVR_IOCTL_IOPORT_GETIRQ(sw_i2c.sda_port),
+        sw_i2c.sda_pin);
+    if (sda)
+        avr_raise_irq(sda, value ? 1 : 0);
+    pthread_mutex_lock(&sw_i2c_lock);
+    sw_i2c.self_driving = 0;
+    pthread_mutex_unlock(&sw_i2c_lock);
+}
+
+static void
+sw_i2c_sda_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq; (void)param;
+    int next = value ? 1 : 0;
+    pthread_mutex_lock(&sw_i2c_lock);
+    if (sw_i2c.self_driving) {
+        sw_i2c.last_sda = next;
+        pthread_mutex_unlock(&sw_i2c_lock);
+        return;
+    }
+    int prev = sw_i2c.last_sda;
+    sw_i2c.last_sda = next;
+    if (prev != next && sw_i2c.last_scl == 1) {
+        if (prev == 1 && next == 0) {
+            sw_i2c.active = 1;
+            sw_i2c.bit_count = 0;
+        } else if (prev == 0 && next == 1) {
+            sw_i2c.active = 0;
+            sw_i2c.bit_count = 0;
+        }
+    }
+    pthread_mutex_unlock(&sw_i2c_lock);
+}
+
+static void
+sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq; (void)param;
+    int next = value ? 1 : 0;
+    int drive_low = 0, release = 0;
+    pthread_mutex_lock(&sw_i2c_lock);
+    int prev = sw_i2c.last_scl;
+    sw_i2c.last_scl = next;
+    if (prev == next || !sw_i2c.active) {
+        pthread_mutex_unlock(&sw_i2c_lock);
+        return;
+    }
+    if (prev == 1 && next == 0) {
+        sw_i2c.bit_count++;
+        if (sw_i2c.bit_count == 8)
+            drive_low = 1;
+        else if (sw_i2c.bit_count == 9) {
+            release = 1;
+            sw_i2c.bit_count = 0;
+        }
+    }
+    pthread_mutex_unlock(&sw_i2c_lock);
+    if (drive_low)
+        sw_i2c_drive_sda(0);
+    else if (release)
+        sw_i2c_drive_sda(1);
 }
 
 /* Hook on the BLTouch control pin. Klippy drives this with software
@@ -1064,6 +1228,18 @@ apply_control_line(struct control_ctx *ctx, char *line)
             apply_bltouch(ctx,
                 (int)(unsigned char)ctrl_port, ctrl_pin,
                 (int)(unsigned char)sensor_port, sensor_pin, invert);
+        }
+        return;
+    }
+    if (strncmp(line, "sw_i2c ", 7) == 0) {
+        char scl_port = 0, sda_port = 0;
+        int scl_pin = -1, sda_pin = -1;
+        int got = sscanf(line + 7, "%c %d %c %d",
+                         &scl_port, &scl_pin, &sda_port, &sda_pin);
+        if (got == 4) {
+            apply_sw_i2c(ctx,
+                (int)(unsigned char)scl_port, scl_pin,
+                (int)(unsigned char)sda_port, sda_pin);
         }
         return;
     }

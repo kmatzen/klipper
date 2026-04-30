@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --depth 1 \
         https://github.com/buserror/simavr.git /tmp/simavr \
     && cd /tmp/simavr \
+    && sed -i 's|p->external.pull_value = m->value;|p->external.pull_value = m->value;\n\t\t\t\tavr_ioport_update_irqs(p);|' \
+        simavr/sim/avr_ioport.c \
+    && grep -A1 "p->external.pull_value = m->value" simavr/sim/avr_ioport.c \
     && make build-simavr install RELEASE=1 DESTDIR=/usr/local 2>&1 | tail -5 \
     && mkdir -p /usr/local/include/simavr/parts \
     && cp examples/parts/uart_pty.h /usr/local/include/simavr/parts/ \

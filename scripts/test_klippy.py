@@ -428,6 +428,41 @@ class TestCase:
     _EXTRUDER_SECTION_RE = re.compile(r'^\[(extruder\d*)\]\s*$')
     _PROBE_PIN_RE = re.compile(r'^\s*pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
                                r'(?:#.*)?$')
+    _SW_I2C_RE = re.compile(
+        r'^\s*i2c_software_(scl|sda)_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
+        r'(?:#.*)?$')
+
+    @classmethod
+    def _parse_sw_i2c_pin_pairs(cls, config_fname):
+        # Yield (scl_pin, sda_pin) for each section that has matching
+        # i2c_software_scl_pin / i2c_software_sda_pin entries. Pairs
+        # are emitted in section-declaration order.
+        pairs = []
+        scl = sda = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return pairs
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    if scl and sda:
+                        pairs.append((scl, sda))
+                    scl = sda = None
+                    continue
+                m = cls._SW_I2C_RE.match(line)
+                if not m:
+                    continue
+                if m.group(1) == 'scl':
+                    scl = m.group(3)
+                else:
+                    sda = m.group(3)
+        finally:
+            f.close()
+        if scl and sda:
+            pairs.append((scl, sda))
+        return pairs
 
     @classmethod
     def _parse_probe_pin(cls, config_fname):
@@ -668,6 +703,16 @@ class TestCase:
         # succeeds. Mutually exclusive with spi_response.
         if raw.get('spi_tmc'):
             lines.append("spi_tmc")
+        # Software I2C: scan the cfg for any
+        # i2c_software_scl_pin / i2c_software_sda_pin pairs and
+        # configure the bridge's bit-bang ACK emulator on each. The
+        # bridge auto-ACKs every byte on those pins so write-only
+        # software-I2C peripherals (e.g. pca9632) succeed.
+        if raw.get('sw_i2c_auto_ack', True) and config_fname is not None:
+            for scl, sda in self._parse_sw_i2c_pin_pairs(config_fname):
+                lines.append("sw_i2c %s %d %s %d" % (
+                    scl[1], int(scl[2:]),
+                    sda[1], int(sda[2:])))
         # gpio: list of [port_letter, pin, value] triples. Drives the
         # named GPIO pin to the given level via the bridge's gpio
         # control command. Useful for tests where a sensor's data-
