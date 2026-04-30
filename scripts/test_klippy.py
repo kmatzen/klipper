@@ -431,6 +431,36 @@ class TestCase:
     _SW_I2C_RE = re.compile(
         r'^\s*i2c_software_(scl|sda)_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
         r'(?:#.*)?$')
+    _TMC_UART_SECTION_RE = re.compile(
+        r'^\[(tmc220[89])\s+\S+\]\s*$')
+    _TMC_UART_PIN_RE = re.compile(
+        r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+
+    @classmethod
+    def _parse_tmc_uart_pins(cls, config_fname):
+        # Yield uart_pin (e.g. "PA5") for every [tmc2208 ...] / [tmc2209
+        # ...] section. Pins are emitted in section-declaration order.
+        pins = []
+        in_section = False
+        try:
+            f = open(config_fname)
+        except OSError:
+            return pins
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    in_section = bool(cls._TMC_UART_SECTION_RE.match(stripped))
+                    continue
+                if not in_section:
+                    continue
+                m = cls._TMC_UART_PIN_RE.match(line)
+                if m:
+                    pins.append(m.group(2))
+                    in_section = False
+        finally:
+            f.close()
+        return pins
 
     @classmethod
     def _parse_sw_i2c_pin_pairs(cls, config_fname):
@@ -744,6 +774,22 @@ class TestCase:
                 lines.append("sw_i2c %s %d %s %d" % (
                     scl[1], int(scl[2:]),
                     sda[1], int(sda[2:])))
+        # Software UART: scan the cfg for [tmc2208/2209 ...] sections
+        # and configure the bridge's UART slave model on each uart_pin.
+        # The bridge decodes the bit-banged datagrams (TMC2208/2209
+        # half-duplex single-wire UART), services WREG/RREG against a
+        # per-chip register file, and pulses the response back over
+        # the same wire so klippy's tmc_uart driver succeeds in
+        # emulator mode.  bit_time defaults to 1778 cycles
+        # (TMC_BAUD_RATE_AVR=9000 baud at 16 MHz).  Override via
+        # `sw_uart_bit_time_cycles` in the fixture if needed.
+        if raw.get('sw_uart_auto', True) and config_fname is not None:
+            bit_time = int(raw.get('sw_uart_bit_time_cycles', 1778))
+            for upin in self._parse_tmc_uart_pins(config_fname):
+                if (len(upin) >= 3 and upin[0] == 'P'
+                        and upin[1].isalpha()):
+                    lines.append("sw_uart %s %d %d 0" % (
+                        upin[1], int(upin[2:]), bit_time))
         # gpio: list of [port_letter, pin, value] triples. Drives the
         # named GPIO pin to the given level via the bridge's gpio
         # control command. Useful for tests where a sensor's data-

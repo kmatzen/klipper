@@ -406,6 +406,86 @@ static int g_sw_i2c_hook_registered[96] = {0};
 static void sw_i2c_scl_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static void sw_i2c_sda_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 
+/* Software-UART slave model for TMC2208/2209 single-wire UART.
+ *
+ * klippy bit-bangs the UART line via src/tmcuart.c: tmcuart_send_event
+ * toggles the tx_pin at cfg_bit_time MCU cycles per bit, sending a
+ * pre-encoded bit stream where each chip-level byte is wrapped as
+ * start(0) + 8 data bits LSB-first + stop(1) (klippy's
+ * MCU_TMC_uart_bitbang._add_serial_bits). For a read request the
+ * firmware then reconfigures the pin as input (single-wire) and
+ * samples for the slave's response; for a write it just goes idle.
+ *
+ * The bridge:
+ *   1. Hooks the UART pin's port IRQ. On a falling edge from idle
+ *      (line was high) we have a start bit - schedule a simavr cycle
+ *      timer at +1.5 * bit_time so the first sample lands in the
+ *      middle of data bit 0.
+ *   2. The cycle timer reads the pin, stores the bit, schedules the
+ *      next sample at +bit_time. After 8 data bits and 1 stop bit
+ *      we have a complete byte; back to idle, wait for next falling
+ *      edge.
+ *   3. Once we've seen 4 bytes (read req) or 8 bytes (write), decode
+ *      the TMC datagram (sync 0x05, node addr, reg addr, [4 data],
+ *      crc8). The CRC validates the frame.
+ *   4. WRITE: store data[0..3] in the chip's register file.
+ *   5. READ: synthesize a response (8 bytes) with the requested
+ *      register's stored value, then encode each byte as 10 bits
+ *      (start + data LSB-first + stop) and drive the pin via
+ *      SET_EXTERNAL on a cycle timer that fires at bit_time intervals
+ *      to pulse the response back to the firmware. firmware's
+ *      tmcuart_read_sync_event sees the response and decodes it.
+ *
+ * All timing is in MCU sim cycles (avr->cycle) so the protocol
+ * timing is deterministic regardless of host CPU load. */
+#define SW_UART_MAX 4
+#define SW_UART_RX_BUF 16    /* encoded bytes; we expect <=8 */
+#define SW_UART_TX_BUF 16    /* response bytes (8 data + slack) */
+struct sw_uart_state {
+    int active;
+    char port; int pin;          /* shared TX/RX in single-wire mode */
+    avr_t *avr;
+    uint32_t bit_time;           /* MCU cycles per bit */
+    uint8_t addr;                /* expected node address */
+
+    /* RX state machine. Driven by the pin IRQ for the start-bit edge,
+     * then by a simavr cycle timer (rx_timer) for sampling subsequent
+     * bits. */
+    int rx_armed;                /* 1 when expecting next falling edge */
+    int rx_in_byte;              /* 1 when sampling bits of current byte */
+    int rx_bit_pos;              /* next data-bit index 0..7 */
+    uint8_t rx_byte;             /* accumulating byte */
+    uint8_t rx_buf[SW_UART_RX_BUF];
+    int rx_len;
+    uint64_t rx_last_cycle;      /* cycle of last completed byte (for idle gap) */
+
+    /* TX state machine. Once an RX read request decodes, we populate
+     * tx_buf with the response and a cycle timer drives bits at
+     * bit_time intervals via SET_EXTERNAL. */
+    int tx_active;
+    uint8_t tx_buf[SW_UART_TX_BUF];
+    int tx_len;
+    int tx_byte_pos;             /* current byte being sent */
+    int tx_bit_pos;              /* 0..9: 0=start, 1..8=data, 9=stop */
+
+    /* Per-chip register file for TMC2208/2209. 7-bit address space. */
+    uint32_t regs[128];
+};
+
+static pthread_mutex_t sw_uart_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sw_uart_state sw_uart[SW_UART_MAX];
+static int sw_uart_count = 0;
+static int g_sw_uart_hook_registered[96] = {0};
+
+static void sw_uart_pin_hook(struct avr_irq_t *irq, uint32_t value,
+                             void *param);
+static avr_cycle_count_t sw_uart_rx_sample(struct avr_t *avr,
+                                           avr_cycle_count_t when,
+                                           void *param);
+static avr_cycle_count_t sw_uart_tx_bit(struct avr_t *avr,
+                                        avr_cycle_count_t when,
+                                        void *param);
+
 /* Load-cell-probe analog-trigger emulation. The load_cell_probe driver
  * arms a trigger_analog on the MCU and waits for an ADC sample to
  * cross a force threshold. Real hardware closes that loop by the
@@ -1216,6 +1296,292 @@ bltouch_ctrl_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     pthread_mutex_unlock(&bltouch_lock);
 }
 
+/* sw_uart helpers ----------------------------------------------- */
+
+/* CRC8-ATM (poly 0x07, MSB-first), matching klippy/extras/tmc_uart.py
+ * MCU_TMC_uart_bitbang._calc_crc8 byte-for-byte. */
+static uint8_t
+sw_uart_crc8(const uint8_t *data, int len)
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        uint8_t b = data[i];
+        for (int j = 0; j < 8; j++) {
+            if (((crc >> 7) ^ (b & 0x01)) & 0x01)
+                crc = (uint8_t)((crc << 1) ^ 0x07);
+            else
+                crc = (uint8_t)(crc << 1);
+            b >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* Drive the (single-wire) UART pin low or high via SET_EXTERNAL.
+ * Used to pulse out a response. The pin is in firmware-input mode at
+ * this point, so SET_EXTERNAL controls what gpio_in_read returns. */
+static void
+sw_uart_drive(struct sw_uart_state *u, int high)
+{
+    if (!u->avr)
+        return;
+    avr_ioport_external_t ext = {
+        .name = u->port,
+        .mask = (uint8_t)(1U << u->pin),
+        .value = high ? (uint8_t)(1U << u->pin) : 0,
+    };
+    avr_ioctl(u->avr, AVR_IOCTL_IOPORT_SET_EXTERNAL(u->port), &ext);
+    avr_irq_t *irq = avr_io_getirq(u->avr,
+                                   AVR_IOCTL_IOPORT_GETIRQ(u->port), u->pin);
+    if (irq)
+        avr_raise_irq(irq, high ? 1 : 0);
+}
+
+/* Decode the buffered RX bytes as a TMC2208/2209 datagram and react.
+ *   Read req:  4 bytes [sync, addr, reg, crc]
+ *   Write req: 8 bytes [sync, addr, reg|0x80, d0, d1, d2, d3, crc]
+ * On read req we populate tx_buf with an 8-byte response and arm
+ * the TX cycle timer. On write we just store the data in the
+ * register file. */
+static void
+sw_uart_handle_frame(struct sw_uart_state *u)
+{
+    if (u->rx_len < 4)
+        return;
+    uint8_t sync = u->rx_buf[0];
+    if (sync != 0x05 && sync != 0xf5)
+        return;          /* not a recognized TMC sync byte - ignore */
+    uint8_t reg_field = u->rx_buf[2];
+    int is_write = (reg_field & 0x80) != 0;
+    int expected = is_write ? 8 : 4;
+    if (u->rx_len != expected)
+        return;
+    uint8_t crc = sw_uart_crc8(u->rx_buf, expected - 1);
+    if (crc != u->rx_buf[expected - 1])
+        return;
+    uint8_t reg = (uint8_t)(reg_field & 0x7f);
+    if (is_write) {
+        uint32_t v = ((uint32_t)u->rx_buf[3] << 24)
+                   | ((uint32_t)u->rx_buf[4] << 16)
+                   | ((uint32_t)u->rx_buf[5] << 8)
+                   |  (uint32_t)u->rx_buf[6];
+        u->regs[reg] = v;
+        return;
+    }
+    /* Build 8-byte read response: [sync, master_addr=0xff, reg, d0..3, crc]
+     * matches klippy._encode_write(0x05, 0xff, reg, val) - the firmware
+     * round-trips this through _decode_read which calls _encode_write
+     * with sync=0x05 to compare bytes. */
+    uint32_t v = u->regs[reg];
+    uint8_t resp[8];
+    resp[0] = 0x05;
+    resp[1] = 0xff;
+    resp[2] = reg;
+    resp[3] = (uint8_t)((v >> 24) & 0xff);
+    resp[4] = (uint8_t)((v >> 16) & 0xff);
+    resp[5] = (uint8_t)((v >> 8) & 0xff);
+    resp[6] = (uint8_t)(v & 0xff);
+    resp[7] = sw_uart_crc8(resp, 7);
+    memcpy(u->tx_buf, resp, 8);
+    u->tx_len = 8;
+    u->tx_byte_pos = 0;
+    u->tx_bit_pos = 0;
+    u->tx_active = 1;
+    /* Explicitly assert idle HIGH on the line so the firmware's
+     * tmcuart_read_sync_event sees a HIGH-then-LOW transition (it
+     * latches TU_READ_SYNC on HIGH, syncs on the subsequent LOW).
+     * Without this it can race a stale EXTERNAL=0 from a prior chip
+     * and the very first sample lands on our start bit, which
+     * doesn't set TU_READ_SYNC and shifts the byte alignment by 1. */
+    sw_uart_drive(u, 1);
+    /* Schedule the first TX bit a few bit_times after the firmware's
+     * stop-bit edge, giving its read_sync_event time to arm and
+     * sample HIGH at least once before our LOW start bit. */
+    avr_cycle_timer_register(u->avr, u->bit_time * 4,
+                             sw_uart_tx_bit, u);
+}
+
+/* simavr cycle timer callback: drive one bit of the response. */
+static avr_cycle_count_t
+sw_uart_tx_bit(struct avr_t *avr, avr_cycle_count_t when, void *param)
+{
+    (void)avr;
+    struct sw_uart_state *u = (struct sw_uart_state *)param;
+    pthread_mutex_lock(&sw_uart_lock);
+    if (!u->tx_active || u->tx_byte_pos >= u->tx_len) {
+        u->tx_active = 0;
+        pthread_mutex_unlock(&sw_uart_lock);
+        sw_uart_drive(u, 1);    /* idle line */
+        return 0;
+    }
+    uint8_t b = u->tx_buf[u->tx_byte_pos];
+    int bit_value;
+    if (u->tx_bit_pos == 0)
+        bit_value = 0;            /* start bit */
+    else if (u->tx_bit_pos <= 8)
+        bit_value = (b >> (u->tx_bit_pos - 1)) & 0x01;
+    else
+        bit_value = 1;            /* stop bit */
+    u->tx_bit_pos++;
+    if (u->tx_bit_pos > 9) {
+        u->tx_bit_pos = 0;
+        u->tx_byte_pos++;
+    }
+    uint32_t bt = u->bit_time;
+    pthread_mutex_unlock(&sw_uart_lock);
+    /* Drive after releasing the lock so the synchronous IRQ
+     * dispatch (avr_raise_irq) inside the hook can briefly take
+     * the lock without recursing on this thread. The hook checks
+     * tx_active while we hold it elsewhere - safe because we set
+     * tx_active=1 on entry and only clear it after the loop ends. */
+    sw_uart_drive(u, bit_value);
+    return when + bt;
+}
+
+/* simavr cycle timer callback: sample the next RX bit. */
+static avr_cycle_count_t
+sw_uart_rx_sample(struct avr_t *avr, avr_cycle_count_t when, void *param)
+{
+    (void)when;
+    struct sw_uart_state *u = (struct sw_uart_state *)param;
+    pthread_mutex_lock(&sw_uart_lock);
+    if (!u->rx_in_byte) {
+        pthread_mutex_unlock(&sw_uart_lock);
+        return 0;
+    }
+    avr_irq_t *irq = avr_io_getirq(avr, AVR_IOCTL_IOPORT_GETIRQ(u->port),
+                                   u->pin);
+    int bit = irq ? (int)(irq->value & 1) : 1;
+    if (u->rx_bit_pos < 8) {
+        if (bit)
+            u->rx_byte |= (uint8_t)(1U << u->rx_bit_pos);
+        u->rx_bit_pos++;
+        uint32_t bt = u->bit_time;
+        pthread_mutex_unlock(&sw_uart_lock);
+        return when + bt;
+    }
+    /* Just sampled stop bit slot - byte complete. */
+    if (u->rx_len < SW_UART_RX_BUF)
+        u->rx_buf[u->rx_len++] = u->rx_byte;
+    u->rx_in_byte = 0;
+    u->rx_armed = 1;
+    u->rx_last_cycle = avr->cycle;
+    /* Schedule a frame-completion check: if no further start bit
+     * within ~3 bit_times, treat the buffer as a complete frame. */
+    pthread_mutex_unlock(&sw_uart_lock);
+    return 0;
+}
+
+/* simavr cycle timer callback: if the line has been idle for long
+ * enough, decode the buffered frame.  Re-arms itself on every fire
+ * until either the frame is decoded or no bytes are pending. */
+static avr_cycle_count_t
+sw_uart_frame_check(struct avr_t *avr, avr_cycle_count_t when, void *param)
+{
+    struct sw_uart_state *u = (struct sw_uart_state *)param;
+    pthread_mutex_lock(&sw_uart_lock);
+    if (u->rx_in_byte) {
+        uint32_t bt = u->bit_time;
+        pthread_mutex_unlock(&sw_uart_lock);
+        return when + bt * 4;
+    }
+    if (u->rx_len == 0) {
+        pthread_mutex_unlock(&sw_uart_lock);
+        return 0;
+    }
+    if (avr->cycle - u->rx_last_cycle < u->bit_time * 3) {
+        uint32_t bt = u->bit_time;
+        pthread_mutex_unlock(&sw_uart_lock);
+        return when + bt * 4;
+    }
+    sw_uart_handle_frame(u);
+    u->rx_len = 0;
+    u->rx_armed = 1;
+    pthread_mutex_unlock(&sw_uart_lock);
+    return 0;
+}
+
+/* Pin IRQ hook: catches the start-bit falling edge and arms the RX
+ * sample timer. Falling edges from our own TX driving land here too;
+ * tx_active filters those out. */
+static void
+sw_uart_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq;
+    struct sw_uart_state *u = (struct sw_uart_state *)param;
+    if (!u || !u->avr)
+        return;
+    int next = value ? 1 : 0;
+    if (next != 0)
+        return;     /* only care about falling edges (start bits) */
+    int register_frame_check = 0;
+    pthread_mutex_lock(&sw_uart_lock);
+    if (u->tx_active || u->rx_in_byte || !u->rx_armed) {
+        pthread_mutex_unlock(&sw_uart_lock);
+        return;
+    }
+    u->rx_in_byte = 1;
+    u->rx_armed = 0;
+    u->rx_bit_pos = 0;
+    u->rx_byte = 0;
+    if (u->rx_len == 0)
+        register_frame_check = 1;
+    avr_cycle_count_t delay = u->bit_time + u->bit_time / 2;
+    pthread_mutex_unlock(&sw_uart_lock);
+    avr_cycle_timer_register(u->avr, delay, sw_uart_rx_sample, u);
+    if (register_frame_check)
+        avr_cycle_timer_register(u->avr, u->bit_time * 4,
+                                 sw_uart_frame_check, u);
+}
+
+/* sw_uart <port> <pin> <bit_time_cycles> <addr>
+ * Configure a single-wire TMC UART slave on <port><pin>. */
+static void
+apply_sw_uart(struct control_ctx *ctx,
+              int port_ord, int pin,
+              int bit_time, int addr)
+{
+    if (port_ord < 'A' || port_ord > 'L' || pin < 0 || pin > 7)
+        return;
+    if (bit_time <= 0)
+        bit_time = 1778;    /* TMC_BAUD_RATE_AVR=9000 baud at 16 MHz */
+    if (sw_uart_count >= SW_UART_MAX)
+        return;
+    struct sw_uart_state *u = &sw_uart[sw_uart_count++];
+    memset(u, 0, sizeof(*u));
+    u->active = 1;
+    u->port = (char)port_ord;
+    u->pin = pin;
+    u->avr = ctx->avr;
+    u->bit_time = (uint32_t)bit_time;
+    u->addr = (uint8_t)addr;
+    u->rx_armed = 1;
+
+    /* TMC2208/2209 default register values that the chip reports
+     * after reset.  klippy probes a handful during init / DUMP_TMC;
+     * supplying plausible values keeps the driver from flagging the
+     * chip as unresponsive. IOIN reports the chip variant so klippy
+     * can tell them apart - 0x21 = TMC2208 silentstepstick rev.
+     * IFCNT is a write counter; klippy expects it to advance after
+     * each WREG.  GSTAT reset value is 1 (reset flag set). */
+    u->regs[0x00] = 0x00000040;   /* GCONF: pdn_disable=1 (UART mode) */
+    u->regs[0x01] = 0x00000001;   /* GSTAT: reset flag */
+    u->regs[0x06] = 0x21000040;   /* IOIN: version=0x21 (TMC2208) */
+    u->regs[0x6f] = 0xc0000000;   /* DRV_STATUS: stst=1 (standstill) */
+
+    avr_irq_t *p = avr_io_getirq(ctx->avr,
+                                 AVR_IOCTL_IOPORT_GETIRQ((char)port_ord),
+                                 pin);
+    int idx = (port_ord - 'A') * 8 + pin;
+    if (p && !g_sw_uart_hook_registered[idx]) {
+        avr_irq_register_notify(p, sw_uart_pin_hook, u);
+        g_sw_uart_hook_registered[idx] = 1;
+    }
+    if (ctx->verbose)
+        fprintf(stderr, "simavr_bridge: sw_uart pin=%c%d bit_time=%u addr=%u\n",
+                (char)port_ord, pin, u->bit_time, u->addr);
+}
+
 /* Hook on the firmware's SPI MOSI byte. Each time the firmware
  * writes SPDR, simavr fires this with the byte going OUT to the
  * (virtual) slave; we synchronously raise SPI_IRQ_INPUT with the
@@ -1536,6 +1902,17 @@ apply_control_line(struct control_ctx *ctx, char *line)
             apply_probe_step(ctx,
                 (int)(unsigned char)step_port, step_pin,
                 reset_us, force_per_step);
+        }
+        return;
+    }
+    if (strncmp(line, "sw_uart ", 8) == 0) {
+        char port = 0;
+        int pin = -1, bit_time = 0, addr = 0;
+        int got = sscanf(line + 8, "%c %d %d %d",
+                         &port, &pin, &bit_time, &addr);
+        if (got == 4) {
+            apply_sw_uart(ctx, (int)(unsigned char)port, pin,
+                          bit_time, addr);
         }
         return;
     }
