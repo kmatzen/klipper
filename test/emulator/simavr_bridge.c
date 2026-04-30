@@ -168,6 +168,19 @@ struct twi_response_state {
     size_t pos;
     uint8_t current_addr;  /* last addressed slave for diagnostics */
     int verbose;
+    /* Register-aware mode: when reg_count > 0, the bridge tracks
+     * the last byte the firmware wrote (klippy's "register address"
+     * preface), then on the subsequent read serves the bytes
+     * configured for that register. Set up via the i2c_reg control
+     * command; falls back to the flat bytes[] queue when no reg
+     * configured for the current address. */
+    uint8_t reg_addrs[64];          /* register addresses (one per chip) */
+    uint8_t reg_data[64][8];        /* up to 8 bytes per register */
+    uint8_t reg_lens[64];           /* bytes configured per register */
+    int reg_count;                  /* slots in use */
+    uint8_t pending_reg;            /* most recent write (register select) */
+    int pending_reg_valid;          /* 1 if pending_reg holds a valid select */
+    uint8_t pending_pos;            /* read offset into the matched register */
 };
 
 static struct twi_response_state twi_state = {
@@ -402,6 +415,44 @@ apply_control_command(struct control_ctx *ctx, const char *line)
             fprintf(stderr,
                     "simavr_bridge: control spi queue len=%zu\n",
                     set_len);
+    } else if (strcmp(op, "i2c_reg") == 0) {
+        /* i2c_reg <reg_hex> <byte_hex> <byte_hex> ...: register a
+         * register-keyed I2C response. The bridge tracks the register
+         * address the firmware writes preceding a read and serves the
+         * matching bytes here. Used for chips like LDC1612 / SHT3X
+         * where the register-select byte determines which fixed-size
+         * value the chip returns on the subsequent read.  Up to 64
+         * registers, 8 bytes per register. */
+        const char *p = strchr(line, ' ');
+        if (!p)
+            return;
+        p++;
+        unsigned int reg = 0;
+        if (sscanf(p, "%x", &reg) != 1)
+            return;
+        while (*p && *p != ' ')
+            p++;
+        while (*p == ' ')
+            p++;
+        pthread_mutex_lock(&twi_state.lock);
+        if (twi_state.reg_count < 64) {
+            int slot = twi_state.reg_count;
+            twi_state.reg_addrs[slot] = (uint8_t)(reg & 0xff);
+            int len = 0;
+            while (*p && len < 8) {
+                unsigned int b = 0;
+                if (sscanf(p, "%x", &b) != 1)
+                    break;
+                twi_state.reg_data[slot][len++] = (uint8_t)(b & 0xff);
+                while (*p && *p != ' ')
+                    p++;
+                while (*p == ' ')
+                    p++;
+            }
+            twi_state.reg_lens[slot] = (uint8_t)len;
+            twi_state.reg_count++;
+        }
+        pthread_mutex_unlock(&twi_state.lock);
     } else if (strcmp(op, "spi_tmc") == 0) {
         /* spi_tmc: switch the SPI hook into TMC SPI register-file mode.
          * Each 5-byte SPI datagram is decoded as a TMC2130/5160/2240/
@@ -882,10 +933,22 @@ twi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     avr_twi_msg_irq_t v = { .u = { .v = value } };
     uint8_t msg = v.u.twi.msg;
     uint8_t addr = v.u.twi.addr;
-    /* Address byte: firmware is starting a transaction. ACK to
-     * indicate the slave is present at this address. */
-    if (msg & TWI_COND_ADDR) {
-        twi_state.current_addr = addr >> 1;  /* drop R/W bit */
+    /* START condition: firmware is starting a new transaction. ACK
+     * the addressing. simavr emits TWI_COND_START (not TWI_COND_ADDR)
+     * for the START+address phase; the addr byte is in v.u.twi.addr
+     * with the R/W bit in its LSB. Register-select state is reset
+     * here only for write-mode addressing - the read-mode addressing
+     * after a register-select write must preserve pending_reg. */
+    if (msg & TWI_COND_START) {
+        pthread_mutex_lock(&twi_state.lock);
+        twi_state.current_addr = addr >> 1;
+        if (!(addr & 0x01)) {
+            /* Write addressing - new transaction, clear register
+             * select so the next WRITE byte latches as the new reg. */
+            twi_state.pending_reg_valid = 0;
+        }
+        twi_state.pending_pos = 0;
+        pthread_mutex_unlock(&twi_state.lock);
         if (twi_state.verbose)
             fprintf(stderr, "simavr_bridge: twi addr=%02x %s\n",
                     twi_state.current_addr,
@@ -894,22 +957,54 @@ twi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
                       avr_twi_irq_msg(TWI_COND_ACK, addr, 1));
         return;
     }
-    /* Firmware writing a data byte: ACK it (we don't need the
-     * content for any current test). */
+    /* Firmware writing a data byte. ACK it. The first byte of a
+     * write phase is treated as the register-select byte for the
+     * subsequent read in register-aware mode. */
     if (msg & TWI_COND_WRITE) {
+        uint8_t data = v.u.twi.data;
+        pthread_mutex_lock(&twi_state.lock);
+        int latched = 0;
+        if (twi_state.reg_count > 0 && !twi_state.pending_reg_valid) {
+            twi_state.pending_reg = data;
+            twi_state.pending_reg_valid = 1;
+            latched = 1;
+        }
+        pthread_mutex_unlock(&twi_state.lock);
+        (void)latched;
         avr_raise_irq(g_twi_in_irq,
                       avr_twi_irq_msg(TWI_COND_ACK, addr, 1));
         return;
     }
-    /* Firmware reading a byte: hand it the next queued response. */
+    /* Firmware reading a byte: in register-aware mode, look up the
+     * register that was written in the preceding phase and serve
+     * the next byte of its configured response. Falls back to the
+     * flat round-robin queue if no register matches. */
     if (msg & TWI_COND_READ) {
         uint8_t resp = 0x00;
         pthread_mutex_lock(&twi_state.lock);
-        if (twi_state.len > 0) {
+        int matched = -1;
+        uint8_t preg = twi_state.pending_reg;
+        int pvalid = twi_state.pending_reg_valid;
+        uint8_t ppos = twi_state.pending_pos;
+        if (twi_state.reg_count > 0 && twi_state.pending_reg_valid) {
+            for (int i = 0; i < twi_state.reg_count; i++) {
+                if (twi_state.reg_addrs[i] == twi_state.pending_reg) {
+                    matched = i;
+                    break;
+                }
+            }
+        }
+        if (matched >= 0 && twi_state.reg_lens[matched] > 0) {
+            resp = twi_state.reg_data[matched]
+                    [twi_state.pending_pos
+                        % twi_state.reg_lens[matched]];
+            twi_state.pending_pos++;
+        } else if (twi_state.len > 0) {
             resp = twi_state.bytes[twi_state.pos];
             twi_state.pos = (twi_state.pos + 1) % twi_state.len;
         }
         pthread_mutex_unlock(&twi_state.lock);
+        (void)preg; (void)pvalid; (void)ppos;
         avr_raise_irq(g_twi_in_irq,
                       avr_twi_irq_msg(TWI_COND_READ | TWI_COND_ACK,
                                       addr, resp));

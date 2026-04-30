@@ -668,6 +668,16 @@ class TestCase:
         # succeeds. Mutually exclusive with spi_response.
         if raw.get('spi_tmc'):
             lines.append("spi_tmc")
+        # gpio: list of [port_letter, pin, value] triples. Drives the
+        # named GPIO pin to the given level via the bridge's gpio
+        # control command. Useful for tests where a sensor's data-
+        # ready / interrupt pin needs to be asserted continuously
+        # (e.g. LDC1612's intb_pin) so the firmware sees the chip as
+        # always having data ready.
+        for gpio_cmd in raw.get('gpio', []):
+            if isinstance(gpio_cmd, list) and len(gpio_cmd) >= 3:
+                port, pin, val = gpio_cmd[0], gpio_cmd[1], gpio_cmd[2]
+                lines.append("gpio %s %d %d" % (port, int(pin), int(val)))
         # i2c reads: concatenate per-slave read sequences in fixture
         # order, push as a single bridge i2c queue. The bridge
         # auto-ACKs addressing/writes and serves reads round-robin
@@ -684,6 +694,17 @@ class TestCase:
         # is empty.
         for reg_str, payload in (raw.get('i2c_default', {})
                                  .get('register_responses', {}).items()):
+            # Emit an i2c_reg command for each register so the bridge
+            # serves the right bytes when klippy reads that specific
+            # register, regardless of read order. Falls back to
+            # appending to the flat queue too for backward compat with
+            # tests that expect order-dependent reads.
+            try:
+                reg = int(reg_str, 0)
+            except ValueError:
+                continue
+            byte_strs = ' '.join("%02x" % (int(b) & 0xff) for b in payload)
+            lines.append("i2c_reg %02x %s" % (reg, byte_strs))
             i2c_bytes.extend(int(b) & 0xff for b in payload)
         if i2c_bytes:
             lines.append("i2c " + ''.join("%02x" % b for b in i2c_bytes))
