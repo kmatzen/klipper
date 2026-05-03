@@ -435,6 +435,10 @@ class TestCase:
         r'^\[(tmc220[89])\s+\S+\]\s*$')
     _TMC_UART_PIN_RE = re.compile(
         r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+    _TMC2660_SECTION_RE = re.compile(
+        r'^\[tmc2660\s+\S+\]\s*$')
+    _TMC2660_CS_PIN_RE = re.compile(
+        r'^\s*cs_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
 
     @classmethod
     def _parse_tmc_uart_pins(cls, config_fname):
@@ -455,6 +459,36 @@ class TestCase:
                 if not in_section:
                     continue
                 m = cls._TMC_UART_PIN_RE.match(line)
+                if m:
+                    pins.append(m.group(2))
+                    in_section = False
+        finally:
+            f.close()
+        return pins
+
+    @classmethod
+    def _parse_tmc2660_cs_pins(cls, config_fname):
+        # Yield cs_pin (e.g. "PA0") for every [tmc2660 ...] section.
+        # The bridge needs to know each TMC2660 chip's CS pin so it
+        # can apply the 3-byte / 20-bit datagram protocol while that
+        # CS is asserted (vs. the 5-byte default for tmc2130 / 5160 /
+        # 2240 chips that may share the same SPI bus).
+        pins = []
+        in_section = False
+        try:
+            f = open(config_fname)
+        except OSError:
+            return pins
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    in_section = bool(
+                        cls._TMC2660_SECTION_RE.match(stripped))
+                    continue
+                if not in_section:
+                    continue
+                m = cls._TMC2660_CS_PIN_RE.match(line)
                 if m:
                     pins.append(m.group(2))
                     in_section = False
@@ -733,6 +767,17 @@ class TestCase:
         # succeeds. Mutually exclusive with spi_response.
         if raw.get('spi_tmc'):
             lines.append("spi_tmc")
+            # tmc2660 chips on a shared TMC SPI bus need per-chip
+            # registration so the bridge can apply its 3-byte (20-bit)
+            # datagram protocol while their CS is asserted. Auto-scan
+            # the cfg for [tmc2660 ...] sections; each emits a
+            # spi_tmc_chip command pointing at the chip's cs_pin.
+            if config_fname is not None:
+                for cs in self._parse_tmc2660_cs_pins(config_fname):
+                    if (len(cs) >= 3 and cs[0] == 'P'
+                            and cs[1].isalpha()):
+                        lines.append("spi_tmc_chip %s %d tmc2660" % (
+                            cs[1], int(cs[2:])))
         # spi_ads1220: switch the bridge's SPI hook into ADS1220
         # register-file mode. Each command is decoded as RREG / WREG /
         # RESET and the bridge maintains a small register file so the
