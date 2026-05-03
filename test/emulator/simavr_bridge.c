@@ -751,6 +751,16 @@ apply_control_command(struct control_ctx *ctx, const char *line)
         memset(spi_state.tmc_in_buf, 0, sizeof(spi_state.tmc_in_buf));
         memset(spi_state.tmc_out_buf, 0, sizeof(spi_state.tmc_out_buf));
         memset(spi_state.tmc_regs, 0, sizeof(spi_state.tmc_regs));
+        /* DRV_STATUS default for tmc2130 / tmc5160 / tmc2240: stst=1
+         * (standstill) and cs_actual=5 (a non-zero value any of klippy's
+         * driver field tables decodes as a healthy current scaler).
+         * Without this default, klippy's periodic _do_periodic_check
+         * reads cs_actual=0 once motion starts and shuts down with
+         * "DRV_STATUS: 00000000 cs_actual=0(Reset?)" before the test
+         * gets to its DUMP_TMC / SET_TMC_FIELD commands. The register
+         * file is shared across the bus; klippy initializes each chip
+         * sequentially so a single shared default suffices. */
+        spi_state.tmc_regs[0x6f] = 0xc0050000;
         pthread_mutex_unlock(&spi_state.lock);
         if (ctx->verbose)
             fprintf(stderr, "simavr_bridge: spi_tmc mode enabled\n");
@@ -1454,7 +1464,19 @@ sw_uart_handle_frame(struct sw_uart_state *u)
                    | ((uint32_t)u->rx_buf[4] << 16)
                    | ((uint32_t)u->rx_buf[5] << 8)
                    |  (uint32_t)u->rx_buf[6];
-        u->regs[reg] = v;
+        if (reg == 0x01) {
+            /* GSTAT: write-1-to-clear semantics on real silicon. Each
+             * 1 bit in the write clears the corresponding flag.
+             * klippy's start_checks calls _query_register with
+             * try_clear=True, which writes back the read value to
+             * clear pending flags - if we just stored the written
+             * value verbatim the reset bit would stay set and the
+             * next read would shutdown with "GSTAT: 00000001
+             * reset=1(Reset)" once motion starts. */
+            u->regs[reg] = u->regs[reg] & ~v;
+        } else {
+            u->regs[reg] = v;
+        }
         /* Bump IFCNT so klippy's write-verify ("did the chip ack the
          * write?") sees the counter advance after each WREG. The
          * firmware's tmc_uart driver reads IFCNT before and after the
@@ -1782,13 +1804,23 @@ tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     if (now_active && !was_active) {
         /* CS just went low: start of a 3-byte datagram. Reset the
          * MOSI buffer and pre-load the response (READRSP@RDSEL<rdsel>
-         * value, which we don't populate so it's all zeros - good
-         * enough for klippy's pretty_format to print and for init not
-         * to flag anything as a fault). */
+         * value).  When rdsel=2 (READRSP@RDSEL2 in tmc2660.py) klippy's
+         * periodic _do_periodic_check uses the "se" field as the
+         * cs_actual / current-scaler healthiness gate - if it reads
+         * zero, klippy decodes it as "0(Reset?)" and shuts down once
+         * motion starts.  klippy's tmc2660 init sets RDSEL=2 first
+         * (see tmc2660.py "Must set RDSEL value first") so by the time
+         * the periodic check runs we're already serving RDSEL2.  Pack
+         * a non-zero se: the field sits at data bits 14..18 (after
+         * klippy's data = pr[0]<<16 | pr[1]<<8 | pr[2] decode shifts
+         * the 20-bit response up by 4), so 5 << 10 in response_value
+         * lands as se=5 in the field-decoded value.  Other fields
+         * (stallguard / ot / sg_result / etc.) stay zero - good enough
+         * for pretty_format and for init not to flag anything. */
         c->in_pos = 0;
         c->out_pos = 0;
         memset(c->in_buf, 0, sizeof(c->in_buf));
-        uint32_t response_value = 0;
+        uint32_t response_value = (c->rdsel == 2) ? (5U << 10) : 0;
         uint32_t packed = response_value << 4;
         c->out_buf[0] = (uint8_t)((packed >> 16) & 0xff);
         c->out_buf[1] = (uint8_t)((packed >> 8) & 0xff);
