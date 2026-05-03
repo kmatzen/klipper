@@ -1455,6 +1455,14 @@ sw_uart_handle_frame(struct sw_uart_state *u)
                    | ((uint32_t)u->rx_buf[5] << 8)
                    |  (uint32_t)u->rx_buf[6];
         u->regs[reg] = v;
+        /* Bump IFCNT so klippy's write-verify ("did the chip ack the
+         * write?") sees the counter advance after each WREG. The
+         * firmware's tmc_uart driver reads IFCNT before and after the
+         * write and raises "Unable to write tmc uart ... register X"
+         * if they're equal. Real silicon increments IFCNT on every
+         * successful write to a control register; mirror that here. */
+        if (reg != 0x02)
+            u->regs[0x02] = (u->regs[0x02] + 1) & 0xff;
         return;
     }
     /* Build 8-byte read response: [sync, master_addr=0xff, reg, d0..3, crc]
@@ -1483,11 +1491,42 @@ sw_uart_handle_frame(struct sw_uart_state *u)
      * and the very first sample lands on our start bit, which
      * doesn't set TU_READ_SYNC and shifts the byte alignment by 1. */
     sw_uart_drive(u, 1);
-    /* Schedule the first TX bit a few bit_times after the firmware's
-     * stop-bit edge, giving its read_sync_event time to arm and
-     * sample HIGH at least once before our LOW start bit. */
-    avr_cycle_timer_register(u->avr, u->bit_time * 4,
-                             sw_uart_tx_bit, u);
+    /* Phase-lock the first TX bit to the firmware's RX poll grid.
+     *
+     * tmcuart_send_finish_event runs at T_send_finish = bit 40 of the
+     * encoded request stream = u->rx_last_cycle + bit_time/2 (we
+     * record rx_last_cycle at the centre of the last byte's stop
+     * slot, T_first_falling_last + 9.5*bt; firmware's send_finish
+     * fires at T_first_falling_last + 10*bt). It then schedules
+     * tmcuart_read_sync_event at T_send_finish + 4*bt, so the
+     * firmware's poll grid is rx_last_cycle + (4.5 + n)*bt for
+     * n = 0, 1, 2 ... .
+     *
+     * If we drove the start bit at any cycle aligned with that grid
+     * we'd race against the firmware's two back-to-back gpio_in_read
+     * calls (read_sync_event reads the pin, then recursively calls
+     * read_event which reads it again a few AVR cycles later). With
+     * the bridge transitioning from start bit (LOW) to data bit 0
+     * between those two reads, the first read latches LOW (triggers
+     * the sync transition) and the second latches data bit 0 - so
+     * data[0][0] gets the data 0 value instead of the start bit's
+     * LOW. _decode_read fails by exactly one bit at position 0.
+     *
+     * Targeting rx_last_cycle + 8*bt puts our first LOW drive at
+     * T_firmware_first_poll + 3.5*bt: the firmware sees HIGH idle
+     * for four polls (k = 0..3) - plenty to set TU_READ_SYNC - then
+     * catches LOW at k = 4 with T_caught - C = 0.5*bt phase, so
+     * every subsequent sample lands in the middle of the bridge's
+     * bit drive period. Both gpio_in_read calls see the same
+     * stable bit value. */
+    uint64_t target_cycle = u->rx_last_cycle + (uint64_t)u->bit_time * 8;
+    uint64_t now = u->avr->cycle;
+    avr_cycle_count_t delay;
+    if (target_cycle > now)
+        delay = (avr_cycle_count_t)(target_cycle - now);
+    else
+        delay = u->bit_time;
+    avr_cycle_timer_register(u->avr, delay, sw_uart_tx_bit, u);
 }
 
 /* simavr cycle timer callback: drive one bit of the response. */
