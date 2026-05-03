@@ -439,6 +439,16 @@ class TestCase:
         r'^\[tmc2660\s+\S+\]\s*$')
     _TMC2660_CS_PIN_RE = re.compile(
         r'^\s*cs_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+    _LOAD_CELL_SECTION_RE = re.compile(
+        r'^\[load_cell(?:_probe)?(?:\s+\S+)?\]\s*$')
+    _ADS1220_SENSOR_TYPE_RE = re.compile(
+        r'^\s*sensor_type\s*:\s*ads1220\s*(?:#.*)?$')
+    _ADS1220_CS_PIN_RE = re.compile(
+        r'^\s*cs_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+    _ADS1220_DRDY_PIN_RE = re.compile(
+        r'^\s*data_ready_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+    _ADS1220_SAMPLE_RATE_RE = re.compile(
+        r'^\s*sample_rate\s*:\s*(\d+)\s*(?:#.*)?$')
 
     @classmethod
     def _parse_tmc_uart_pins(cls, config_fname):
@@ -495,6 +505,59 @@ class TestCase:
         finally:
             f.close()
         return pins
+
+    @classmethod
+    def _parse_ads1220_chips(cls, config_fname):
+        # Yield (cs_pin, drdy_pin, sample_rate) for every [load_cell ...]
+        # / [load_cell_probe] section whose sensor_type is ads1220.
+        # The bridge needs each chip's CS + DRDY pins so it can pulse
+        # DRDY at the chip's configured sample rate (default 660 SPS),
+        # replacing the previous "hold DRDY low forever" gpio fixture
+        # workaround that overflowed the firmware's wake-task drain.
+        chips = []
+        in_section = False
+        cs = drdy = None
+        sensor_is_ads = False
+        rate = 660
+        try:
+            f = open(config_fname)
+        except OSError:
+            return chips
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    if (in_section and sensor_is_ads
+                            and cs is not None and drdy is not None):
+                        chips.append((cs, drdy, rate))
+                    in_section = bool(
+                        cls._LOAD_CELL_SECTION_RE.match(stripped))
+                    cs = drdy = None
+                    sensor_is_ads = False
+                    rate = 660
+                    continue
+                if not in_section:
+                    continue
+                if cls._ADS1220_SENSOR_TYPE_RE.match(line):
+                    sensor_is_ads = True
+                    continue
+                m = cls._ADS1220_CS_PIN_RE.match(line)
+                if m:
+                    cs = m.group(2)
+                    continue
+                m = cls._ADS1220_DRDY_PIN_RE.match(line)
+                if m:
+                    drdy = m.group(2)
+                    continue
+                m = cls._ADS1220_SAMPLE_RATE_RE.match(line)
+                if m:
+                    rate = int(m.group(1))
+        finally:
+            f.close()
+        if (in_section and sensor_is_ads
+                and cs is not None and drdy is not None):
+            chips.append((cs, drdy, rate))
+        return chips
 
     @classmethod
     def _parse_sw_i2c_pin_pairs(cls, config_fname):
@@ -787,6 +850,25 @@ class TestCase:
         # with spi_response and spi_tmc.
         if raw.get('spi_ads1220'):
             lines.append("spi_ads1220")
+            # Auto-scan the cfg for [load_cell ...] / [load_cell_probe]
+            # sections with sensor_type=ads1220 and emit a per-chip
+            # spi_ads1220_chip command. The bridge then pulses each
+            # chip's DRDY at its configured sample rate (default 660
+            # SPS) instead of holding it perpetually low - which the
+            # earlier gpio-based approach did and overflowed the
+            # firmware's wake-task drain under stepper load.
+            if config_fname is not None:
+                for cs, drdy, rate in self._parse_ads1220_chips(
+                        config_fname):
+                    if (len(cs) >= 3 and cs[0] == 'P'
+                            and cs[1].isalpha()
+                            and len(drdy) >= 3 and drdy[0] == 'P'
+                            and drdy[1].isalpha()):
+                        lines.append(
+                            "spi_ads1220_chip %s %d %s %d %d" % (
+                                cs[1], int(cs[2:]),
+                                drdy[1], int(drdy[2:]),
+                                rate))
         # load_cell_probe_trigger: hook the configured Z step pin and
         # synthesize a ramped ADC sample = (steps_in_burst *
         # force_per_step) raw counts. A step burst starts on the

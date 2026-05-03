@@ -70,6 +70,7 @@ dropped.
 | `i2c <hexbytes>`                                     | Replace the I2C read response queue (auto-ACKs writes/addressing) |
 | `step_trigger <step_p> <step_pin> <count> <trig_p> <trig_pin> <val>` | Drive `<trig_p><trig_pin>` to `val` after `count` rising edges on the step pin |
 | `bltouch <ctrl_p> <ctrl_pin> <sensor_p> <sensor_pin> <invert>` | Configure the BLTouch state machine (decodes PWM commands by pulse duration, drives the sensor pin to match) |
+| `spi_ads1220_chip <cs_p> <cs_pin> <drdy_p> <drdy_pin> <rate_hz>` | Register an ADS1220 chip's CS + DRDY pins; bridge pulses DRDY active-low at `rate_hz` SPS via a simavr cycle timer and de-asserts on each 3-byte continuous-mode read |
 
 ## Fixture JSON keys
 

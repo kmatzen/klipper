@@ -68,6 +68,15 @@
  *       a 3-byte (20-bit) datagram decoder while CS is asserted.
  *       Other TMC SPI variants on the same bus continue using the
  *       default 5-byte path. Up to TMC_CHIP_MAX chips supported.
+ *   spi_ads1220_chip <cs_port> <cs_pin> <drdy_port> <drdy_pin> <rate_hz>
+ *       Register an ADS1220 chip's CS + DRDY pins so the bridge can
+ *       pulse DRDY active-low at the chip's configured sample rate
+ *       via a simavr cycle timer; on each 3-byte ADC read in
+ *       continuous mode the bridge de-asserts DRDY (drive HIGH) so
+ *       the firmware reads at exactly the chip's rate instead of
+ *       its full poll rate. Replaces the previous "hold DRDY low
+ *       forever" gpio fixture approach which overflowed the
+ *       firmware's wake-task drain under stepper load.
  *
  * Lines that don't parse are silently ignored to avoid breaking the
  * simulator on a fixture typo.
@@ -234,6 +243,33 @@ struct tmc_chip {
 static struct tmc_chip tmc_chips[TMC_CHIP_MAX];
 static int tmc_chips_count = 0;
 static int tmc_active_chip = -1;  /* index into tmc_chips, or -1 */
+
+/* ADS1220 DRDY pulsing. With DRDY held perpetually low (the previous
+ * fixture-gpio approach), the firmware's ads1220_event polls and
+ * reads at its full poll rate - on heavy stepper load this overflows
+ * the firmware's wake-task drain. Each registered chip gets its CS
+ * pin tracked (so we know which chip is being addressed during a
+ * transaction) and its DRDY pin pulsed by a simavr cycle timer at
+ * the chip's configured sample rate; on each 3-byte ADC read in
+ * continuous mode the bridge de-asserts DRDY (drive HIGH) so the
+ * firmware backs off until the next periodic assertion. The firmware
+ * then sees the chip running at exactly its configured rate and the
+ * test cfg can use the chip's real default (660 SPS) instead of the
+ * 175 SPS workaround. All scheduling is in `avr->cycle` so timing is
+ * deterministic regardless of host load. */
+#define ADS1220_CHIP_MAX 4
+struct ads1220_chip {
+    char cs_port;             /* 'A'..'L' */
+    int cs_pin;               /* 0..7 */
+    char drdy_port;           /* 'A'..'L' */
+    int drdy_pin;             /* 0..7 */
+    uint32_t period_cycles;   /* MCU cycles between DRDY assertions */
+    int drdy_low;             /* 1 = currently asserted (low) */
+    struct avr_t *avr;        /* set on first chip register */
+};
+static struct ads1220_chip ads1220_chips[ADS1220_CHIP_MAX];
+static int ads1220_chips_count = 0;
+static int ads1220_active_chip = -1; /* index of chip whose CS is low */
 
 /* Global I2C (TWI) read response queue. Klippy talks to I2C
  * peripherals (SHT3X, LDC1612, MAX31865, ...) by writing a command
@@ -532,6 +568,10 @@ static avr_cycle_count_t sw_uart_tx_bit(struct avr_t *avr,
 
 /* Forward decl - definition lives further down with the SPI hook. */
 static void tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+static void ads1220_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+static avr_cycle_count_t ads1220_drdy_assert(struct avr_t *avr,
+                                             avr_cycle_count_t when,
+                                             void *param);
 
 /* Load-cell-probe analog-trigger emulation. The load_cell_probe driver
  * arms a trigger_analog on the MCU and waits for an ADC sample to
@@ -1744,6 +1784,149 @@ tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     pthread_mutex_unlock(&spi_state.lock);
 }
 
+/* Drive a registered ADS1220 chip's DRDY pin high or low. Active-low
+ * "data ready" semantics: drive LOW to tell the firmware a sample is
+ * waiting, drive HIGH to make it back off. Mirrors the SET_EXTERNAL
+ * + raise_irq pattern used by the gpio control command and sw_uart
+ * so the value persists across firmware PORT/DDR writes and the
+ * per-pin IRQ fires synchronously for any hooks listening. */
+static void
+ads1220_drive_drdy(struct ads1220_chip *c, int high)
+{
+    if (!c->avr)
+        return;
+    avr_ioport_external_t ext = {
+        .name = (uint8_t)c->drdy_port,
+        .mask = (uint8_t)(1U << c->drdy_pin),
+        .value = high ? (uint8_t)(1U << c->drdy_pin) : 0,
+    };
+    avr_ioctl(c->avr, AVR_IOCTL_IOPORT_SET_EXTERNAL(c->drdy_port), &ext);
+    avr_irq_t *irq = avr_io_getirq(
+        c->avr, AVR_IOCTL_IOPORT_GETIRQ(c->drdy_port), c->drdy_pin);
+    if (irq)
+        avr_raise_irq(irq, high ? 1 : 0);
+    c->drdy_low = high ? 0 : 1;
+}
+
+/* CS-pin hook for a registered ADS1220 chip. CS is active-low so we
+ * track which chip is currently being addressed; spi_out_hook uses
+ * this to know whose DRDY to de-assert at the end of a 3-byte ADC
+ * read in continuous mode. Multiple ADS1220 chips on the same SPI
+ * bus assert their CS one at a time, so the single global
+ * ads1220_active_chip suffices. */
+static void
+ads1220_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq;
+    int idx = (int)(intptr_t)param;
+    if (idx < 0 || idx >= ads1220_chips_count)
+        return;
+    pthread_mutex_lock(&spi_state.lock);
+    if (value == 0) {
+        ads1220_active_chip = idx;
+    } else if (ads1220_active_chip == idx) {
+        ads1220_active_chip = -1;
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+}
+
+/* simavr cycle timer callback: assert this chip's DRDY low to signal
+ * "sample ready", then re-arm one period out. The firmware's poll
+ * loop sees DRDY low and schedules a wake task that does the 3-byte
+ * SPI read; spi_out_hook then drives DRDY back high. If the firmware
+ * is too slow to read before the next period (sample dropped), DRDY
+ * just stays low - benign, the overflow path the firmware already
+ * handles for missed samples will catch it. */
+static avr_cycle_count_t
+ads1220_drdy_assert(struct avr_t *avr, avr_cycle_count_t when, void *param)
+{
+    (void)avr;
+    struct ads1220_chip *c = (struct ads1220_chip *)param;
+    if (!c->avr)
+        return 0;
+    pthread_mutex_lock(&spi_state.lock);
+    if (!c->drdy_low) {
+        pthread_mutex_unlock(&spi_state.lock);
+        ads1220_drive_drdy(c, 0);
+    } else {
+        pthread_mutex_unlock(&spi_state.lock);
+    }
+    return when + c->period_cycles;
+}
+
+/* spi_ads1220_chip <cs_port> <cs_pin> <drdy_port> <drdy_pin> <sample_rate_hz>
+ * Register an ADS1220 chip's CS + DRDY pins so the bridge can pulse
+ * DRDY at the chip's configured sample rate (replacing the previous
+ * "hold DRDY low forever" approach which made the firmware read at
+ * its full poll rate and overflow under stepper load). Re-issuing
+ * for the same CS pin is a no-op (we keep the first registration). */
+static void
+apply_spi_ads1220_chip(struct control_ctx *ctx,
+                       int cs_port_ord, int cs_pin,
+                       int drdy_port_ord, int drdy_pin,
+                       int sample_rate_hz)
+{
+    if (cs_port_ord < 'A' || cs_port_ord > 'L')
+        return;
+    if (cs_pin < 0 || cs_pin > 7)
+        return;
+    if (drdy_port_ord < 'A' || drdy_port_ord > 'L')
+        return;
+    if (drdy_pin < 0 || drdy_pin > 7)
+        return;
+    if (sample_rate_hz <= 0)
+        sample_rate_hz = 660;
+    char cs_port = (char)cs_port_ord;
+    char drdy_port = (char)drdy_port_ord;
+    pthread_mutex_lock(&spi_state.lock);
+    int existing = -1;
+    for (int i = 0; i < ads1220_chips_count; i++) {
+        if (ads1220_chips[i].cs_port == cs_port
+                && ads1220_chips[i].cs_pin == cs_pin) {
+            existing = i;
+            break;
+        }
+    }
+    int slot = existing;
+    if (slot < 0 && ads1220_chips_count < ADS1220_CHIP_MAX) {
+        slot = ads1220_chips_count++;
+        ads1220_chips[slot].cs_port = cs_port;
+        ads1220_chips[slot].cs_pin = cs_pin;
+        ads1220_chips[slot].drdy_port = drdy_port;
+        ads1220_chips[slot].drdy_pin = drdy_pin;
+        ads1220_chips[slot].period_cycles =
+            (uint32_t)(ctx->avr->frequency / (uint32_t)sample_rate_hz);
+        ads1220_chips[slot].drdy_low = 0;
+        ads1220_chips[slot].avr = ctx->avr;
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+    if (slot < 0)
+        return;
+    if (existing < 0) {
+        avr_irq_t *cs_irq = avr_io_getirq(
+            ctx->avr, AVR_IOCTL_IOPORT_GETIRQ(cs_port), cs_pin);
+        if (cs_irq) {
+            avr_irq_register_notify(
+                cs_irq, ads1220_cs_hook, (void *)(intptr_t)slot);
+        }
+        /* Drive DRDY HIGH initially so the firmware doesn't latch a
+         * stale low from the fixture's earlier gpio command (or from
+         * the pin's default state). The cycle timer will assert it
+         * one period from now. */
+        ads1220_drive_drdy(&ads1220_chips[slot], 1);
+        avr_cycle_timer_register(ctx->avr,
+                                 ads1220_chips[slot].period_cycles,
+                                 ads1220_drdy_assert,
+                                 &ads1220_chips[slot]);
+    }
+    if (ctx->verbose)
+        fprintf(stderr,
+                "simavr_bridge: spi_ads1220_chip cs=%c%d drdy=%c%d "
+                "rate=%dHz period=%u cycles (slot %d)\n",
+                cs_port, cs_pin, drdy_port, drdy_pin,
+                sample_rate_hz, ads1220_chips[slot].period_cycles, slot);
+}
+
 /* Hook on the firmware's SPI MOSI byte. Each time the firmware
  * writes SPDR, simavr fires this with the byte going OUT to the
  * (virtual) slave; we synchronously raise SPI_IRQ_INPUT with the
@@ -1778,8 +1961,21 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
             resp = spi_state.ads_sample[spi_state.ads_byte_idx];
             spi_state.ads_byte_idx++;
             spi_state.ads_remaining--;
-            if (spi_state.ads_remaining == 0)
+            if (spi_state.ads_remaining == 0) {
                 spi_state.ads_streaming = 0;
+                /* Sample fully consumed: de-assert DRDY (drive HIGH)
+                 * for the addressed chip so the firmware backs off
+                 * until the next periodic assertion fires. The DRDY
+                 * pin has no bridge-side hooks, so driving it under
+                 * spi_state.lock can't recurse. */
+                if (ads1220_active_chip >= 0
+                        && ads1220_active_chip < ads1220_chips_count) {
+                    struct ads1220_chip *c =
+                        &ads1220_chips[ads1220_active_chip];
+                    if (c->drdy_low)
+                        ads1220_drive_drdy(c, 1);
+                }
+            }
         } else if (spi_state.ads_remaining == 0) {
             /* Command byte. Decode and prime any follow-on phase. */
             uint8_t cmd = mosi;
@@ -2099,6 +2295,19 @@ apply_control_line(struct control_ctx *ctx, char *line)
         int got = sscanf(line + 13, "%c %d %15s", &port, &pin, proto);
         if (got == 3 && strcmp(proto, "tmc2660") == 0) {
             apply_spi_tmc_chip(ctx, (int)(unsigned char)port, pin);
+        }
+        return;
+    }
+    if (strncmp(line, "spi_ads1220_chip ", 17) == 0) {
+        char cs_port = 0, drdy_port = 0;
+        int cs_pin = -1, drdy_pin = -1, rate = 0;
+        int got = sscanf(line + 17, "%c %d %c %d %d",
+                         &cs_port, &cs_pin, &drdy_port, &drdy_pin, &rate);
+        if (got == 5) {
+            apply_spi_ads1220_chip(ctx,
+                                   (int)(unsigned char)cs_port, cs_pin,
+                                   (int)(unsigned char)drdy_port, drdy_pin,
+                                   rate);
         }
         return;
     }

@@ -1,5 +1,5 @@
 {
-    "_comment": "Drives load_cell.test under the simavr bridge. spi_ads1220 puts the bridge into ADS1220 register-file + continuous-conversion mode so the chip init's write-then-verify succeeds and continuous-mode reads serve real samples. data_ready_pin (PA1 for [load_cell my_ads1220], PJ3 for [load_cell_probe]) is held low so the firmware reads the ADC continuously. load_cell_probe_trigger hooks the Z step pin (PL3) and synthesizes a ramped 24-bit sample = steps_in_burst * force_per_step on each ADS1220 read while Z is descending, returning 0 during quiet (tare) stretches. With counts_per_gram=100, force_per_step=50 means 0.5 g/step; at the configured probe_speed=10 mm/s on a 400 step/mm Z stepper that's 2000 g/s of ramp, crossing the default 75 g trigger about 38 ms into the descent - well before the 2000 g safety limit. auto_trsync_trigger_ticks fires the cartesian endstops on G28 so homing completes; analog_in supplies plausible thermistor readings for heater min/max checks. sim_time keeps simavr free-running with klippy on the same simulated clock.",
+    "_comment": "Drives load_cell.test under the simavr bridge. spi_ads1220 puts the bridge into ADS1220 register-file + continuous-conversion mode so the chip init's write-then-verify succeeds and continuous-mode reads serve real samples. The runner auto-emits a spi_ads1220_chip command per [load_cell ...] section so the bridge pulses each chip's data_ready_pin (PA1 for [load_cell my_ads1220], PJ3 for [load_cell_probe]) at the configured sample_rate (default 660 SPS) instead of holding it perpetually low - which the earlier gpio-fixture approach did and overflowed the firmware's wake-task drain under stepper load. load_cell_probe_trigger hooks the Z step pin (PL3) and synthesizes a ramped 24-bit sample = steps_in_burst * force_per_step on each ADS1220 read while Z is descending, returning 0 during quiet (tare) stretches. With counts_per_gram=100, force_per_step=50 means 0.5 g/step; at the configured probe_speed=10 mm/s on a 400 step/mm Z stepper that's 2000 g/s of ramp, crossing the default 75 g trigger about 38 ms into the descent - well before the 2000 g safety limit. auto_trsync_trigger_ticks fires the cartesian endstops on G28 so homing completes; analog_in supplies plausible thermistor readings for heater min/max checks. sim_time keeps simavr free-running with klippy on the same simulated clock.",
     "spi_ads1220": true,
     "sim_time": true,
     "auto_trsync_trigger_ticks": 160000,
@@ -7,10 +7,6 @@
     "analog_in": {
         "_hot_extruder_0": {"default_value": 1200}
     },
-    "gpio": [
-        ["A", 1, 0],
-        ["J", 3, 0]
-    ],
     "load_cell_probe_trigger": {
         "z_step_pin": "PL3",
         "reset_quiet_us": 50000,
