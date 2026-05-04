@@ -72,6 +72,11 @@ dropped.
 | `bltouch <ctrl_p> <ctrl_pin> <sensor_p> <sensor_pin> <invert>` | Configure the BLTouch state machine (decodes PWM commands by pulse duration, drives the sensor pin to match) |
 | `spi_ads1220_chip <cs_p> <cs_pin> <drdy_p> <drdy_pin> <rate_hz>` | Register an ADS1220 chip's CS + DRDY pins; bridge pulses DRDY active-low at `rate_hz` SPS via a simavr cycle timer and de-asserts on each 3-byte continuous-mode read |
 
+The bridge also accepts a separate `--tick-socket <path>` that klippy
+connects to in tick mode (see "Tick mode" below). Its protocol is
+just `advance <T>\n` from klippy and `done <T_actual>\n` from the
+bridge, exchanged once per reactor iteration.
+
 ## Fixture JSON keys
 
 Tests drop a `<test>.fixture.json` next to `<test>.test` to script
@@ -99,8 +104,40 @@ bridge commands at simavr startup:
   Concatenated into the bridge's I2C queue in fixture order.
 - `i2c_default.register_responses` - chip-id register payloads
   klippy probes once at startup.
+- `tick_mode` - if `true`, drive klippy and simavr in lockstep over
+  a tick socket (see "Tick mode" below). Implies `sim_time: true`.
 
-## Running
+## Tick mode (deterministic-time lockstep)
+
+The default `sim_time: true` path puts klippy on the MCU's clock but
+lets simavr free-run with a wall-clock ceiling - the two clocks stay
+*consistent* but neither side drives the other's progress. Under host
+CPU contention simavr can fall behind and the relative ordering of
+klippy I/O against MCU events becomes nondeterministic.
+
+`tick_mode: true` upgrades the relationship to lockstep. The runner
+allocates an extra unix socket and passes it as `--tick-socket` to
+the bridge plus `KLIPPY_TICK_SOCKET=<path>` to klippy. Klippy's
+reactor connects on startup; whenever it has no fd ready and no timer
+due it sends `advance <T>\n` over the socket. The bridge runs avr_run
+until `avr->cycle / frequency >= T`, updates the sim_time mmap, and
+replies `done <T_actual>\n`. simavr never advances past where klippy
+asked, and klippy never processes events past where simavr has
+advanced - so timing is deterministic regardless of host load.
+
+`tick_mode: true` implies `sim_time: true` (the reactor still reads
+its monotonic clock from the mmap). The wall-clock throttle that
+caps simavr in non-tick sim_time runs is bypassed once klippy
+connects; before that the bridge stays in free-run so the test
+runner's `barrier <usec>` over the control socket can still flush
+fixture-setup IRQs in.
+
+`SelectReactor._TICK_MAX_QUANTUM` (default 0.1 s) caps how far ahead
+klippy will ask the bridge to advance per tick - if the next timer
+is far away (or `NEVER`) klippy still hands control back every
+~100 ms of sim time so pty bytes from the firmware get serviced.
+
+
 
 The Dockerfile at `scripts/Dockerfile.emulator-test` builds an image
 with simavr, the bridge, and `.elf` + `.dict` artifacts for every

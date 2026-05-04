@@ -289,13 +289,23 @@ class TestCase:
         # tests that set heater targets, so it must be opt-in until
         # the bridge models heater PWM -> ADC heat-up.
         sim_time_enabled = False
+        tick_mode_enabled = False
         try:
             if fixture_path is not None:
                 with open(fixture_path) as ff:
-                    sim_time_enabled = bool(json.load(ff).get('sim_time'))
+                    fx = json.load(ff)
+                sim_time_enabled = bool(fx.get('sim_time'))
+                tick_mode_enabled = bool(fx.get('tick_mode'))
         except (OSError, ValueError):
             sim_time_enabled = False
+            tick_mode_enabled = False
+        # tick_mode implies sim_time (klippy reads the MCU's cycle as
+        # its monotonic clock); the bridge then drives klippy in
+        # lockstep over the tick socket so the two clocks can't drift.
+        if tick_mode_enabled:
+            sim_time_enabled = True
         sim_time_file = None
+        tick_socket_path = None
         emu_args = [
             bridge_path,
             '--elf', elf_path,
@@ -310,6 +320,13 @@ class TestCase:
             except OSError:
                 pass
             emu_args += ['--sim-time-file', sim_time_file]
+        if tick_mode_enabled:
+            tick_socket_path = os.path.join(self.tempdir, 'tick_sock')
+            try:
+                os.unlink(tick_socket_path)
+            except OSError:
+                pass
+            emu_args += ['--tick-socket', tick_socket_path]
         emu_log_fd = open(emu_log, 'w')
         emu_proc = subprocess.Popen(emu_args, cwd=repo_root,
                                     stdout=emu_log_fd,
@@ -327,9 +344,12 @@ class TestCase:
             for df in dict_fnames:
                 klippy_args += ['-d', df]
             klippy_env = None
-            if sim_time_file:
+            if sim_time_file or tick_socket_path:
                 klippy_env = dict(os.environ)
-                klippy_env['KLIPPY_SIM_TIME_FILE'] = sim_time_file
+                if sim_time_file:
+                    klippy_env['KLIPPY_SIM_TIME_FILE'] = sim_time_file
+                if tick_socket_path:
+                    klippy_env['KLIPPY_TICK_SOCKET'] = tick_socket_path
             res = self._run_klippy_with_deadline(klippy_args, env=klippy_env)
         finally:
             self._terminate(emu_proc)

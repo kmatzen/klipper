@@ -2480,6 +2480,79 @@ control_socket_thread(void *arg)
     return NULL;
 }
 
+/* Tick-mode lockstep (--tick-socket): klippy's reactor connects on
+ * this AF_UNIX socket and drives simulated time by exchange. Klippy
+ * sends "advance <T>\n", we run avr_run() until avr->cycle/frequency
+ * reaches T, update the sim_time mmap, and reply "done <T_actual>\n".
+ * Once klippy is connected, the wall-clock throttle is bypassed and
+ * simavr advances exactly as far as klippy asks - eliminating the
+ * host-load timing skew that makes parallel sim_time mode flaky.
+ *
+ * Pre-connection (before klippy starts) the main loop stays in
+ * free-run with the wall-clock throttle so the test runner's
+ * fixture-setup `barrier <usec>` over the control socket still
+ * advances simavr enough to apply the queued IRQs. */
+static int
+tick_socket_listen(const char *path)
+{
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "simavr_bridge: tick socket(): %s\n",
+                strerror(errno));
+        return -1;
+    }
+    int flags = fcntl(srv, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(srv, F_SETFL, flags | O_NONBLOCK);
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", path);
+    unlink(path);
+    if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "simavr_bridge: tick bind(%s): %s\n",
+                path, strerror(errno));
+        close(srv);
+        return -1;
+    }
+    chmod(path, 0666);
+    if (listen(srv, 1) < 0) {
+        fprintf(stderr, "simavr_bridge: tick listen: %s\n",
+                strerror(errno));
+        close(srv);
+        return -1;
+    }
+    return srv;
+}
+
+/* Read one newline-terminated line from cli into buf (size>=2). The
+ * caller's `*fill` accumulates partial reads across calls. Returns
+ * length of the line (excluding NUL), 0 on EOF, or -1 on error. */
+static ssize_t
+tick_read_line(int cli, char *buf, size_t bufsize, size_t *fill)
+{
+    while (g_running) {
+        char *nl = memchr(buf, '\n', *fill);
+        if (nl) {
+            size_t linelen = (size_t)(nl - buf);
+            buf[linelen] = '\0';
+            return (ssize_t)linelen;
+        }
+        if (*fill + 1 >= bufsize) {
+            /* Line longer than buffer: treat as protocol error. */
+            return -1;
+        }
+        ssize_t n = read(cli, buf + *fill, bufsize - 1 - *fill);
+        if (n == 0) return 0;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        *fill += (size_t)n;
+    }
+    return -1;
+}
+
 static int
 write_slave_link(const char *path, const char *slave_path)
 {
@@ -2512,6 +2585,7 @@ main(int argc, char *argv[])
     double duration_s = 0.0;
     int verbose = 0;
     const char *sim_time_path = NULL;
+    const char *tick_socket_path = NULL;
 
     static struct option longopts[] = {
         {"elf",            required_argument, NULL, 'e'},
@@ -2521,10 +2595,11 @@ main(int argc, char *argv[])
         {"duration",       required_argument, NULL, 'd'},
         {"verbose",        no_argument,       NULL, 'v'},
         {"sim-time-file",  required_argument, NULL, 't'},
+        {"tick-socket",    required_argument, NULL, 'k'},
         {NULL, 0, NULL, 0},
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "e:l:c:m:d:vt:", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:l:c:m:d:vt:k:", longopts, NULL)) != -1) {
         switch (opt) {
         case 'e': elf_path = optarg; break;
         case 'l': slave_link_path = optarg; break;
@@ -2533,6 +2608,7 @@ main(int argc, char *argv[])
         case 'd': duration_s = atof(optarg); break;
         case 'v': verbose = 1; break;
         case 't': sim_time_path = optarg; break;
+        case 'k': tick_socket_path = optarg; break;
         default:
             fprintf(stderr,
                 "Usage: %s --elf <klipper.elf> --slave-link <path>\n"
@@ -2631,6 +2707,19 @@ main(int argc, char *argv[])
     if (twi_out_irq && g_twi_in_irq)
         avr_irq_register_notify(twi_out_irq, twi_out_hook, NULL);
 
+    /* Bring up the tick-mode listen socket BEFORE publishing the
+     * slave_link so klippy (which only starts once the slave_link
+     * exists) is guaranteed a successful connect on its first try. */
+    int tick_listen_fd = -1;
+    if (tick_socket_path) {
+        tick_listen_fd = tick_socket_listen(tick_socket_path);
+        if (tick_listen_fd < 0)
+            return 1;
+        if (verbose)
+            fprintf(stderr, "simavr_bridge: tick socket %s\n",
+                    tick_socket_path);
+    }
+
     if (write_slave_link(slave_link_path, pty.pty.slavename) < 0)
         return 1;
 
@@ -2706,7 +2795,88 @@ main(int argc, char *argv[])
     int state = cpu_Running;
     uint64_t throttle_check_interval = avr->frequency / 1000;
     uint64_t next_throttle_cycle = throttle_check_interval;
+    int tick_client_fd = -1;
+    char tick_buf[256];
+    size_t tick_fill = 0;
     while (g_running && state != cpu_Done && state != cpu_Crashed) {
+        /* Once klippy connects on the tick socket we leave free-run
+         * mode and only advance simavr in response to "advance" lines.
+         * Until then (during fixture-setup `barrier`s on the control
+         * socket) we run free with the wall-clock throttle below. */
+        if (tick_listen_fd >= 0 && tick_client_fd < 0) {
+            int fd = accept(tick_listen_fd, NULL, NULL);
+            if (fd >= 0) {
+                tick_client_fd = fd;
+                tick_fill = 0;
+                if (verbose)
+                    fprintf(stderr,
+                        "simavr_bridge: tick client connected at cycle %llu\n",
+                        (unsigned long long)avr->cycle);
+            }
+        }
+        if (tick_client_fd >= 0) {
+            ssize_t llen = tick_read_line(tick_client_fd, tick_buf,
+                                          sizeof(tick_buf), &tick_fill);
+            if (llen <= 0) {
+                if (verbose)
+                    fprintf(stderr,
+                        "simavr_bridge: tick client closed at cycle %llu\n",
+                        (unsigned long long)avr->cycle);
+                break;
+            }
+            double target = 0.;
+            int parsed = sscanf(tick_buf, "advance %lf", &target);
+            /* Shift any bytes after the parsed line back to the front. */
+            size_t consumed = (size_t)llen + 1;  /* include the '\n' */
+            if (consumed <= tick_fill) {
+                memmove(tick_buf, tick_buf + consumed, tick_fill - consumed);
+                tick_fill -= consumed;
+            } else {
+                tick_fill = 0;
+            }
+            if (parsed != 1) {
+                /* Unrecognized message - ack with current time and let
+                 * klippy keep going rather than wedge the test. */
+                char reply[64];
+                int rl = snprintf(reply, sizeof(reply), "done %.9f\n",
+                                  (double)avr->cycle / (double)avr->frequency);
+                if (write(tick_client_fd, reply, rl) != rl) break;
+                continue;
+            }
+            avr_cycle_count_t target_cycle =
+                (avr_cycle_count_t)(target * (double)avr->frequency);
+            while (g_running && avr->cycle < target_cycle
+                   && state != cpu_Done && state != cpu_Crashed) {
+                state = avr_run(avr);
+            }
+            if (sim_time_ptr)
+                *sim_time_ptr = (double)avr->cycle / (double)avr->frequency;
+            /* Honor the wall-clock duration safety net even in tick
+             * mode so a runaway test still terminates. */
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t wall_ns = (uint64_t)(now.tv_sec - start_ts.tv_sec)
+                                * 1000000000ULL
+                             + (now.tv_nsec - start_ts.tv_nsec);
+            if (deadline_wall_ns && wall_ns >= deadline_wall_ns) {
+                if (verbose)
+                    fprintf(stderr,
+                        "simavr_bridge: wall deadline reached at cycle %llu\n",
+                        (unsigned long long)avr->cycle);
+                break;
+            }
+            char reply[64];
+            int rl = snprintf(reply, sizeof(reply), "done %.9f\n",
+                              (double)avr->cycle / (double)avr->frequency);
+            if (write(tick_client_fd, reply, rl) != rl) {
+                if (verbose)
+                    fprintf(stderr,
+                        "simavr_bridge: tick reply write failed: %s\n",
+                        strerror(errno));
+                break;
+            }
+            continue;
+        }
         state = avr_run(avr);
         if (avr->cycle < next_throttle_cycle)
             continue;

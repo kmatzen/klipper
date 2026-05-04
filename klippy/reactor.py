@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, gc, select, math, time, logging, queue
+import os, gc, select, socket, math, time, logging, queue
 import greenlet
 import chelper, util
 
@@ -104,6 +104,10 @@ class ReactorPreventPause:
 class SelectReactor:
     NOW = _NOW
     NEVER = _NEVER
+    # Tick-mode lockstep (see _tick_request_advance): cap the per-tick
+    # advance window so an idle reactor (NEVER timer) still hands
+    # control back to the bridge regularly.
+    _TICK_MAX_QUANTUM = 0.1
     def __init__(self, gc_checking=False):
         # Main code
         self._process = False
@@ -130,6 +134,16 @@ class SelectReactor:
         self._cached_dispatch_greenlets = []
         self._all_greenlets = []
         self._prevent_pause_count = 0
+        # Tick mode (deterministic-time lockstep with simavr bridge).
+        # When KLIPPY_TICK_SOCKET is set, the dispatch loop yields to
+        # the bridge whenever no fd is ready and no timer is due: it
+        # sends `advance <T>` to ask simavr to run forward to T, then
+        # the bridge replies `done <T_actual>` after updating sim_time.
+        # This pins host-time non-determinism out of the reactor/MCU
+        # interaction without changing how callbacks see eventtime.
+        self._tick_socket_path = os.environ.get('KLIPPY_TICK_SOCKET') or None
+        self._tick_socket = None
+        self._tick_recv_buf = b''
     # Python garbage collection
     def get_gc_stats(self):
         return tuple(self._last_gc_times)
@@ -312,6 +326,62 @@ class SelectReactor:
                     self._end_greenlet(g_dispatch)
                     return self.monotonic()
         return eventtime
+    # Tick-mode lockstep with an external time driver
+    def _tick_connect(self):
+        if not self._tick_socket_path or self._tick_socket is not None:
+            return
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        # The bridge spawns first and binds before us, but in CI it can
+        # still lose a race if klippy starts very fast; retry briefly.
+        deadline = time.monotonic() + 5.0
+        last_err = None
+        while time.monotonic() < deadline:
+            try:
+                s.connect(self._tick_socket_path)
+                self._tick_socket = s
+                return
+            except OSError as e:
+                last_err = e
+                time.sleep(0.05)
+        s.close()
+        raise ReactorError("Could not connect KLIPPY_TICK_SOCKET=%s: %s"
+                           % (self._tick_socket_path, last_err))
+    def _tick_close(self):
+        if self._tick_socket is None:
+            return
+        try:
+            self._tick_socket.close()
+        except OSError:
+            pass
+        self._tick_socket = None
+    def _tick_request_advance(self):
+        # Ask the bridge to advance simulated time. Returns the new
+        # eventtime after the bridge updates the sim_time mmap, or
+        # None if the bridge has closed the connection.
+        target = self._next_timer
+        eventtime = self.monotonic()
+        cap = eventtime + self._TICK_MAX_QUANTUM
+        if target >= self.NEVER or target > cap:
+            target = cap
+        if target < eventtime:
+            target = eventtime
+        msg = ('advance %.9f\n' % target).encode('ascii')
+        try:
+            self._tick_socket.sendall(msg)
+            while b'\n' not in self._tick_recv_buf:
+                chunk = self._tick_socket.recv(64)
+                if not chunk:
+                    return None
+                self._tick_recv_buf += chunk
+            line, self._tick_recv_buf = self._tick_recv_buf.split(b'\n', 1)
+        except OSError:
+            return None
+        if not line.startswith(b'done '):
+            return None
+        try:
+            return float(line[5:])
+        except ValueError:
+            return None
     # Main loop
     def _dispatch_loop(self):
         busy = True
@@ -319,16 +389,27 @@ class SelectReactor:
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = select.select(self._read_fds, self._write_fds, [], timeout)
+            in_tick = self._tick_socket is not None
+            wait_timeout = 0 if in_tick else timeout
+            res = select.select(self._read_fds, self._write_fds, [],
+                                wait_timeout)
             eventtime = self.monotonic()
             if res[0] or res[1]:
                 busy = True
                 hdls = ([(fd, self._READ) for fd in res[0]]
                         + [(fd, self._WRITE) for fd in res[1]])
                 eventtime = self._check_fds(eventtime, hdls)
+            elif in_tick and timeout > 0.:
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
     def run(self):
         if self._pipe_fds is None:
             self._setup_async_callbacks()
+        if self._tick_socket is None and self._tick_socket_path:
+            self._tick_connect()
         self._process = True
         self._prevent_pause_count = 0
         try:
@@ -356,6 +437,7 @@ class SelectReactor:
             os.close(self._pipe_fds[0])
             os.close(self._pipe_fds[1])
             self._pipe_fds = None
+        self._tick_close()
 
 class PollReactor(SelectReactor):
     def __init__(self, gc_checking=False):
@@ -386,11 +468,19 @@ class PollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = self._poll.poll(int(math.ceil(timeout * 1000.)))
+            in_tick = self._tick_socket is not None
+            wait_ms = 0 if in_tick else int(math.ceil(timeout * 1000.))
+            res = self._poll.poll(wait_ms)
             eventtime = self.monotonic()
             if res:
                 busy = True
                 eventtime = self._check_fds(eventtime, res)
+            elif in_tick and timeout > 0.:
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
 
 class EPollReactor(SelectReactor):
     def __init__(self, gc_checking=False):
@@ -421,11 +511,19 @@ class EPollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = self._epoll.poll(timeout)
+            in_tick = self._tick_socket is not None
+            wait_timeout = 0. if in_tick else timeout
+            res = self._epoll.poll(wait_timeout)
             eventtime = self.monotonic()
             if res:
                 busy = True
                 eventtime = self._check_fds(eventtime, res)
+            elif in_tick and timeout > 0.:
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
 
 # Use the poll based reactor if it is available
 try:
