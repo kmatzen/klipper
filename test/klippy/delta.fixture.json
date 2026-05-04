@@ -1,0 +1,6 @@
+{
+    "_comment": "Drives test/klippy/delta.test under the simavr bridge in tick-mode lockstep. Delta tests are excluded from EMULATOR mode in free-run sim_time because the simavr serial path can't keep up with klippy's expected step rates under host CPU contention; tick_mode pins simavr's advance to klippy's reactor cycle so throughput is paced exactly to what klippy needs (per round-trip, simavr advances to klippy's next-timer target before klippy processes the resulting MCU events). auto_trsync_trigger_ticks fires each tower's endstop on G28 after 100 step edges so homing completes; analog_in_default keeps thermistor reads in-range so the extruder/heater_bed config stays out of min/max-temp shutdown.",
+    "tick_mode": true,
+    "auto_trsync_trigger_ticks": 100,
+    "analog_in_default": {"default_value": 5000}
+}
