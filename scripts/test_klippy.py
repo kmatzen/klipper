@@ -359,12 +359,22 @@ class TestCase:
                 args += ['--tick-socket', tsp]
                 tick_socket_paths.append(tsp)
             b['args'] = args
-        emu_log_fd = open(emu_log, 'w')
+        # One log file per bridge so concurrent stderr from multiple
+        # simavr instances doesn't interleave (each fd has its own
+        # write position).
+        emu_log_fds = []
         emu_procs = []
         try:
             for b in bridges:
+                if len(bridges) == 1:
+                    log_path = emu_log
+                else:
+                    log_path = os.path.join(self.tempdir,
+                                            '_test_emu' + b['sfx'] + '.log')
+                fd = open(log_path, 'w')
+                emu_log_fds.append(fd)
                 emu_procs.append(subprocess.Popen(b['args'], cwd=repo_root,
-                                                  stdout=emu_log_fd,
+                                                  stdout=fd,
                                                   stderr=subprocess.STDOUT))
             for p, b in zip(emu_procs, bridges):
                 b['slave_path'] = self._wait_for_slave_link(b['slave_link'],
@@ -393,7 +403,8 @@ class TestCase:
         finally:
             for p in emu_procs:
                 self._terminate(p)
-            emu_log_fd.close()
+            for fd in emu_log_fds:
+                fd.close()
         return res, TEMP_LOG_FILE
 
     _STEPPER_RE = re.compile(r'^\[(stepper_[a-z0-9_]+)\]\s*$')
