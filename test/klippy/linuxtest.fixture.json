@@ -1,0 +1,6 @@
+{
+    "_comment": "Linuxprocess backend fixture. The runner auto-scans the cfg for DS18B20 sensors and pre-creates a w1_slave mock per serial under <tempdir>/w1_devices/<serial>/, then spawns the linux klipper.elf with KLIPPER_W1_DEVICES_PATH pointed at that dir. The default mock temp is 25000 millideg C; override per serial via the optional w1_devices map below if a test needs a specific value (e.g. to exercise min_temp / max_temp checks).",
+    "w1_devices": {
+        "12345678": {"temp_mdeg": 23000}
+    }
+}

@@ -263,25 +263,22 @@ class TestCase:
         cfg_path = os.path.join(self.tempdir, TEMP_EMU_CFG)
         emu_log = os.path.join(self.tempdir, TEMP_EMU_LOG)
         bridge_path = os.path.join(repo_root, 'ci_build', 'simavr_bridge')
-        if not os.path.isfile(bridge_path) or not os.access(bridge_path,
-                                                            os.X_OK):
-            raise error(
-                "simavr bridge or .elf missing - this build of "
-                "test_klippy.py requires both. Rebuild with "
-                "scripts/Dockerfile.emulator-test or build the bridge "
-                "manually with gcc against libsimavr.")
         # Per-MCU paths suffix the mcu name (default `mcu` keeps the
         # legacy `_test_emu.tty` filename so single-MCU tests are
         # byte-identical to the pre-fan-out path).
         def mcu_suffix(name):
             return '' if name == 'mcu' else '_' + name
         bridges = []  # list of dicts, one per MCU
+        any_simavr = False
         for mcu_name, dict_path in mcu_dicts:
             elf_path = self._find_elf_for_dict(dict_path)
             if elf_path is None:
                 raise error(
                     "EMULATOR mode: no .elf alongside dict %r for [mcu %s]"
                     % (dict_path, mcu_name))
+            backend = self._backend_for_dict(dict_path)
+            if backend == 'simavr':
+                any_simavr = True
             sfx = mcu_suffix(mcu_name)
             slave_link = os.path.join(self.tempdir,
                                       TEMP_EMU_LINK[:-len('.tty')]
@@ -295,11 +292,19 @@ class TestCase:
                     pass
             bridges.append({
                 'mcu': mcu_name,
+                'backend': backend,
                 'elf': elf_path,
                 'slave_link': slave_link,
                 'ctl_socket': ctl_socket,
                 'sfx': sfx,
             })
+        if any_simavr and (not os.path.isfile(bridge_path)
+                           or not os.access(bridge_path, os.X_OK)):
+            raise error(
+                "simavr bridge or .elf missing - this build of "
+                "test_klippy.py requires both. Rebuild with "
+                "scripts/Dockerfile.emulator-test or build the bridge "
+                "manually with gcc against libsimavr.")
         # Opt-in sim-time mode: tests with `sim_time: true` in their
         # fixture get a deterministic-time runtime where klippy reads
         # MCU clock via a memory-mapped double instead of
@@ -334,6 +339,17 @@ class TestCase:
         tick_socket_paths = []
         for b in bridges:
             sfx = b['sfx']
+            if b['backend'] == 'linuxprocess':
+                # linuxprocess: the linux klipper.elf is itself the MCU.
+                # It opens a pty via openpty() and symlinks the slave end
+                # to the path passed via -I, so klippy connects directly
+                # without any simavr bridge in between. Sim-time / tick
+                # mode don't apply (real-time host clock is the MCU
+                # clock); per-test fixtures plumb peripheral state via
+                # filesystem mocks (e.g. KLIPPER_W1_DEVICES_PATH for
+                # DS18B20) rather than a control socket.
+                b['args'] = [b['elf'], '-I', b['slave_link']]
+                continue
             args = [
                 bridge_path,
                 '--elf', b['elf'],
@@ -373,12 +389,30 @@ class TestCase:
                                             '_test_emu' + b['sfx'] + '.log')
                 fd = open(log_path, 'w')
                 emu_log_fds.append(fd)
+                proc_env = None
+                if b['backend'] == 'linuxprocess':
+                    # Pre-create w1_slave mock files for any DS18B20
+                    # sensors in the cfg, then point the binary at
+                    # that tempdir so its sysfs reads succeed without
+                    # /sys being writable.
+                    w1_dir = self._setup_w1_mocks(config_fname,
+                                                  fixture_path, b['sfx'])
+                    if w1_dir is not None:
+                        proc_env = dict(os.environ)
+                        proc_env['KLIPPER_W1_DEVICES_PATH'] = w1_dir
                 emu_procs.append(subprocess.Popen(b['args'], cwd=repo_root,
                                                   stdout=fd,
-                                                  stderr=subprocess.STDOUT))
+                                                  stderr=subprocess.STDOUT,
+                                                  env=proc_env))
             for p, b in zip(emu_procs, bridges):
+                is_lp = (b['backend'] == 'linuxprocess')
                 b['slave_path'] = self._wait_for_slave_link(b['slave_link'],
-                                                            p)
+                                                            p,
+                                                            is_symlink=is_lp)
+                if is_lp:
+                    # No control socket for linuxprocess - peripheral
+                    # state is staged via filesystem mocks before spawn.
+                    continue
                 self._push_fixture_to_control_socket(
                     b['ctl_socket'], fixture_path, config_fname,
                     sim_time_enabled=sim_time_enabled,
@@ -1117,6 +1151,101 @@ class TestCase:
         finally:
             sock.close()
 
+    @staticmethod
+    def _backend_for_dict(dict_path):
+        # linuxprocess builds yield a host-architecture binary that runs
+        # the firmware in-process and exposes its pty directly to klippy
+        # - no simavr in the loop. Every other dict (avr / arm / pru ...)
+        # is currently routed through simavr; non-AVR backends remain
+        # follow-up work.
+        if os.path.basename(dict_path) == 'linuxprocess.dict':
+            return 'linuxprocess'
+        return 'simavr'
+
+    _DS18B20_SERIAL_RE = re.compile(r'^\s*serial_no\s*:\s*(\S+)\s*'
+                                    r'(?:#.*)?$')
+    _DS18B20_SENSOR_TYPE_RE = re.compile(r'^\s*sensor_type\s*:\s*'
+                                         r'DS18B20\s*(?:#.*)?$')
+
+    @classmethod
+    def _parse_ds18b20_serials(cls, config_fname):
+        # Walk every section that has both `sensor_type: DS18B20` and a
+        # `serial_no:` line and return the configured serial strings.
+        # The linux klipper firmware opens /sys/bus/w1/devices/<serial>/
+        # w1_slave per sensor; in emulator mode we redirect the prefix
+        # to a tempdir and pre-create one mock w1_slave per serial.
+        serials = []
+        in_section = False
+        sensor_is_ds = False
+        serial_no = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return serials
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    if in_section and sensor_is_ds and serial_no is not None:
+                        serials.append(serial_no)
+                    in_section = True
+                    sensor_is_ds = False
+                    serial_no = None
+                    continue
+                if not in_section:
+                    continue
+                if cls._DS18B20_SENSOR_TYPE_RE.match(line):
+                    sensor_is_ds = True
+                    continue
+                m = cls._DS18B20_SERIAL_RE.match(line)
+                if m:
+                    serial_no = m.group(1)
+        finally:
+            f.close()
+        if in_section and sensor_is_ds and serial_no is not None:
+            serials.append(serial_no)
+        return serials
+
+    def _setup_w1_mocks(self, config_fname, fixture_path, sfx):
+        # Pre-create <tempdir>/w1_devices<sfx>/<serial>/w1_slave for every
+        # DS18B20 serial declared in the cfg, with a CRC-OK report whose
+        # `t=N` is the configured millidegrees C (default 25000 = 25 C,
+        # well inside any test's min_temp / max_temp). Returns the root
+        # dir to feed into KLIPPER_W1_DEVICES_PATH, or None if there are
+        # no DS18B20 sensors (in which case we don't need to set the env
+        # var).
+        if config_fname is None:
+            return None
+        serials = self._parse_ds18b20_serials(config_fname)
+        if not serials:
+            return None
+        overrides = {}
+        if fixture_path is not None:
+            try:
+                with open(fixture_path) as ff:
+                    fx = json.load(ff)
+                overrides = fx.get('w1_devices') or {}
+            except (OSError, ValueError):
+                overrides = {}
+        w1_root = os.path.abspath(
+            os.path.join(self.tempdir, 'w1_devices' + sfx))
+        for serial in serials:
+            spec = overrides.get(serial) or {}
+            t_mdeg = int(spec.get('temp_mdeg', 25000))
+            dev_dir = os.path.join(w1_root, serial)
+            try:
+                os.makedirs(dev_dir)
+            except OSError:
+                pass  # already exists from a prior run; we'll overwrite
+            # The reader thread reads up to 128 bytes and looks for the
+            # `t=` substring; the leading hex bytes are decorative but
+            # match the kernel's w1_therm output format for realism.
+            payload = ("31 00 4b 46 7f ff 0c 10 77 : crc=77 YES\n"
+                       "31 00 4b 46 7f ff 0c 10 77 t=%d\n" % (t_mdeg,))
+            with open(os.path.join(dev_dir, 'w1_slave'), 'w') as f:
+                f.write(payload)
+        return w1_root
+
     def _find_elf_for_dict(self, dict_path):
         # The Dockerfile builds a parallel ci_build/elf/<mcu>.elf
         # alongside ci_build/dict/<mcu>.dict; we use the dict's
@@ -1137,13 +1266,21 @@ class TestCase:
                 return c
         return None
 
-    def _wait_for_slave_link(self, link_path, emu_proc, timeout=10.0):
+    def _wait_for_slave_link(self, link_path, emu_proc, timeout=10.0,
+                             is_symlink=False):
+        # simavr_bridge writes a regular file containing the pty path;
+        # the linuxprocess binary creates a symlink at the path itself.
+        # In the symlink case we return the link path - klippy / pyserial
+        # will follow it transparently.
         deadline = _monotonic() + timeout
         while _monotonic() < deadline:
             if emu_proc.poll() is not None:
                 raise error("emulator exited before publishing slave link "
                             "(returncode=%d)" % (emu_proc.returncode,))
-            if os.path.exists(link_path):
+            if is_symlink:
+                if os.path.lexists(link_path):
+                    return link_path
+            elif os.path.exists(link_path):
                 with open(link_path) as f:
                     return f.read().strip()
             time.sleep(0.05)

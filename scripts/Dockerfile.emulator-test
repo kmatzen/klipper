@@ -56,6 +56,19 @@ RUN mkdir -p ci_build/dict ci_build/elf \
         cp out/klipper.elf ci_build/elf/${cfg}.elf; \
     done
 
+# Also build linuxprocess - this is a host-arch binary (gcc, not
+# avr-gcc) that runs the firmware in-process. test_klippy.py's
+# linuxprocess backend spawns it directly with -I <slave-link>; the
+# binary opens a pty and symlinks the slave end to that path so klippy
+# connects to it as if it were a real serial device. Used by
+# linuxtest.test (DS18B20) and any future host-MCU coverage.
+RUN make distclean V=1 || true \
+    && cp test/configs/linuxprocess.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/linuxprocess.dict \
+    && cp out/klipper.elf ci_build/elf/linuxprocess.elf
+
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the
 # klipper firmware and exposes its UART as a pty for klippy plus a
@@ -70,4 +83,4 @@ RUN gcc -O2 -Wall -Wextra \
 
 RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi()"
 
-CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", "test/klippy/emulator_smoke.test", "test/klippy/sht3x_crc_regression.test"]
+CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", "test/klippy/emulator_smoke.test", "test/klippy/sht3x_crc_regression.test", "test/klippy/linuxtest.test"]
