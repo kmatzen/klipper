@@ -1,0 +1,6 @@
+{
+    "_comment": "Drives test/klippy/delta_calibrate.test under the simavr bridge in tick-mode lockstep, mirroring delta.fixture.json. Same throughput-bound exclusion delta hit in free-run sim_time; tick_mode pins simavr's advance to klippy's reactor cycle so the per-step UART traffic always lands inside the simulated moment it was sent. delta_calibrate.cfg has no thermistors / heaters / sensors past the three towers' endstops, so only auto_trsync_trigger_ticks is needed; analog_in_default is harmless-but-unused.",
+    "tick_mode": true,
+    "auto_trsync_trigger_ticks": 100,
+    "analog_in_default": {"default_value": 5000}
+}
