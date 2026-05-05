@@ -381,7 +381,8 @@ class TestCase:
                                                             p)
                 self._push_fixture_to_control_socket(
                     b['ctl_socket'], fixture_path, config_fname,
-                    sim_time_enabled=sim_time_enabled)
+                    sim_time_enabled=sim_time_enabled,
+                    mcu_name=b['mcu'])
             self._materialize_emulator_config(config_fname, cfg_path,
                                               bridges)
             klippy_args = [sys.executable, './klippy/klippy.py', cfg_path,
@@ -408,7 +409,12 @@ class TestCase:
         return res, TEMP_LOG_FILE
 
     _STEPPER_RE = re.compile(r'^\[(stepper_[a-z0-9_]+)\]\s*$')
-    _PIN_RE = re.compile(r'^\s*([a-z_]+_pin)\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
+    # Pins may be MCU-prefixed in multi-MCU configs (`zboard:PL3`); the
+    # optional `(?:(\w+):)?` group captures that prefix so the fixture
+    # pusher can route step_trigger commands to the bridge that owns
+    # each pin. Bare pins fall through to the default `[mcu]` section.
+    _PIN_RE = re.compile(r'^\s*([a-z_]+_pin)\s*:\s*([!^~]*)'
+                         r'(?:([a-z_][a-z0-9_]*):)?(P[A-L]\d+)\s*'
                          r'(?:#.*)?$')
 
     @classmethod
@@ -442,9 +448,10 @@ class TestCase:
                 m = cls._PIN_RE.match(line)
                 if not m:
                     continue
-                key, _flags, bare = m.groups()
+                key, _flags, mcu, bare = m.groups()
                 if key in ('step_pin', 'endstop_pin'):
                     current[key] = bare
+                    current[key + '_mcu'] = mcu or 'mcu'
         finally:
             f.close()
         if current:
@@ -486,9 +493,10 @@ class TestCase:
                 m = cls._PIN_RE.match(line)
                 if not m:
                     continue
-                key, _flags, bare = m.groups()
+                key, _flags, mcu, bare = m.groups()
                 if key in ('step_pin', 'endstop_pin'):
                     current[key] = bare
+                    current[key + '_mcu'] = mcu or 'mcu'
         finally:
             f.close()
         if current and 'step_pin' in current \
@@ -716,7 +724,7 @@ class TestCase:
                 m = cls._PIN_RE.match(line)
                 if not m:
                     continue
-                key, _flags, bare = m.groups()
+                key, _flags, _mcu, bare = m.groups()
                 if key == 'sensor_pin':
                     out.append((current, bare))
                     current = None
@@ -744,7 +752,8 @@ class TestCase:
 
     def _push_fixture_to_control_socket(self, socket_path, fixture_path,
                                         config_fname=None,
-                                        sim_time_enabled=False):
+                                        sim_time_enabled=False,
+                                        mcu_name='mcu'):
         # Translate the JSON fixture into newline-terminated commands
         # the simavr bridge understands and write them through the
         # control socket. Connection retries briefly because the
@@ -771,6 +780,15 @@ class TestCase:
             for stepper in self._parse_stepper_endstops(config_fname):
                 step_p = stepper['step_pin']
                 end_p = stepper['endstop_pin']
+                # Each bridge only sees its own AVR's GPIO IRQs, so
+                # step_trigger only makes sense when both pins live on
+                # this bridge. Skip steppers whose pins belong to a
+                # different MCU section (multi-MCU configs like
+                # sample-multi-mcu.cfg with `zboard:PL3` style pins).
+                if (stepper.get('step_pin_mcu', 'mcu') != mcu_name
+                        or stepper.get('endstop_pin_mcu', 'mcu')
+                        != mcu_name):
+                    continue
                 # 100 steps is well below any homing move's full
                 # range; the home succeeds long before klippy's
                 # home_wait timeout. Triggered = pin_value=1 (klippy
@@ -786,7 +804,13 @@ class TestCase:
         # number of stepper edges. Together these let multi-sample
         # probe tests run against real klipper firmware via simavr.
         bltouch = raw.get('bltouch')
-        if bltouch and config_fname is not None:
+        # bltouch fixture pins are bare (assumed on the default `[mcu]`
+        # section); a future multi-MCU bltouch fixture can override via
+        # `bltouch.mcu`. Skip emitting on bridges that don't own them.
+        bltouch_mcu = (bltouch.get('mcu', 'mcu')
+                       if isinstance(bltouch, dict) else 'mcu')
+        if (bltouch and config_fname is not None
+                and bltouch_mcu == mcu_name):
             ctrl = bltouch.get('control_pin', '')
             sens = bltouch.get('sensor_pin', '')
             inv = 1 if bltouch.get('invert', False) else 0
@@ -803,12 +827,14 @@ class TestCase:
                     # current test fixtures we just use the first
                     # stepper_z section.
                     z_step_pin = None
+                    z_step_mcu = 'mcu'
                     for s in self._parse_stepper_endstops_any(
                             config_fname):
                         if s['name'] == 'stepper_z' and 'step_pin' in s:
                             z_step_pin = s['step_pin']
+                            z_step_mcu = s.get('step_pin_mcu', 'mcu')
                             break
-                    if z_step_pin is not None:
+                    if z_step_pin is not None and z_step_mcu == mcu_name:
                         lines.append("step_trigger %s %d %d %s %d 1" % (
                             z_step_pin[1], int(z_step_pin[2:]),
                             int(ats),
@@ -830,11 +856,21 @@ class TestCase:
                 # value is 1 unless `!` invert flag is set.
                 trig_val = 0 if '!' in flags else 1
                 z_step_pin = None
+                z_step_mcu = 'mcu'
                 for s in self._parse_stepper_endstops_any(config_fname):
                     if s['name'] == 'stepper_z' and 'step_pin' in s:
                         z_step_pin = s['step_pin']
+                        z_step_mcu = s.get('step_pin_mcu', 'mcu')
                         break
-                if z_step_pin is not None:
+                # The probe pin is parsed bare today (_PROBE_PIN_RE
+                # doesn't yet handle MCU prefixes); assume it lives
+                # on the default `[mcu]` section. Cross-MCU step ->
+                # probe wiring would need both pins on the same
+                # bridge anyway, so only emit when Z and the probe
+                # both belong to this bridge.
+                if (z_step_pin is not None
+                        and z_step_mcu == mcu_name
+                        and mcu_name == 'mcu'):
                     lines.append("step_trigger %s %d %d %s %d %d" % (
                         z_step_pin[1], int(z_step_pin[2:]),
                         int(probe_steps),
