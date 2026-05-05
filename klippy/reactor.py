@@ -141,9 +141,15 @@ class SelectReactor:
         # the bridge replies `done <T_actual>` after updating sim_time.
         # This pins host-time non-determinism out of the reactor/MCU
         # interaction without changing how callbacks see eventtime.
-        self._tick_socket_path = os.environ.get('KLIPPY_TICK_SOCKET') or None
-        self._tick_socket = None
-        self._tick_recv_buf = b''
+        # Multi-MCU configs pass KLIPPY_TICK_SOCKET as a `:`-separated
+        # list; the reactor connects to each, broadcasts the same
+        # `advance T` to all, waits for `done` from all, and takes the
+        # minimum reported actual as the new eventtime so klippy never
+        # advances past any bridge.
+        tick_env = os.environ.get('KLIPPY_TICK_SOCKET') or ''
+        self._tick_socket_paths = [p for p in tick_env.split(':') if p]
+        self._tick_sockets = []
+        self._tick_recv_bufs = []
     # Python garbage collection
     def get_gc_stats(self):
         return tuple(self._last_gc_times)
@@ -326,38 +332,44 @@ class SelectReactor:
                     self._end_greenlet(g_dispatch)
                     return self.monotonic()
         return eventtime
-    # Tick-mode lockstep with an external time driver
+    # Tick-mode lockstep with one or more external time drivers
     def _tick_connect(self):
-        if not self._tick_socket_path or self._tick_socket is not None:
+        if not self._tick_socket_paths or self._tick_sockets:
             return
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        # The bridge spawns first and binds before us, but in CI it can
-        # still lose a race if klippy starts very fast; retry briefly.
         deadline = time.monotonic() + 5.0
-        last_err = None
-        while time.monotonic() < deadline:
-            try:
-                s.connect(self._tick_socket_path)
-                self._tick_socket = s
-                return
-            except OSError as e:
-                last_err = e
-                time.sleep(0.05)
-        s.close()
-        raise ReactorError("Could not connect KLIPPY_TICK_SOCKET=%s: %s"
-                           % (self._tick_socket_path, last_err))
+        for path in self._tick_socket_paths:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            last_err = None
+            while time.monotonic() < deadline:
+                try:
+                    s.connect(path)
+                    self._tick_sockets.append(s)
+                    self._tick_recv_bufs.append(b'')
+                    s = None
+                    break
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.05)
+            if s is not None:
+                s.close()
+                # Tear down anything we already connected so a partial
+                # connect doesn't leave dangling fds.
+                self._tick_close()
+                raise ReactorError(
+                    "Could not connect KLIPPY_TICK_SOCKET=%s: %s"
+                    % (path, last_err))
     def _tick_close(self):
-        if self._tick_socket is None:
-            return
-        try:
-            self._tick_socket.close()
-        except OSError:
-            pass
-        self._tick_socket = None
+        for s in self._tick_sockets:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._tick_sockets = []
+        self._tick_recv_bufs = []
     def _tick_request_advance(self):
-        # Ask the bridge to advance simulated time. Returns the new
-        # eventtime after the bridge updates the sim_time mmap, or
-        # None if the bridge has closed the connection.
+        # Ask all bridges to advance simulated time, in lockstep.
+        # Returns the minimum reported actual (so klippy never thinks
+        # any bridge is ahead of where it actually is) or None on EOF.
         target = self._next_timer
         eventtime = self.monotonic()
         cap = eventtime + self._TICK_MAX_QUANTUM
@@ -367,19 +379,30 @@ class SelectReactor:
             target = eventtime
         msg = ('advance %.9f\n' % target).encode('ascii')
         try:
-            self._tick_socket.sendall(msg)
-            while b'\n' not in self._tick_recv_buf:
-                chunk = self._tick_socket.recv(64)
-                if not chunk:
-                    return None
-                self._tick_recv_buf += chunk
-            line, self._tick_recv_buf = self._tick_recv_buf.split(b'\n', 1)
+            for s in self._tick_sockets:
+                s.sendall(msg)
         except OSError:
             return None
-        if not line.startswith(b'done '):
-            return None
+        actuals = []
+        for i, s in enumerate(self._tick_sockets):
+            try:
+                while b'\n' not in self._tick_recv_bufs[i]:
+                    chunk = s.recv(64)
+                    if not chunk:
+                        return None
+                    self._tick_recv_bufs[i] += chunk
+                line, self._tick_recv_bufs[i] = (
+                    self._tick_recv_bufs[i].split(b'\n', 1))
+            except OSError:
+                return None
+            if not line.startswith(b'done '):
+                return None
+            try:
+                actuals.append(float(line[5:]))
+            except ValueError:
+                return None
         try:
-            return float(line[5:])
+            return min(actuals)
         except ValueError:
             return None
     # Main loop
@@ -389,7 +412,7 @@ class SelectReactor:
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            in_tick = self._tick_socket is not None
+            in_tick = bool(self._tick_sockets)
             wait_timeout = 0 if in_tick else timeout
             res = select.select(self._read_fds, self._write_fds, [],
                                 wait_timeout)
@@ -408,7 +431,7 @@ class SelectReactor:
     def run(self):
         if self._pipe_fds is None:
             self._setup_async_callbacks()
-        if self._tick_socket is None and self._tick_socket_path:
+        if not self._tick_sockets and self._tick_socket_paths:
             self._tick_connect()
         self._process = True
         self._prevent_pause_count = 0
@@ -468,7 +491,7 @@ class PollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            in_tick = self._tick_socket is not None
+            in_tick = bool(self._tick_sockets)
             wait_ms = 0 if in_tick else int(math.ceil(timeout * 1000.))
             res = self._poll.poll(wait_ms)
             eventtime = self.monotonic()
@@ -511,7 +534,7 @@ class EPollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            in_tick = self._tick_socket is not None
+            in_tick = bool(self._tick_sockets)
             wait_timeout = 0. if in_tick else timeout
             res = self._epoll.poll(wait_timeout)
             eventtime = self.monotonic()

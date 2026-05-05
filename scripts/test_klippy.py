@@ -245,40 +245,61 @@ class TestCase:
 
     def _launch_emulator_test(self, config_fname, dict_fnames, gcode_fname,
                               fixture_path):
-        if len(dict_fnames) != 1:
-            raise error("EMULATOR mode currently supports a single MCU dict")
-        dict_path = dict_fnames[0]
-        if '=' in dict_path:
-            dict_path = dict_path.split('=', 1)[1]
+        # `DICTIONARY a.dict mcu1=b.dict ...` parses into a list where the
+        # first entry is the default `[mcu]` and the rest are
+        # `name=path` for `[mcu name]` sections. We map each entry to its
+        # own simavr bridge (separate ELF, pty, sockets) so multi-MCU
+        # configs spin up one bridge per MCU and klippy connects to each
+        # MCU section's pty independently.
+        mcu_dicts = []  # [(mcu_name, dict_path), ...]
+        for i, df in enumerate(dict_fnames):
+            if '=' in df:
+                mcu_name, dict_path = df.split('=', 1)
+                mcu_dicts.append((mcu_name.strip(), dict_path))
+            else:
+                mcu_dicts.append(('mcu', df))
         repo_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), os.pardir))
-        slave_link = os.path.join(self.tempdir, TEMP_EMU_LINK)
-        emu_log = os.path.join(self.tempdir, TEMP_EMU_LOG)
         cfg_path = os.path.join(self.tempdir, TEMP_EMU_CFG)
-        if os.path.exists(slave_link):
-            os.unlink(slave_link)
-        # Prefer the simavr-based bridge when an .elf for this MCU
-        # The simavr bridge runs the actual klipper firmware ELF
-        # under cycle-accurate AVR simulation - every endstop sample
-        # loop, trsync timer, and software-PWM pulse runs the same
-        # C code that ships on real hardware. The fixture is
-        # translated into bridge control-socket commands that drive
-        # ADC values, GPIO pins, SPI/I2C MISO queues, step-edge
-        # triggers, and BLTouch state.
-        elf_path = self._find_elf_for_dict(dict_path)
+        emu_log = os.path.join(self.tempdir, TEMP_EMU_LOG)
         bridge_path = os.path.join(repo_root, 'ci_build', 'simavr_bridge')
-        if elf_path is None or not os.path.isfile(bridge_path) \
-                or not os.access(bridge_path, os.X_OK):
+        if not os.path.isfile(bridge_path) or not os.access(bridge_path,
+                                                            os.X_OK):
             raise error(
                 "simavr bridge or .elf missing - this build of "
                 "test_klippy.py requires both. Rebuild with "
                 "scripts/Dockerfile.emulator-test or build the bridge "
                 "manually with gcc against libsimavr.")
-        ctl_socket = os.path.join(self.tempdir, TEMP_EMU_CTL)
-        try:
-            os.unlink(ctl_socket)
-        except OSError:
-            pass
+        # Per-MCU paths suffix the mcu name (default `mcu` keeps the
+        # legacy `_test_emu.tty` filename so single-MCU tests are
+        # byte-identical to the pre-fan-out path).
+        def mcu_suffix(name):
+            return '' if name == 'mcu' else '_' + name
+        bridges = []  # list of dicts, one per MCU
+        for mcu_name, dict_path in mcu_dicts:
+            elf_path = self._find_elf_for_dict(dict_path)
+            if elf_path is None:
+                raise error(
+                    "EMULATOR mode: no .elf alongside dict %r for [mcu %s]"
+                    % (dict_path, mcu_name))
+            sfx = mcu_suffix(mcu_name)
+            slave_link = os.path.join(self.tempdir,
+                                      TEMP_EMU_LINK[:-len('.tty')]
+                                      + sfx + '.tty')
+            ctl_socket = os.path.join(self.tempdir,
+                                      '_test_emu' + sfx + '.ctl')
+            for p in (slave_link, ctl_socket):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            bridges.append({
+                'mcu': mcu_name,
+                'elf': elf_path,
+                'slave_link': slave_link,
+                'ctl_socket': ctl_socket,
+                'sfx': sfx,
+            })
         # Opt-in sim-time mode: tests with `sim_time: true` in their
         # fixture get a deterministic-time runtime where klippy reads
         # MCU clock via a memory-mapped double instead of
@@ -304,55 +325,74 @@ class TestCase:
         # lockstep over the tick socket so the two clocks can't drift.
         if tick_mode_enabled:
             sim_time_enabled = True
-        sim_time_file = None
-        tick_socket_path = None
-        emu_args = [
-            bridge_path,
-            '--elf', elf_path,
-            '--slave-link', slave_link,
-            '--control-socket', ctl_socket,
-            '--duration', str(EMULATOR_KLIPPY_DEADLINE + 5),
-        ]
-        if sim_time_enabled:
-            sim_time_file = os.path.join(self.tempdir, 'sim_time')
-            try:
-                os.unlink(sim_time_file)
-            except OSError:
-                pass
-            emu_args += ['--sim-time-file', sim_time_file]
-        if tick_mode_enabled:
-            tick_socket_path = os.path.join(self.tempdir, 'tick_sock')
-            try:
-                os.unlink(tick_socket_path)
-            except OSError:
-                pass
-            emu_args += ['--tick-socket', tick_socket_path]
+        # Per-bridge sim_time and tick_socket files. klippy can only
+        # read one canonical sim_time mmap (set via KLIPPY_SIM_TIME_FILE),
+        # so the first bridge's file is authoritative -- under tick mode
+        # all bridges advance to the same target each round-trip, so
+        # they stay sync'd to within a single tick anyway.
+        canonical_sim_time_file = None
+        tick_socket_paths = []
+        for b in bridges:
+            sfx = b['sfx']
+            args = [
+                bridge_path,
+                '--elf', b['elf'],
+                '--slave-link', b['slave_link'],
+                '--control-socket', b['ctl_socket'],
+                '--duration', str(EMULATOR_KLIPPY_DEADLINE + 5),
+            ]
+            if sim_time_enabled:
+                stf = os.path.join(self.tempdir, 'sim_time' + sfx)
+                try:
+                    os.unlink(stf)
+                except OSError:
+                    pass
+                args += ['--sim-time-file', stf]
+                if canonical_sim_time_file is None:
+                    canonical_sim_time_file = stf
+            if tick_mode_enabled:
+                tsp = os.path.join(self.tempdir, 'tick_sock' + sfx)
+                try:
+                    os.unlink(tsp)
+                except OSError:
+                    pass
+                args += ['--tick-socket', tsp]
+                tick_socket_paths.append(tsp)
+            b['args'] = args
         emu_log_fd = open(emu_log, 'w')
-        emu_proc = subprocess.Popen(emu_args, cwd=repo_root,
-                                    stdout=emu_log_fd,
-                                    stderr=subprocess.STDOUT)
+        emu_procs = []
         try:
-            slave_path = self._wait_for_slave_link(slave_link, emu_proc)
-            if ctl_socket is not None:
+            for b in bridges:
+                emu_procs.append(subprocess.Popen(b['args'], cwd=repo_root,
+                                                  stdout=emu_log_fd,
+                                                  stderr=subprocess.STDOUT))
+            for p, b in zip(emu_procs, bridges):
+                b['slave_path'] = self._wait_for_slave_link(b['slave_link'],
+                                                            p)
                 self._push_fixture_to_control_socket(
-                    ctl_socket, fixture_path, config_fname,
+                    b['ctl_socket'], fixture_path, config_fname,
                     sim_time_enabled=sim_time_enabled)
             self._materialize_emulator_config(config_fname, cfg_path,
-                                              slave_path)
+                                              bridges)
             klippy_args = [sys.executable, './klippy/klippy.py', cfg_path,
                            '-i', gcode_fname, '-l', TEMP_LOG_FILE, '-v']
             for df in dict_fnames:
                 klippy_args += ['-d', df]
             klippy_env = None
-            if sim_time_file or tick_socket_path:
+            if canonical_sim_time_file or tick_socket_paths:
                 klippy_env = dict(os.environ)
-                if sim_time_file:
-                    klippy_env['KLIPPY_SIM_TIME_FILE'] = sim_time_file
-                if tick_socket_path:
-                    klippy_env['KLIPPY_TICK_SOCKET'] = tick_socket_path
+                if canonical_sim_time_file:
+                    klippy_env['KLIPPY_SIM_TIME_FILE'] \
+                        = canonical_sim_time_file
+                if tick_socket_paths:
+                    # ":"-separated so the reactor can connect to each
+                    # bridge and broadcast advance/done in lockstep.
+                    klippy_env['KLIPPY_TICK_SOCKET'] = ':'.join(
+                        tick_socket_paths)
             res = self._run_klippy_with_deadline(klippy_args, env=klippy_env)
         finally:
-            self._terminate(emu_proc)
+            for p in emu_procs:
+                self._terminate(p)
             emu_log_fd.close()
         return res, TEMP_LOG_FILE
 
@@ -1063,22 +1103,54 @@ class TestCase:
         raise error("emulator did not publish slave link within %.1fs"
                     % (timeout,))
 
-    def _materialize_emulator_config(self, src_path, dest_path, slave_path):
+    def _materialize_emulator_config(self, src_path, dest_path, bridges):
+        # `bridges` is a list of dicts with 'mcu' (section name) and
+        # 'slave_path' (resolved pty). For single-MCU configs (one
+        # entry, mcu=='mcu') we keep the legacy behavior: rewrite
+        # every `serial:` line OR substitute SERIAL_PLACEHOLDER. For
+        # multi-MCU configs we walk `[mcu ...]` sections and rewrite
+        # each section's `serial:` line to its bridge's pty.
         with open(src_path) as f:
             cfg = f.read()
-        if SERIAL_PLACEHOLDER in cfg:
-            cfg = cfg.replace(SERIAL_PLACEHOLDER, slave_path)
+        if len(bridges) == 1 and bridges[0]['mcu'] == 'mcu':
+            slave_path = bridges[0]['slave_path']
+            if SERIAL_PLACEHOLDER in cfg:
+                cfg = cfg.replace(SERIAL_PLACEHOLDER, slave_path)
+            else:
+                cfg, n = re.subn(r'(?m)^(\s*serial\s*:\s*).*$',
+                                 r'\1' + slave_path, cfg)
+                if n == 0:
+                    raise error(
+                        "EMULATOR config %r has no serial: line and no %r "
+                        "placeholder; nothing to substitute"
+                        % (src_path, SERIAL_PLACEHOLDER))
         else:
-            # No explicit placeholder: rewrite every "serial: ..." line
-            # to point at the emulator. This lets existing .cfg files
-            # be reused with `EMULATOR` without modification.
-            cfg, n = re.subn(r'(?m)^(\s*serial\s*:\s*).*$',
-                             r'\1' + slave_path, cfg)
-            if n == 0:
+            slave_by_name = {b['mcu']: b['slave_path'] for b in bridges}
+            out_lines = []
+            current_mcu = None
+            mcu_section_re = re.compile(r'^\s*\[mcu(?:\s+([a-z0-9_]+))?\]\s*$')
+            section_re = re.compile(r'^\s*\[')
+            serial_re = re.compile(r'^(\s*serial\s*:\s*).*$')
+            replaced = set()
+            for line in cfg.splitlines(True):
+                m = mcu_section_re.match(line)
+                if m:
+                    current_mcu = m.group(1) or 'mcu'
+                elif section_re.match(line):
+                    current_mcu = None
+                if current_mcu is not None and serial_re.match(line):
+                    target = slave_by_name.get(current_mcu)
+                    if target is not None:
+                        sm = serial_re.match(line)
+                        line = sm.group(1) + target + '\n'
+                        replaced.add(current_mcu)
+                out_lines.append(line)
+            missing = set(slave_by_name) - replaced
+            if missing:
                 raise error(
-                    "EMULATOR config %r has no serial: line and no %r "
-                    "placeholder; nothing to substitute"
-                    % (src_path, SERIAL_PLACEHOLDER))
+                    "EMULATOR config %r missing serial: line for "
+                    "[mcu %s]" % (src_path, ', '.join(sorted(missing))))
+            cfg = ''.join(out_lines)
         with open(dest_path, 'w') as f:
             f.write(cfg)
 
