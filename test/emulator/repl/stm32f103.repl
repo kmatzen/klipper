@@ -1,0 +1,19 @@
+// Local override of upstream stm32f103.repl that adds the peripherals
+// klipper firmware exercises but Renode upstream doesn't model.
+//
+// Upstream stm32f103.repl ships GPIO ports A-G with EXTI wiring,
+// USART1-5 with DMA, I2C1+2, NVIC, TIM1-5, and the F1 system memory
+// map - sufficient for a basic Cortex-M3 boot but missing ADC and SPI
+// entirely. Klipper's printer configs read thermistors via ADC1 and
+// talk to TMC drivers / displays / SD cards via SPI; without these
+// peripherals modeled, klippy reads zeros and shuts down on
+// "ADC out of range" or hangs on SPI byte exchange.
+//
+// Addresses match RM0008 (STM32F1xx reference manual).
+using "platforms/cpus/stm32f103.repl"
+
+adc1: Analog.STM32_ADC @ sysbus 0x40012400
+adc2: Analog.STM32_ADC @ sysbus 0x40012800
+
+spi1: SPI.STM32SPI @ sysbus 0x40013000
+spi2: SPI.STM32SPI @ sysbus 0x40003800

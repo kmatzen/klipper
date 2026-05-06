@@ -5,8 +5,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     gcc make libffi-dev build-essential \
     gcc-avr avr-libc \
-    git libelf-dev pkg-config \
+    gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi \
+    git libelf-dev pkg-config curl ca-certificates \
+    libicu70 \
     && rm -rf /var/lib/apt/lists/*
+
+# Renode for the STM32 backend. We use the portable .NET self-
+# contained tarball (not the .deb) so the same Dockerfile builds on
+# both linux/amd64 and linux/arm64 hosts - the .deb is amd64-only
+# and pulls in Mono, while the portable-dotnet bundle ships a
+# self-contained .NET 6 runtime and exists for both architectures
+# starting with Renode 1.16. Pinned to a specific release so
+# peripheral model drift doesn't silently break tests between
+# rebuilds; bump the version when a new Renode release is validated
+# to still pass the suite. Buildkit injects TARGETARCH automatically.
+ARG TARGETARCH
+ARG RENODE_VERSION=1.16.1
+RUN case "${TARGETARCH}" in \
+        amd64) renode_arch_suffix="linux-portable-dotnet" ;; \
+        arm64) renode_arch_suffix="linux-arm64-portable-dotnet" ;; \
+        *) echo "renode: no portable-dotnet build for arch ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -L -o /tmp/renode.tar.gz \
+        "https://github.com/renode/renode/releases/download/v${RENODE_VERSION}/renode-${RENODE_VERSION}.${renode_arch_suffix}.tar.gz" \
+    && mkdir -p /opt/renode \
+    && tar -xzf /tmp/renode.tar.gz -C /opt/renode --strip-components=1 \
+    && rm /tmp/renode.tar.gz \
+    && ln -s /opt/renode/renode /usr/local/bin/renode \
+    && /usr/local/bin/renode --version 2>&1 | head -3
 
 # Build simavr from upstream rather than using Ubuntu's 1.6 package.
 # The packaged version has a known issue dispatching interrupts across
@@ -69,6 +95,31 @@ RUN make distclean V=1 || true \
     && cp out/klipper.dict ci_build/dict/linuxprocess.dict \
     && cp out/klipper.elf ci_build/elf/linuxprocess.elf
 
+# STM32 firmware builds for the renode backend. Each chip's
+# -serial.config selects MACH_STM32{chip} + STM32_SERIAL_USART1; klippy
+# then talks to the firmware over the USART1 pty Renode exposes
+# (Renode does not model STM32 USB-OTG well enough for klipper's CDC
+# stack). printers.test references stm32f103.dict and
+# stm32f103-serial.dict separately, so we publish the F1 build under
+# both names; all other chips use one canonical basename.
+RUN for cfg in stm32f070 stm32f401 stm32f405 stm32f407 stm32f429 \
+               stm32f446 stm32g0b1 stm32h723 stm32h743; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}-serial.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done \
+    && make distclean V=1 || true \
+    && cp test/configs/stm32f103-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/stm32f103.dict \
+    && cp out/klipper.elf ci_build/elf/stm32f103.elf \
+    && cp out/klipper.dict ci_build/dict/stm32f103-serial.dict \
+    && cp out/klipper.elf ci_build/elf/stm32f103-serial.elf
+
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the
 # klipper firmware and exposes its UART as a pty for klippy plus a
@@ -83,4 +134,16 @@ RUN gcc -O2 -Wall -Wextra \
 
 RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi()"
 
-CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", "test/klippy/emulator_smoke.test", "test/klippy/sht3x_crc_regression.test", "test/klippy/linuxtest.test"]
+# printers.test + the two generic_cartesian_* tests are the
+# remaining fileoutput-only suites once the renode backend is wired -
+# they exercise STM32 dicts and so route through Renode in
+# scripts/test_klippy.py:_backend_for_dict. They run alongside the
+# pre-existing AVR + linuxprocess smoke tests so a regression in any
+# backend is caught by the same CMD.
+CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
+     "test/klippy/emulator_smoke.test", \
+     "test/klippy/sht3x_crc_regression.test", \
+     "test/klippy/linuxtest.test", \
+     "test/klippy/printers.test", \
+     "test/klippy/generic_cartesian_itex.test", \
+     "test/klippy/generic_cartesian_iqex.test"]

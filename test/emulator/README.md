@@ -153,3 +153,42 @@ docker run --rm -v $(pwd)/scripts:/klipper/scripts \
 
 `--force-emulator` runs every test under the bridge regardless of
 whether the test file specifies an `EMULATOR <fixture>` line.
+
+## Renode (STM32 backend)
+
+STM32 dicts route through `renode_launcher.py`, which spawns
+[Renode](https://renode.io) with a per-chip platform script and
+exposes the same line-oriented fixture control protocol as
+`simavr_bridge.c`. `renode_hooks.py` is the IronPython module Renode
+loads at startup; its functions (`step_trigger`, `bltouch`,
+`gpio_set`, ...) are invoked by the launcher via Renode's TCP
+Monitor as `python "<call>"` after each fixture command arrives.
+
+Chips covered (see `_PLATFORM_FOR_CHIP` in
+`renode_launcher.py`): F070, F103, F401, F405, F407, F429, F446,
+G0B1, H723, H743. Other chips in `test/configs/stm32*.config` are
+not exercised by any test today and so are not built in the
+Dockerfile; add them when a test calls for them.
+
+### Validating the Renode wiring
+
+Because Renode is Linux-only in our setup (Mono runtime, packaged as
+a .deb), the launcher and hook code is hard to iterate on locally.
+`validate_renode.py` is a standalone probe runner that exercises
+every Renode API the launcher relies on (TCP Monitor connect, prompt
+parsing, `mach create`, `LoadPlatformDescription`, `LoadELF`,
+`CreateUartPtyTerminal`, `python` state persistence,
+`machine[...]` peripheral lookup, `Connections[N]` indexing,
+`AddStateChangedHook` registration, firmware boot bytes on the pty)
+and reports PASS/FAIL with the raw Monitor response per probe.
+
+```sh
+docker build -t klipper-emu -f scripts/Dockerfile.emulator-test .
+docker run --rm klipper-emu \
+    /venv/bin/python test/emulator/validate_renode.py
+```
+
+A failed probe pinpoints which assumption in `renode_launcher.py` /
+`renode_hooks.py` needs adjusting before the full
+`scripts/test_klippy.py` path is run end-to-end against an STM32
+target.

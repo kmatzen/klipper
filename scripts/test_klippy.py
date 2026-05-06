@@ -263,6 +263,8 @@ class TestCase:
         cfg_path = os.path.join(self.tempdir, TEMP_EMU_CFG)
         emu_log = os.path.join(self.tempdir, TEMP_EMU_LOG)
         bridge_path = os.path.join(repo_root, 'ci_build', 'simavr_bridge')
+        renode_launcher = os.path.join(repo_root, 'test', 'emulator',
+                                       'renode_launcher.py')
         # Per-MCU paths suffix the mcu name (default `mcu` keeps the
         # legacy `_test_emu.tty` filename so single-MCU tests are
         # byte-identical to the pre-fan-out path).
@@ -270,6 +272,7 @@ class TestCase:
             return '' if name == 'mcu' else '_' + name
         bridges = []  # list of dicts, one per MCU
         any_simavr = False
+        any_renode = False
         for mcu_name, dict_path in mcu_dicts:
             elf_path = self._find_elf_for_dict(dict_path)
             if elf_path is None:
@@ -279,6 +282,8 @@ class TestCase:
             backend = self._backend_for_dict(dict_path)
             if backend == 'simavr':
                 any_simavr = True
+            elif backend == 'renode':
+                any_renode = True
             sfx = mcu_suffix(mcu_name)
             slave_link = os.path.join(self.tempdir,
                                       TEMP_EMU_LINK[:-len('.tty')]
@@ -305,6 +310,12 @@ class TestCase:
                 "test_klippy.py requires both. Rebuild with "
                 "scripts/Dockerfile.emulator-test or build the bridge "
                 "manually with gcc against libsimavr.")
+        if any_renode and not os.path.isfile(renode_launcher):
+            raise error(
+                "renode launcher missing - this build of test_klippy.py "
+                "requires test/emulator/renode_launcher.py for stm32 "
+                "dicts. Rebuild with scripts/Dockerfile.emulator-test "
+                "(which installs renode and the launcher).")
         # Opt-in sim-time mode: tests with `sim_time: true` in their
         # fixture get a deterministic-time runtime where klippy reads
         # MCU clock via a memory-mapped double instead of
@@ -349,6 +360,32 @@ class TestCase:
                 # filesystem mocks (e.g. KLIPPER_W1_DEVICES_PATH for
                 # DS18B20) rather than a control socket.
                 b['args'] = [b['elf'], '-I', b['slave_link']]
+                continue
+            if b['backend'] == 'renode':
+                # renode_launcher.py wraps `renode` with the per-chip
+                # platform script and exposes the same interface as
+                # simavr_bridge: --slave-link is a pty symlink klippy
+                # connects to, --control-socket accepts the same
+                # newline-terminated fixture commands that
+                # _push_fixture_to_control_socket emits. Sim-time and
+                # tick-mode are not yet wired through Renode (real-time
+                # only on first cut); the flags are accepted-and-ignored
+                # by the launcher so the dispatch above can stay
+                # uniform. --fixture-file lets the launcher self-apply
+                # the fixture's analog_in / i2c_default keys (which
+                # simavr_bridge.c handles internally from the file
+                # rather than over the control socket).
+                renode_args = [
+                    sys.executable, renode_launcher,
+                    '--elf', b['elf'],
+                    '--slave-link', b['slave_link'],
+                    '--control-socket', b['ctl_socket'],
+                    '--duration',
+                    str(EMULATOR_KLIPPY_DEADLINE + 5),
+                ]
+                if fixture_path is not None:
+                    renode_args += ['--fixture-file', fixture_path]
+                b['args'] = renode_args
                 continue
             args = [
                 bridge_path,
@@ -406,9 +443,24 @@ class TestCase:
                                                   env=proc_env))
             for p, b in zip(emu_procs, bridges):
                 is_lp = (b['backend'] == 'linuxprocess')
-                b['slave_path'] = self._wait_for_slave_link(b['slave_link'],
-                                                            p,
-                                                            is_symlink=is_lp)
+                # renode publishes the slave end via
+                # `emulation CreateUartPtyTerminal` followed by a
+                # symlink, so it uses the symlink-readiness branch like
+                # linuxprocess. simavr writes the slave dev path into
+                # slave_link as a plain file, so it falls through to
+                # the original poll branch.
+                use_symlink = is_lp or (b['backend'] == 'renode')
+                # renode startup includes loading the platform .repl
+                # (which downloads + decompresses the SVD on first use),
+                # the firmware ELF, and several Monitor commands - so
+                # it's substantially slower than simavr. Allow 60 s
+                # for the pty to appear; simavr / linuxprocess keep
+                # the default snappier deadline so genuine bridge
+                # hangs still surface quickly.
+                wait_timeout = 60.0 if b['backend'] == 'renode' else 10.0
+                b['slave_path'] = self._wait_for_slave_link(
+                    b['slave_link'], p, timeout=wait_timeout,
+                    is_symlink=use_symlink)
                 if is_lp:
                     # No control socket for linuxprocess - peripheral
                     # state is staged via filesystem mocks before spawn.
@@ -1155,11 +1207,18 @@ class TestCase:
     def _backend_for_dict(dict_path):
         # linuxprocess builds yield a host-architecture binary that runs
         # the firmware in-process and exposes its pty directly to klippy
-        # - no simavr in the loop. Every other dict (avr / arm / pru ...)
-        # is currently routed through simavr; non-AVR backends remain
-        # follow-up work.
-        if os.path.basename(dict_path) == 'linuxprocess.dict':
+        # - no simavr in the loop. STM32 dicts route through Renode (an
+        # external Cortex-M emulator); the renode_launcher.py wrapper
+        # presents the same --elf/--slave-link/--control-socket interface
+        # as simavr_bridge so the spawn dispatch only differs in which
+        # binary is launched. Every other dict (other ARM, pru, ...) is
+        # currently routed through simavr; non-AVR/non-STM32 backends
+        # remain follow-up work.
+        base = os.path.basename(dict_path)
+        if base == 'linuxprocess.dict':
             return 'linuxprocess'
+        if base.startswith('stm32'):
+            return 'renode'
         return 'simavr'
 
     _DS18B20_SERIAL_RE = re.compile(r'^\s*serial_no\s*:\s*(\S+)\s*'

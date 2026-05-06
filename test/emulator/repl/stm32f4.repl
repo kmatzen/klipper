@@ -1,0 +1,20 @@
+// Local override of upstream stm32f4.repl that adds ADC1 (which
+// upstream omits). The upstream platform models GPIO/USART/SPI/I2C/
+// TIM/DMA but not Analog peripherals, so klipper's thermistor reads
+// return zero and trip min_temp shutdowns on every printer config
+// that has a heater - which is essentially all of them.
+//
+// Used by F401, F405, F407, F446 (all share stm32f4.repl in upstream).
+// F429 has its own override at test/emulator/repl/stm32f429.repl
+// because upstream stm32f429.repl extends stm32f4.repl with
+// F429-specific bits (LTDC, FMC memory bank).
+//
+// Addresses match RM0090 (STM32F4xx reference manual): ADC1 at
+// 0x40012000, ADC2 at 0x40012100, ADC3 at 0x40012200, ADC_Common
+// at 0x40012300. Klipper firmware only initialises ADC1 + 2 + 3
+// when the cfg references the corresponding analog pins.
+using "platforms/cpus/stm32f4.repl"
+
+adc1: Analog.STM32_ADC @ sysbus 0x40012000
+adc2: Analog.STM32_ADC @ sysbus 0x40012100
+adc3: Analog.STM32_ADC @ sysbus 0x40012200

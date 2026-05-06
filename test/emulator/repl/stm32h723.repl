@@ -1,0 +1,10 @@
+// Renode platform override for STM32H723. Renode upstream has
+// stm32h743.repl + stm32h753.repl but no h723; h743 is the
+// closest sibling and a faithful enough proxy for our test
+// coverage (homing / move / probe semantics don't depend on
+// H723-vs-H743 deltas in clock-tree maxima or cache/RAM sizes).
+//
+// NB: portable Renode bundles inline what upstream master keeps in
+// stm32h7.repl - everything is in stm32h743.repl directly. So we
+// inherit from h743, not from h7.
+using "platforms/cpus/stm32h743.repl"
