@@ -1,0 +1,80 @@
+// Renode platform description for ATSAM4E8E (Cortex-M4).
+//
+// Renode upstream has no SAM4E platform; sam4s.repl is the closest
+// neighbor (same M4 core, identical UART/PMC/EFC base addresses on
+// the system controller side - 0x400E0xxx) but is unsuitable as an
+// `using` base because of address conflicts with SAM4E peripherals:
+//
+//   - SAM4E PIOD lives at 0x400E1400 where SAM4S has RSTC. The
+//     SAM4S_RSTC model would consume PIOD writes klipper makes for
+//     pin muxing, with unpredictable side effects.
+//   - SAM4E WDT lives at 0x400E1850 where SAM4S has nothing
+//     mapped; SAM4S WDT at 0x400E1450 conversely has no SAM4E
+//     analog. The SAM4S_WDT model would tick on its default
+//     timeout because klipper SAM4E firmware writes to a different
+//     address (0x400E1850) and never feeds the SAM4S WDT - that
+//     could trigger spurious resets via the rstc connection.
+//   - SAM4E ADC peripheral is AFEC0/AFEC1 at 0x400B0000/0x400B4000,
+//     not the SAM4S_ADC at 0x40038000. Renode does not ship a
+//     SAM_AFEC model, so AFEC stubs are runtime-injected by the
+//     launcher (_AFEC_BASES_FOR_CHIP, mirroring the SAME70 path).
+//
+// Standalone with only what klipper SAM4E firmware actually drives:
+// CPU + NVIC + DWT + memory (boot mirror at 0x0 + flash at
+// 0x400000 + sram at 0x20000000) + UART0 (host link, PA9/PA10) +
+// PMC_SR flipflop (so SystemInit's MOSCXTS/MOSCSELS/MCKRDY/LOCKA
+// busy-wait loops complete) + SAM4S_EEFC (so bootloader_request's
+// FRDY wait completes; reusing the SAM4S model since the EEFC
+// register layout is identical between SAM4S and SAM4E).
+//
+// Klipper SAM4E uses generic/armcm_timer.c (DWT + SysTick), so
+// no chip-specific timer modeling is required. Watchdog (WDT)
+// writes go to unmapped 0x400E1850 and produce harmless log
+// warnings; the firmware never reads WDT back.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 120000000
+
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 120000000
+
+// SAM4E8E: 512KB flash linked at 0x00400000 (klipper's
+// CONFIG_FLASH_APPLICATION_ADDRESS for MACH_SAM4). The boot
+// region at 0x0 mirrors flash on real hardware via GPNVM bit 1;
+// here we stand it up as separate Memory.MappedMemory so any
+// stray access at 0x0 doesn't fault. Renode's LoadELF sets the
+// CPU PC directly to the ELF entry point at 0x400000 so the
+// boot mirror itself never executes.
+boot: Memory.MappedMemory @ sysbus 0x0
+    size: 0x400000
+
+flash: Memory.MappedMemory @ sysbus 0x400000
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+// PMC_SR is a status-bit register that klipper's SystemInit busy-
+// waits on. flipflop.py alternates 0/0xFFFFFFFF between reads, so
+// every "is bit X set" check eventually sees a non-zero readback
+// and the wait loops complete. Same approach upstream sam4s.repl
+// uses for SAM4S; works here unchanged because the SAM4E PMC has
+// PMC_SR at the same offset (0x400E0468).
+PMC_SR: Python.PythonPeripheral @ sysbus 0x400E0468
+    size: 0x4
+    initable: true
+    filename: "scripts/pydev/flipflop.py"
+
+uart0: UART.SAM_USART @ sysbus 0x400E0600
+    uartOnlyMode: true
+    enablePdc: true
+    ->nvic@8
+
+eefc: Miscellaneous.SAM4S_EEFC @ sysbus 0x400E0A00
+    underlyingMemory: flash
+    ->nvic@6

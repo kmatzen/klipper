@@ -63,6 +63,7 @@ _PLATFORM_FOR_CHIP = {
     'stm32h723': _local('stm32h723.repl'),
     'stm32h743': '@platforms/cpus/stm32h743.repl',
     'sam4s8c': '@platforms/cpus/sam4s8b.repl',
+    'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
     'samd51p20': _local('samd51p20.repl'),
 }
@@ -79,6 +80,7 @@ _PLATFORM_FOR_CHIP = {
 _DEFAULT_HOST_LINK_PERIPHERAL = 'usart1'
 _HOST_LINK_FOR_CHIP = {
     'sam4s8c': 'uart1',
+    'sam4e8e': 'uart0',
     'same70q20b': 'uart2',
     'samd51p20': 'sercom0',
 }
@@ -134,6 +136,7 @@ _RCC_BASE_FOR_CHIP = {
 # poked through magic offsets by the renode_hooks adc_default /
 # adc_set path.
 _AFEC_BASES_FOR_CHIP = {
+    'sam4e8e': (0x400B0000, 0x400B4000),
     'same70q20b': (0x4003C000, 0x40064000),
 }
 
