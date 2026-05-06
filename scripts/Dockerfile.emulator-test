@@ -154,6 +154,27 @@ RUN make distclean V=1 || true \
     && cp out/klipper.dict ci_build/dict/lpc176x.dict \
     && cp out/klipper.elf ci_build/elf/lpc176x.elf
 
+# HDSC HC32F460 firmware builds for the renode backend. printers.test
+# references two dict basenames (one per host-link pin pair):
+# hc32f460-serial-PA3PA2 (anycubic-kobra-go-2022,
+# anycubic-kobra-plus-2022) and hc32f460-serial-PA7PA8
+# (creality-ender2pro-hc32-2022). Both pin combinations use USART1
+# in the firmware; the .repl wires UART.HC32F460_USART (loaded as
+# C# via `i @hc32f460_uart.cs` by renode_launcher.py) at 0x4001D000
+# with named IRQs to nvic@0/1/2/3 matching the hardcoded
+# IrqRegistration mapping in src/hc32f460/serial.c. INTC/PORT/PWC/
+# SYSREG/EFM/AOS regions are storeback stubs (renode_launcher.py
+# _EXTRA_PERIPHERAL_STUBS_FOR_CHIP['hc32f460']) since none gate
+# firmware boot progress on a status-bit poll.
+RUN for cfg in hc32f460-serial-PA3PA2 hc32f460-serial-PA7PA8; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the
 # klipper firmware and exposes its UART as a pty for klippy plus a

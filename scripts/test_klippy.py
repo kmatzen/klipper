@@ -1244,7 +1244,10 @@ class TestCase:
         # (SAM3X / SAM4E reuse the SAM4S_EEFC + flipflop PMC_SR
         # pattern; SAMD51 carries full OSCCTRL/GCLK/MCLK stubs;
         # LPC176x carries an LPC_SC clock-controller stub paired
-        # with the upstream NS16550 UART model).
+        # with the upstream NS16550 UART model; HC32F460 carries a
+        # full local USART model in C# loaded via `i @file.cs` plus
+        # storeback stubs for INTC/PORT/PWC/SYSREG/EFM since HDSC
+        # has no upstream Renode peripheral models at all).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
@@ -1256,6 +1259,8 @@ class TestCase:
         if base.startswith('samd51'):
             return 'renode'
         if base.startswith('lpc176x'):
+            return 'renode'
+        if base.startswith('hc32f460'):
             return 'renode'
         return 'simavr'
 

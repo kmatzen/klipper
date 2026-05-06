@@ -1,0 +1,80 @@
+// Renode platform description for HDSC HC32F460 (Cortex-M4F).
+//
+// Renode upstream has no HC32F460 platform and no HDSC-specific
+// peripheral models in renode-infrastructure (search:repo:renode/
+// renode-infrastructure HC32 returns 0). Standalone with only what
+// klipper HC32F460 firmware drives at boot:
+//
+//   - cpu (cortex-m4f) + nvic + dwt @ 168MHz (CONFIG_CLOCK_FREQ for
+//     the 168M clock-speed Kconfig option; the 200M variant runs
+//     faster but timer_read_time only needs monotonically
+//     increasing values from DWT->CYCCNT, not a precise frequency
+//     match - the firmware's own SystemCoreClockUpdate reads
+//     M4_SYSREG->CMU_CKSWR.CKSW which we leave as the storeback-
+//     default 0, picking the HRC reset clock branch that bypasses
+//     PLL setup entirely).
+//   - flash (Memory.MappedMemory @ 0x0 size 0x40000) - HC32F460
+//     has 256KB flash mapped at 0x0; klipper links the application
+//     at CONFIG_FLASH_APPLICATION_ADDRESS (default 0x8000, with
+//     0xC000 / 0x10000 alternates). All three application offsets
+//     fit inside one 256KB region; no boot mirror is needed because
+//     reset vector lives in flash directly (no SAM-style boot ROM
+//     remapping).
+//   - sram (Memory.MappedMemory @ 0x1FFF8000 size 0x8000) - 32KB
+//     fast SRAM, the region klipper's CONFIG_RAM_START points at.
+//     The chip also has a separate 160KB SRAM block at
+//     0x20000000-0x20028000 but klipper links exclusively against
+//     the fast SRAM (Kconfig RAM_START = 0x1fff8000).
+//   - usart1: UART.HC32F460_USART @ sysbus 0x4001D000 with four
+//     named GPIO outputs wired to nvic@0/1/2/3 to match the
+//     hardcoded IrqRegistration mapping in src/hc32f460/serial.c
+//     (RX -> Int000, ERR -> Int001, TXE -> Int002, TC -> Int003).
+//     The HC32 INTC peripheral that performs the dynamic source ->
+//     NVIC line remap on real silicon is left as a passive
+//     storeback region in the launcher (see _EXTRA_PERIPHERAL_
+//     STUBS_FOR_CHIP['hc32f460']); the firmware writes its source
+//     IDs to INTC.SEL[N] but never reads them back, so the static
+//     wiring above is observably equivalent for the only consumer
+//     (serial.c). The .cs UART model is loaded into the runtime
+//     via `i @hc32f460_uart.cs` emitted by renode_launcher before
+//     LoadPlatformDescription runs - upstream Renode has no UART
+//     model whose register layout matches the HDSC SR/DR/BRR/CR1/
+//     CR2/CR3/PR ordering.
+//
+// klipper HC32F460 uses generic/armcm_timer.c (DWT + SysTick), so
+// no chip-specific timer modeling is needed. PORT/PWC/MSTP/SYSREG/
+// EFM/AOS/INTC writes go through Python.PythonPeripheral storeback
+// stubs registered by renode_launcher (none of those regions
+// busy-wait the firmware on a status bit - SystemInit just calls
+// SystemCoreClockUpdate which is a passive read of CMU_CKSWR, and
+// armcm_main only writes M4_PORT->PSPCR before entering
+// sched_main).
+//
+// Configs covered: hc32f460-serial-PA3PA2 (anycubic-kobra-go-2022,
+// anycubic-kobra-plus-2022) and hc32f460-serial-PA7PA8 (creality-
+// ender2pro-hc32-2022). Both pin combinations use USART1; the
+// PH2_PB10 / USART3 path is not yet covered (no in-scope printer
+// config uses it).
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 168000000
+
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 168000000
+
+flash: Memory.MappedMemory @ sysbus 0x0
+    size: 0x40000
+
+sram: Memory.MappedMemory @ sysbus 0x1FFF8000
+    size: 0x8000
+
+usart1: UART.HC32F460_USART @ sysbus 0x4001D000
+    RxIRQ -> nvic@0
+    ErrorIRQ -> nvic@1
+    TxEmptyIRQ -> nvic@2
+    TxCompleteIRQ -> nvic@3

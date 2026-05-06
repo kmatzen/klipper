@@ -69,6 +69,7 @@ _PLATFORM_FOR_CHIP = {
     'same70q20b': _local('same70q20b.repl'),
     'samd51p20': _local('samd51p20.repl'),
     'lpc176x': _local('lpc176x.repl'),
+    'hc32f460': _local('hc32f460.repl'),
 }
 
 # Renode peripheral name for the UART/USART that klipper uses as the
@@ -89,6 +90,7 @@ _HOST_LINK_FOR_CHIP = {
     'same70q20b': 'uart2',
     'samd51p20': 'sercom0',
     'lpc176x': 'uart0',
+    'hc32f460': 'usart1',
 }
 
 
@@ -119,6 +121,16 @@ _SAMD_STOREBACK_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 _LPC_SC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'lpc_sc_stub.py')
+
+# Path to the HC32F460 USART C# peripheral. Loaded into the running
+# Renode runtime via `i @<path>` (Roslyn-compiled into the live
+# process by IncludeFileCommand) BEFORE any LoadPlatformDescription
+# call so the .repl's `UART.HC32F460_USART` reference resolves at
+# platform-load time. HDSC has no upstream Renode UART model whose
+# register layout matches its USART, so we ship one as a small .cs
+# under test/emulator/repl/.
+_HC32F460_UART_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'repl', 'hc32f460_uart.cs')
 
 # Per-chip RCC peripheral base address (RM cross-reference per
 # family). Most upstream Renode STM32 platforms ship some kind of
@@ -167,6 +179,49 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
     'lpc176x': [
         ('lpc_sc', 0x400FC000, 0x200, _LPC_SC_STUB_PY),
     ],
+    # HC32F460: every region the firmware writes during init except
+    # USART1 (which has a real model in the .repl). None of these
+    # peripherals are read back to gate boot progress, so plain
+    # storeback (samd_storeback.py: dict-backed read-after-write,
+    # zero default for unread offsets) is sufficient. See
+    # test/emulator/repl/hc32f460.repl for the reasoning per region.
+    #   - efm  (0x40010400, 0x400) covers HRC_FREQ_MON @ 0x40010684
+    #     read by SystemCoreClockUpdate; default 0 -> firmware picks
+    #     the HRC_20MHz_VALUE branch and SystemCoreClock = HRC_VALUE.
+    #   - mstp (0x40048000, 0x20) clock-enable bits written by
+    #     PWC_Fcg1PeriphClockCmd via M4_MSTP->FCG{0,1,2,3}.
+    #   - intc (0x40051000, 0x800) IrqRegistration's source -> NVIC
+    #     line remap writes; static .repl wiring of usart1 IRQs to
+    #     nvic@0/1/2/3 supersedes the dynamic mapping.
+    #   - port (0x40053800, 0x80) PORT_Unlock/PSPCR/PCCR/PFSR writes
+    #     from PORT_DebugPortSetting + PORT_SetFunc.
+    #   - sysreg (0x40054000, 0x1400) PWR_FPRC unlock and CMU_CKSWR
+    #     reads. Default 0 on CMU_CKSWR.CKSW maps to "internal HRC"
+    #     in SystemCoreClockUpdate, which avoids the PLL setup path
+    #     entirely.
+    #   - aos (0x40010800, 0x100) trigger-source select writes; not
+    #     read back by any current consumer.
+    'hc32f460': [
+        ('efm', 0x40010400, 0x400, _SAMD_STOREBACK_PY),
+        ('aos', 0x40010800, 0x100, _SAMD_STOREBACK_PY),
+        ('mstp', 0x40048000, 0x20, _SAMD_STOREBACK_PY),
+        ('intc', 0x40051000, 0x800, _SAMD_STOREBACK_PY),
+        ('port', 0x40053800, 0x80, _SAMD_STOREBACK_PY),
+        ('sysreg', 0x40054000, 0x1400, _SAMD_STOREBACK_PY),
+    ],
+}
+
+# Per-chip C# peripherals to load (Roslyn-compiled into the running
+# Renode runtime via `i @<path>` / IncludeFileCommand) before the
+# .repl is parsed. Used when an upstream Renode peripheral model
+# either doesn't exist for the chip or has a register layout that
+# doesn't match the chip's vendor library. Today only HC32F460 needs
+# this (its USART register set isn't a match for any of the existing
+# UART/USART models in renode-infrastructure); the .cs file lives at
+# test/emulator/repl/hc32f460_uart.cs and exposes
+# UART.HC32F460_USART for reference from the .repl.
+_CSHARP_INCLUDES_FOR_CHIP = {
+    'hc32f460': [_HC32F460_UART_CS],
 }
 
 
@@ -243,9 +298,17 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
             '{{ size: 0x{size:X}; initable: true; '
             'filename: \\"{stub}\\" }}"\n'
         ).format(name=name, base=base, size=size, stub=stub)
+    # C# peripherals must be Roslyn-compiled into the runtime BEFORE
+    # any LoadPlatformDescription that references them, otherwise the
+    # platform parser fails to resolve the type. See
+    # tests/unit-tests/bus_isolation.resc for the upstream pattern
+    # (mach create -> include @x.cs -> LoadPlatformDescription).
+    cs_includes = _CSHARP_INCLUDES_FOR_CHIP.get(chip, ())
+    cs_include_block = ''.join('i @%s\n' % p for p in cs_includes)
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
+        '{cs_include_block}'
         'machine LoadPlatformDescription {platform}\n'
         '{rcc_block}'
         '{afec_block}'
@@ -260,6 +323,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
     ).format(chip=chip, platform=platform, elf=elf_path,
              log=log_path, pty=pty_path, rcc_block=rcc_block,
              afec_block=afec_block, extra_block=extra_block,
+             cs_include_block=cs_include_block,
              usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
 
 
