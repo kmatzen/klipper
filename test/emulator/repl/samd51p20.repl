@@ -1,0 +1,45 @@
+// Renode platform description for ATSAMD51P20 (Cortex-M4F).
+//
+// Renode upstream ships platforms/cpus/atsamd51g19a.repl but it's
+// not usable for klipper SAMD51:
+//
+//   1. Memory layout is the G19 variant (512KB flash / 192KB SRAM);
+//      klipper SAMD51P20 builds expect 1MB / 256KB.
+//   2. It exposes only sercom3; klipper's host UART is SERCOM0
+//      (PA10/PA11 - see src/atsamd/serial.c).
+//   3. It models GCLK PCHCTRL[1] as a `flipflop.py` register, which
+//      alternates 0/0xFFFFFFFF between reads. klipper's
+//      enable_pclock() does `while (PCHCTRL[id].reg != val)` so the
+//      flipflop never matches `val` and the firmware spins.
+//
+// We therefore stand the platform up from scratch rather than using
+// the upstream as a base. OSCCTRL / GCLK / MCLK / OSC32KCTRL / CMCC
+// stubs are runtime-injected by the launcher (Python.PythonPeripheral
+// instances backed by samd_*_stub.py / samd_storeback.py) because
+// their script paths are checkout-relative - same pattern AFEC uses
+// on SAME70.
+//
+// IRQ 46 = SERCOM0_0 in the SAMD51 vector table. klipper installs
+// the same SERCOM0_Handler on all 4 SERCOM0 IRQs (46..49), so wiring
+// the SAMD5_UART model's single IRQ output to any of them is
+// sufficient - the handler reads INTFLAG and dispatches RX/TX events
+// regardless of which line raised the interrupt.
+
+cpu0: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu0@0
+
+flash0: Memory.MappedMemory @ sysbus 0x0
+    size: 0x100000
+
+sram0: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x40000
+
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 120000000
+
+sercom0: UART.SAMD5_UART @ sysbus 0x40003000
+    ->nvic@46

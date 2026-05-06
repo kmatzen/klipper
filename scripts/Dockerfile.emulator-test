@@ -121,15 +121,16 @@ RUN for cfg in stm32f070 stm32f401 stm32f405 stm32f407 stm32f429 \
     && cp out/klipper.elf ci_build/elf/stm32f103-serial.elf
 
 # Atmel SAM firmware builds for the renode backend. Each -serial.config
-# selects ATSAM_SERIAL so klippy talks to the chip-specific Atmel UART
-# (UART1 on SAM4S, UART2 on SAME70 - see src/atsam/serial.c) over a
-# pty exposed by Renode. Scope is limited to chips whose Renode
-# upstream platform covers what klipper needs: SAM4S has a near-
-# complete sam4s.repl, SAME70 has sam_e70.repl extended locally with
-# DWT + UART2 (test/emulator/repl/same70q20b.repl). SAM3X / SAM4E /
-# SAMD / LPC176x lack adequate upstream platforms and remain follow-
-# up work.
-RUN for cfg in sam4s8c same70q20b; do \
+# selects ATSAM_SERIAL / ATSAMD_SERIAL so klippy talks to the
+# chip-specific UART (UART1 on SAM4S, UART2 on SAME70 - see
+# src/atsam/serial.c; SERCOM0 PA10/PA11 on SAMD51 - see
+# src/atsamd/serial.c) over a pty exposed by Renode. Scope is
+# limited to chips Renode either ships an upstream platform for
+# (SAM4S, SAME70) or for which we carry a local platform plus
+# Python.PythonPeripheral clock stubs (SAMD51 -
+# test/emulator/repl/samd51p20.repl). SAM3X / SAM4E / LPC176x lack
+# adequate upstream platforms and remain follow-up work.
+RUN for cfg in sam4s8c same70q20b samd51p20; do \
         make distclean V=1 || true; \
         cp test/configs/${cfg}-serial.config .config && \
         make olddefconfig && \

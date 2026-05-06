@@ -64,6 +64,7 @@ _PLATFORM_FOR_CHIP = {
     'stm32h743': '@platforms/cpus/stm32h743.repl',
     'sam4s8c': '@platforms/cpus/sam4s8b.repl',
     'same70q20b': _local('same70q20b.repl'),
+    'samd51p20': _local('samd51p20.repl'),
 }
 
 # Renode peripheral name for the UART/USART that klipper uses as the
@@ -71,13 +72,15 @@ _PLATFORM_FOR_CHIP = {
 # USART1 family-wide. Atmel chips don't share that convention -
 # klipper's src/atsam/serial.c picks a chip-specific Atmel UART
 # peripheral (UART1 on SAM4S, UART2 on SAME70) which the platform
-# .repl exposes under different names. Per-chip overrides keyed by
-# the same chip basename as _PLATFORM_FOR_CHIP; chips not in the
+# .repl exposes under different names; klipper's src/atsamd/serial.c
+# always picks SERCOM0 on the SAMx5 family. Per-chip overrides keyed
+# by the same chip basename as _PLATFORM_FOR_CHIP; chips not in the
 # override map fall back to the STM32 default.
 _DEFAULT_HOST_LINK_PERIPHERAL = 'usart1'
 _HOST_LINK_FOR_CHIP = {
     'sam4s8c': 'uart1',
     'same70q20b': 'uart2',
+    'samd51p20': 'sercom0',
 }
 
 
@@ -96,6 +99,15 @@ _RCC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 _AFEC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'afec_stub.py')
+
+_SAMD_OSCCTRL_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'samd_oscctrl_stub.py')
+_SAMD_GCLK_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'samd_gclk_stub.py')
+_SAMD_OSC32KCTRL_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'samd_osc32kctrl_stub.py')
+_SAMD_STOREBACK_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'samd_storeback.py')
 
 # Per-chip RCC peripheral base address (RM cross-reference per
 # family). Most upstream Renode STM32 platforms ship some kind of
@@ -123,6 +135,23 @@ _RCC_BASE_FOR_CHIP = {
 # adc_set path.
 _AFEC_BASES_FOR_CHIP = {
     'same70q20b': (0x4003C000, 0x40064000),
+}
+
+# Per-chip extra Python.PythonPeripheral stubs to inject after the
+# platform load. Each entry is a list of (name, base, size, stub_path)
+# tuples. The samd51p20 entries cover the chip's clock controllers
+# (OSCCTRL / GCLK / OSC32KCTRL) and the simple store/return blocks
+# (MCLK / CMCC) that klipper firmware touches during SystemInit() and
+# enable_pclock() - none of which Renode upstream models. Without
+# these the firmware spins forever in samd51_clock.c.
+_EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
+    'samd51p20': [
+        ('oscctrl', 0x40001000, 0x80, _SAMD_OSCCTRL_STUB_PY),
+        ('osc32kctrl', 0x40001400, 0x40, _SAMD_OSC32KCTRL_STUB_PY),
+        ('gclk', 0x40001C00, 0x200, _SAMD_GCLK_STUB_PY),
+        ('mclk', 0x40000800, 0x40, _SAMD_STOREBACK_PY),
+        ('cmcc', 0x41006000, 0x40, _SAMD_STOREBACK_PY),
+    ],
 }
 
 
@@ -190,12 +219,22 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
             '{{ size: 0x200; initable: true; '
             'filename: \\"{stub}\\" }}"\n'
         ).format(idx=idx, base=base, stub=_AFEC_STUB_PY)
+    extra_stubs = _EXTRA_PERIPHERAL_STUBS_FOR_CHIP.get(chip, ())
+    extra_block = ''
+    for name, base, size, stub in extra_stubs:
+        extra_block += (
+            'machine LoadPlatformDescriptionFromString '
+            '"{name}: Python.PythonPeripheral @ sysbus 0x{base:08X} '
+            '{{ size: 0x{size:X}; initable: true; '
+            'filename: \\"{stub}\\" }}"\n'
+        ).format(name=name, base=base, size=size, stub=stub)
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
         'machine LoadPlatformDescription {platform}\n'
         '{rcc_block}'
         '{afec_block}'
+        '{extra_block}'
         'sysbus LoadELF @{elf}\n'
         'logFile @{log}\n'
         'logLevel 1\n'
@@ -205,7 +244,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
         'python "import renode_hooks; renode_hooks.set_monitor(monitor)"\n'
     ).format(chip=chip, platform=platform, elf=elf_path,
              log=log_path, pty=pty_path, rcc_block=rcc_block,
-             afec_block=afec_block,
+             afec_block=afec_block, extra_block=extra_block,
              usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
 
 

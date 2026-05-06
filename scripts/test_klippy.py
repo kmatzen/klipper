@@ -1233,22 +1233,26 @@ class TestCase:
     def _backend_for_dict(dict_path):
         # linuxprocess builds yield a host-architecture binary that runs
         # the firmware in-process and exposes its pty directly to klippy
-        # - no simavr in the loop. STM32 + select Atmel SAM dicts route
-        # through Renode (an external Cortex-M emulator); the
+        # - no simavr in the loop. STM32 + select Atmel SAM/SAMD dicts
+        # route through Renode (an external Cortex-M emulator); the
         # renode_launcher.py wrapper presents the same --elf/--slave-link
         # /--control-socket interface as simavr_bridge so the spawn
         # dispatch only differs in which binary is launched. Atmel
-        # routing is currently scoped to chips Renode upstream models
-        # well (SAM4S, SAME70); SAM3X/SAM4E/LPC176x/SAMD remain
-        # follow-up work and stay on simavr (which fails for ARM, but
-        # Dockerfile.emulator-test doesn't build their .elfs so the
-        # subtests get skipped via the dict-not-built path).
+        # routing is currently scoped to chips for which Renode either
+        # ships an upstream platform (SAM4S, SAME70) or for which we
+        # carry a local platform + Python.PythonPeripheral clock stubs
+        # (SAMD51). SAM3X/SAM4E/LPC176x remain follow-up work and stay
+        # on simavr (which fails for ARM, but Dockerfile.emulator-test
+        # doesn't build their .elfs so the subtests get skipped via the
+        # dict-not-built path).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
         if base.startswith('stm32'):
             return 'renode'
         if base.startswith('sam4s') or base.startswith('same70'):
+            return 'renode'
+        if base.startswith('samd51'):
             return 'renode'
         return 'simavr'
 
