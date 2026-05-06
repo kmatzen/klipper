@@ -47,7 +47,10 @@ def _local(name):
 # stm32f1.repl + stm32f4.repl + stm32f429.repl in Renode upstream)
 # and SPI (missing on stm32f103.repl). For chips whose upstream
 # platform already covers everything klipper needs (F0 / G0 / H7
-# variants in scope today) we point at upstream verbatim.
+# variants in scope today) we point at upstream verbatim. SAM4S8C
+# memory layout (512KB flash + 128KB sram) matches sam4s8b, so we
+# point at upstream sam4s8b.repl rather than carrying a duplicate
+# locally.
 _PLATFORM_FOR_CHIP = {
     'stm32f070': '@platforms/cpus/stm32f072.repl',
     'stm32f103': _local('stm32f103.repl'),
@@ -59,14 +62,27 @@ _PLATFORM_FOR_CHIP = {
     'stm32g0b1': '@platforms/cpus/stm32g0.repl',
     'stm32h723': _local('stm32h723.repl'),
     'stm32h743': '@platforms/cpus/stm32h743.repl',
+    'sam4s8c': '@platforms/cpus/sam4s8b.repl',
+    'same70q20b': _local('same70q20b.repl'),
 }
 
-# Renode peripheral name for the USART that klipper uses as the host
-# link. Default klipper -serial.config selects USART1 across all
-# families; the platform .repl exposes it as `usart1` on every chip in
-# scope. If we ever pin a chip to a non-USART1 link we add an entry
-# here.
-_HOST_LINK_PERIPHERAL = 'usart1'
+# Renode peripheral name for the UART/USART that klipper uses as the
+# host link in -serial.config mode. STM32 -serial.config selects
+# USART1 family-wide. Atmel chips don't share that convention -
+# klipper's src/atsam/serial.c picks a chip-specific Atmel UART
+# peripheral (UART1 on SAM4S, UART2 on SAME70) which the platform
+# .repl exposes under different names. Per-chip overrides keyed by
+# the same chip basename as _PLATFORM_FOR_CHIP; chips not in the
+# override map fall back to the STM32 default.
+_DEFAULT_HOST_LINK_PERIPHERAL = 'usart1'
+_HOST_LINK_FOR_CHIP = {
+    'sam4s8c': 'uart1',
+    'same70q20b': 'uart2',
+}
+
+
+def _host_link_peripheral(chip):
+    return _HOST_LINK_FOR_CHIP.get(chip, _DEFAULT_HOST_LINK_PERIPHERAL)
 
 # Where renode_hooks.py lives, to be loaded into Renode at startup via
 # `include @<path>` so all the hook functions (step_trigger, bltouch,
@@ -77,6 +93,9 @@ _HOOKS_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 _RCC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'rcc_stub.py')
+
+_AFEC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'afec_stub.py')
 
 # Per-chip RCC peripheral base address (RM cross-reference per
 # family). Most upstream Renode STM32 platforms ship some kind of
@@ -93,6 +112,17 @@ _RCC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # stay restricted to chips whose upstream platform truly lacks RCC.
 _RCC_BASE_FOR_CHIP = {
     'stm32f103': 0x40021000,
+}
+
+# Per-chip AFEC peripheral base addresses. SAME70 has AFEC0 / AFEC1
+# (12 channels each); klipper's src/atsam/sam4e_afec.c initialises
+# both. Renode does not ship a SAM_AFEC peripheral model, so we
+# register Python.PythonPeripheral stubs (test/emulator/afec_stub.py)
+# at each base. The stub serves AFE_LCDR / AFE_CDR reads with values
+# poked through magic offsets by the renode_hooks adc_default /
+# adc_set path.
+_AFEC_BASES_FOR_CHIP = {
+    'same70q20b': (0x4003C000, 0x40064000),
 }
 
 
@@ -151,11 +181,21 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
             '{{ size: 0x400; initable: true; '
             'filename: \\"{stub}\\" }}"\n'
         ).format(rcc=rcc_base, stub=_RCC_STUB_PY)
+    afec_bases = _AFEC_BASES_FOR_CHIP.get(chip, ())
+    afec_block = ''
+    for idx, base in enumerate(afec_bases):
+        afec_block += (
+            'machine LoadPlatformDescriptionFromString '
+            '"afec{idx}: Python.PythonPeripheral @ sysbus 0x{base:08X} '
+            '{{ size: 0x200; initable: true; '
+            'filename: \\"{stub}\\" }}"\n'
+        ).format(idx=idx, base=base, stub=_AFEC_STUB_PY)
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
         'machine LoadPlatformDescription {platform}\n'
         '{rcc_block}'
+        '{afec_block}'
         'sysbus LoadELF @{elf}\n'
         'logFile @{log}\n'
         'logLevel 1\n'
@@ -165,7 +205,8 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
         'python "import renode_hooks; renode_hooks.set_monitor(monitor)"\n'
     ).format(chip=chip, platform=platform, elf=elf_path,
              log=log_path, pty=pty_path, rcc_block=rcc_block,
-             usart=_HOST_LINK_PERIPHERAL, hooks=_HOOKS_PY)
+             afec_block=afec_block,
+             usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
 
 
 def _wait_for_path(path, deadline, poll=0.05):

@@ -160,11 +160,38 @@ def bltouch(ctrl_port, ctrl_pin, sensor_port, sensor_pin, invert):
 _ADC_PERIPHS = ('sysbus.adc1', 'sysbus.adc2', 'sysbus.adc3',
                 'sysbus.adc')
 
+# AFEC peripheral bases for SAME70 (matches _AFEC_BASES_FOR_CHIP in
+# renode_launcher.py). The afec_stub.py PythonPeripheral exposes
+# magic offsets at 0x100 (default value) and 0x104..0x130 (per-channel
+# overrides for 12 channels) - see afec_stub.py for the layout. Both
+# AFEC0 and AFEC1 are listed; sysbus.WriteDoubleWord on a base that
+# isn't mapped (e.g. SAM4S where there's no AFEC) raises, so the
+# pokes below are wrapped in try/except.
+_AFEC_BASES = (0x4003C000, 0x40064000)
+_AFEC_MAGIC_DEFAULT = 0x100
+_AFEC_MAGIC_CH_BASE = 0x104
+
 
 def _iter_adcs():
     for name in _ADC_PERIPHS:
         try:
             yield _M.Machine[name]
+        except Exception:
+            continue
+
+
+def _afec_poke(offset, value):
+    # Write through sysbus to whichever AFEC bases are mapped on the
+    # current platform. SAM4S/STM32 don't have AFEC and the writes
+    # silently fail; SAME70 has both AFEC0 and AFEC1 wired by the
+    # launcher's afec_block.
+    try:
+        sysbus = _M.Machine.SystemBus
+    except Exception:
+        return
+    for base in _AFEC_BASES:
+        try:
+            sysbus.WriteDoubleWord(base + offset, int(value) & 0xFFF)
         except Exception:
             continue
 
@@ -192,6 +219,8 @@ def _feed_one(adc, channel, raw_avr):
 def adc_set(channel, raw_value):
     for adc in _iter_adcs():
         _feed_one(adc, channel, raw_value)
+    raw_12bit = (int(raw_value) * 4095) // 8184
+    _afec_poke(_AFEC_MAGIC_CH_BASE + int(channel) * 4, raw_12bit)
 
 
 def adc_default(raw_value):
@@ -206,6 +235,8 @@ def adc_default(raw_value):
             continue
         for ch in range(16):
             _feed_one(adc, ch, raw_value)
+    raw_12bit = (int(raw_value) * 4095) // 8184
+    _afec_poke(_AFEC_MAGIC_DEFAULT, raw_12bit)
 
 
 # --------------------------------------------------------------------

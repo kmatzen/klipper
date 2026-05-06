@@ -1,0 +1,34 @@
+// Renode platform override for ATSAME70Q20B. Renode upstream ships
+// platforms/cpus/sam_e70.repl with CPU + NVIC + USART0/1/2 + PMC_SR
+// flipflop + a CIDR Tag + ApplySVD, but is missing two pieces klipper
+// firmware needs:
+//
+//   1. DWT - klipper's generic ARM Cortex-M timer (src/generic/
+//      armcm_timer.c) reads DWT->CYCCNT as the system clock. Without
+//      a DWT model the register reads zero forever, so timer_read_time
+//      returns 0 and the klippy handshake never advances.
+//
+//   2. UART2 - klipper's SAME70 host link is UART2 (PD25/PD26) per
+//      src/atsam/serial.c. The upstream repl exposes USART0..2 only
+//      and Atmel UART is a separate peripheral block; we add it at
+//      the datasheet base 0x400E1A00 with UART2_IRQn=44 (SAME70Q20B
+//      datasheet / lib/same70b/include/same70q20b.h).
+//
+// The flash size in upstream sam_e70.repl is sized 0x10000000 (way
+// oversized vs the actual 1MB), which is harmless - LoadELF only
+// touches the bytes the firmware uses.
+//
+// AFEC0/AFEC1 stubbing happens at runtime via afec_stub.py rather
+// than in this .repl - see _AFEC_BASES_FOR_CHIP / afec_block in
+// renode_launcher.py. Doing it that way keeps the per-instance file
+// path resolved by the launcher (rather than baked into the .repl)
+// so checkouts at different filesystem locations both work.
+using "platforms/cpus/sam_e70.repl"
+
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 300000000
+
+uart2: UART.SAM_USART @ sysbus 0x400E1A00
+    uartOnlyMode: true
+    enablePdc: true
+    ->nvic@44

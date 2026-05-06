@@ -120,6 +120,24 @@ RUN for cfg in stm32f070 stm32f401 stm32f405 stm32f407 stm32f429 \
     && cp out/klipper.dict ci_build/dict/stm32f103-serial.dict \
     && cp out/klipper.elf ci_build/elf/stm32f103-serial.elf
 
+# Atmel SAM firmware builds for the renode backend. Each -serial.config
+# selects ATSAM_SERIAL so klippy talks to the chip-specific Atmel UART
+# (UART1 on SAM4S, UART2 on SAME70 - see src/atsam/serial.c) over a
+# pty exposed by Renode. Scope is limited to chips whose Renode
+# upstream platform covers what klipper needs: SAM4S has a near-
+# complete sam4s.repl, SAME70 has sam_e70.repl extended locally with
+# DWT + UART2 (test/emulator/repl/same70q20b.repl). SAM3X / SAM4E /
+# SAMD / LPC176x lack adequate upstream platforms and remain follow-
+# up work.
+RUN for cfg in sam4s8c same70q20b; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}-serial.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the
 # klipper firmware and exposes its UART as a pty for klippy plus a

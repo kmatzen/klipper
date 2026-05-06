@@ -147,6 +147,31 @@ class TestCase:
                         % (self.fname, os.path.basename(config_fname),
                            os.path.basename(path)))
                     return
+        # Some printer configs target boards that are physically USB-
+        # only (e.g. the duet3 6HC/6XD use SAM E70 + USB+CAN, with no
+        # serial-mode firmware variant). The emulator-test Dockerfile
+        # builds a -serial.config firmware for those chips because
+        # Renode does not model USB-CDC well enough for klippy's CDC
+        # stack, but the resulting firmware reserves the host-link UART
+        # pins (e.g. PD25/PD26 for SAME70 UART2) - which collide with
+        # stepper / endstop assignments in the USB-only printer
+        # configs. Detect the collision by parsing the dict's
+        # `RESERVE_PINS_serial` constant and scanning the printer
+        # config for any of those pin names; skip cleanly rather than
+        # fail the whole printers.test pass.
+        if self.force_emulator and dict_fnames and config_fname is not None:
+            primary_dict = (dict_fnames[0].split('=', 1)[1]
+                            if '=' in dict_fnames[0] else dict_fnames[0])
+            reserved = self._parse_reserved_serial_pins(primary_dict)
+            if reserved:
+                conflict = self._config_pin_conflict(config_fname, reserved)
+                if conflict is not None:
+                    sys.stderr.write(
+                        "    Skipping %s (%s) - pin %s reserved for "
+                        "host-link serial on this firmware\n"
+                        % (self.fname, os.path.basename(config_fname),
+                           conflict))
+                    return
         gcode_is_temp = False
         prepend = []
         if emulator_fixture is not None:
@@ -313,9 +338,10 @@ class TestCase:
         if any_renode and not os.path.isfile(renode_launcher):
             raise error(
                 "renode launcher missing - this build of test_klippy.py "
-                "requires test/emulator/renode_launcher.py for stm32 "
-                "dicts. Rebuild with scripts/Dockerfile.emulator-test "
-                "(which installs renode and the launcher).")
+                "requires test/emulator/renode_launcher.py for "
+                "stm32/sam4s/same70 dicts. Rebuild with "
+                "scripts/Dockerfile.emulator-test (which installs "
+                "renode and the launcher).")
         # Opt-in sim-time mode: tests with `sim_time: true` in their
         # fixture get a deterministic-time runtime where klippy reads
         # MCU clock via a memory-mapped double instead of
@@ -1207,19 +1233,86 @@ class TestCase:
     def _backend_for_dict(dict_path):
         # linuxprocess builds yield a host-architecture binary that runs
         # the firmware in-process and exposes its pty directly to klippy
-        # - no simavr in the loop. STM32 dicts route through Renode (an
-        # external Cortex-M emulator); the renode_launcher.py wrapper
-        # presents the same --elf/--slave-link/--control-socket interface
-        # as simavr_bridge so the spawn dispatch only differs in which
-        # binary is launched. Every other dict (other ARM, pru, ...) is
-        # currently routed through simavr; non-AVR/non-STM32 backends
-        # remain follow-up work.
+        # - no simavr in the loop. STM32 + select Atmel SAM dicts route
+        # through Renode (an external Cortex-M emulator); the
+        # renode_launcher.py wrapper presents the same --elf/--slave-link
+        # /--control-socket interface as simavr_bridge so the spawn
+        # dispatch only differs in which binary is launched. Atmel
+        # routing is currently scoped to chips Renode upstream models
+        # well (SAM4S, SAME70); SAM3X/SAM4E/LPC176x/SAMD remain
+        # follow-up work and stay on simavr (which fails for ARM, but
+        # Dockerfile.emulator-test doesn't build their .elfs so the
+        # subtests get skipped via the dict-not-built path).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
         if base.startswith('stm32'):
             return 'renode'
+        if base.startswith('sam4s') or base.startswith('same70'):
+            return 'renode'
         return 'simavr'
+
+    @staticmethod
+    def _parse_reserved_serial_pins(dict_path):
+        # Klipper firmware emits `RESERVE_PINS_serial` as a config
+        # constant in the .dict (JSON), value `"<pin>,<pin>,..."`.
+        # Returns a set of bare pin names (e.g. {'PD25', 'PD26'}) or
+        # the empty set if the constant is absent or unreadable.
+        try:
+            with open(dict_path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return set()
+        raw = (data.get('config') or {}).get('RESERVE_PINS_serial')
+        if not isinstance(raw, str):
+            return set()
+        return {p.strip() for p in raw.split(',') if p.strip()}
+
+    # Matches klipper-style port-pin names (PA0..PJ31). Covers the
+    # widest STM32 chip family (up to PJ) and the Atmel SAM range
+    # (up to PE) under one expression. The `\b` boundaries reject
+    # name fragments embedded in longer identifiers.
+    _PIN_TOKEN_RE = re.compile(r'\b(P[A-J]\d{1,2})\b')
+
+    # Section header line, used to detect the start of [board_pins ...]
+    # alias blocks. Those blocks declare expansion-header aliases (e.g.
+    # `EXP1_3=PA9`) without actually driving the pin - klippy only
+    # generates an MCU command if something else references the alias,
+    # so a board_pins entry on its own can't trip the
+    # "pin reserved for serial" check.
+    _SECTION_RE = re.compile(r'^\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)')
+
+    @classmethod
+    def _config_pin_conflict(cls, config_fname, reserved_pins):
+        # Scan the printer config for any reserved pin name appearing
+        # as a bare token. Returns the first conflicting pin, or None.
+        # Filters: comments are stripped (avoids `# IO0:PD25`
+        # documentation rows in the duet3 configs); lines inside
+        # `[board_pins ...]` sections are also skipped (aliases are
+        # not actual pin drives, so they don't conflict with the
+        # firmware's host-link reservation).
+        try:
+            f = open(config_fname)
+        except OSError:
+            return None
+        in_board_pins = False
+        try:
+            for line in f:
+                cpos = line.find('#')
+                if cpos >= 0:
+                    line = line[:cpos]
+                m = cls._SECTION_RE.match(line)
+                if m is not None:
+                    in_board_pins = (m.group(1) == 'board_pins')
+                    continue
+                if in_board_pins:
+                    continue
+                for m in cls._PIN_TOKEN_RE.finditer(line):
+                    if m.group(1) in reserved_pins:
+                        return m.group(1)
+            return None
+        finally:
+            f.close()
 
     _DS18B20_SERIAL_RE = re.compile(r'^\s*serial_no\s*:\s*(\S+)\s*'
                                     r'(?:#.*)?$')
