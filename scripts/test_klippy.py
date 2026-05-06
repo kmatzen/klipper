@@ -1241,17 +1241,19 @@ class TestCase:
         # routing is currently scoped to chips for which Renode either
         # ships an upstream platform (SAM4S, SAME70) or for which we
         # carry a local platform + Python.PythonPeripheral clock stubs
-        # (SAM4E reuses the SAM4S_EEFC + flipflop PMC_SR pattern,
-        # SAMD51 carries full OSCCTRL/GCLK/MCLK stubs). SAM3X/LPC176x
-        # remain follow-up work and stay on simavr (which fails for
-        # ARM, but Dockerfile.emulator-test doesn't build their .elfs
-        # so the subtests get skipped via the dict-not-built path).
+        # (SAM3X / SAM4E reuse the SAM4S_EEFC + flipflop PMC_SR
+        # pattern; SAMD51 carries full OSCCTRL/GCLK/MCLK stubs).
+        # LPC176x remains follow-up work and stays on simavr (which
+        # fails for ARM, but Dockerfile.emulator-test doesn't build
+        # its .elfs so the subtests get skipped via the
+        # dict-not-built path).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
         if base.startswith('stm32'):
             return 'renode'
-        if base.startswith('sam4') or base.startswith('same70'):
+        if (base.startswith('sam3x') or base.startswith('sam4')
+                or base.startswith('same70')):
             return 'renode'
         if base.startswith('samd51'):
             return 'renode'

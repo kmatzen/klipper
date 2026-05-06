@@ -62,6 +62,8 @@ _PLATFORM_FOR_CHIP = {
     'stm32g0b1': '@platforms/cpus/stm32g0.repl',
     'stm32h723': _local('stm32h723.repl'),
     'stm32h743': '@platforms/cpus/stm32h743.repl',
+    'sam3x8c': _local('sam3x8e.repl'),
+    'sam3x8e': _local('sam3x8e.repl'),
     'sam4s8c': '@platforms/cpus/sam4s8b.repl',
     'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
@@ -79,6 +81,8 @@ _PLATFORM_FOR_CHIP = {
 # override map fall back to the STM32 default.
 _DEFAULT_HOST_LINK_PERIPHERAL = 'usart1'
 _HOST_LINK_FOR_CHIP = {
+    'sam3x8c': 'uart',
+    'sam3x8e': 'uart',
     'sam4s8c': 'uart1',
     'sam4e8e': 'uart0',
     'same70q20b': 'uart2',
