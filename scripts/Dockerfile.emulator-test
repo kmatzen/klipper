@@ -130,8 +130,7 @@ RUN for cfg in stm32f070 stm32f401 stm32f405 stm32f407 stm32f429 \
 # carry a local platform plus Python.PythonPeripheral stubs (SAM3X
 # - test/emulator/repl/sam3x8e.repl, SAM4E -
 # test/emulator/repl/sam4e8e.repl, SAMD51 -
-# test/emulator/repl/samd51p20.repl). LPC176x lacks an adequate
-# upstream platform and remains follow-up work.
+# test/emulator/repl/samd51p20.repl).
 RUN for cfg in sam3x8c sam3x8e sam4s8c sam4e8e same70q20b samd51p20; do \
         make distclean V=1 || true; \
         cp test/configs/${cfg}-serial.config .config && \
@@ -140,6 +139,20 @@ RUN for cfg in sam3x8c sam3x8e sam4s8c sam4e8e same70q20b samd51p20; do \
         cp out/klipper.dict ci_build/dict/${cfg}.dict && \
         cp out/klipper.elf ci_build/elf/${cfg}.elf; \
     done
+
+# NXP LPC176x firmware build for the renode backend. -serial.config
+# selects LPC_SERIAL_UART0 (P0.3/P0.2) so klippy talks to the
+# classic 16550-style UART0 (NS16550 with wideRegisters: true in
+# test/emulator/repl/lpc176x.repl). The LPC_SC clock controller
+# stub at 0x400FC000 (test/emulator/lpc_sc_stub.py) is runtime-
+# injected by renode_launcher.py - same path SAMD51 clock stubs
+# follow.
+RUN make distclean V=1 || true \
+    && cp test/configs/lpc176x-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/lpc176x.dict \
+    && cp out/klipper.elf ci_build/elf/lpc176x.elf
 
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the

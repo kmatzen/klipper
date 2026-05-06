@@ -1240,13 +1240,11 @@ class TestCase:
         # dispatch only differs in which binary is launched. Atmel
         # routing is currently scoped to chips for which Renode either
         # ships an upstream platform (SAM4S, SAME70) or for which we
-        # carry a local platform + Python.PythonPeripheral clock stubs
+        # carry a local platform + Python.PythonPeripheral stubs
         # (SAM3X / SAM4E reuse the SAM4S_EEFC + flipflop PMC_SR
-        # pattern; SAMD51 carries full OSCCTRL/GCLK/MCLK stubs).
-        # LPC176x remains follow-up work and stays on simavr (which
-        # fails for ARM, but Dockerfile.emulator-test doesn't build
-        # its .elfs so the subtests get skipped via the
-        # dict-not-built path).
+        # pattern; SAMD51 carries full OSCCTRL/GCLK/MCLK stubs;
+        # LPC176x carries an LPC_SC clock-controller stub paired
+        # with the upstream NS16550 UART model).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
@@ -1256,6 +1254,8 @@ class TestCase:
                 or base.startswith('same70')):
             return 'renode'
         if base.startswith('samd51'):
+            return 'renode'
+        if base.startswith('lpc176x'):
             return 'renode'
         return 'simavr'
 

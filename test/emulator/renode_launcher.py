@@ -68,6 +68,7 @@ _PLATFORM_FOR_CHIP = {
     'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
     'samd51p20': _local('samd51p20.repl'),
+    'lpc176x': _local('lpc176x.repl'),
 }
 
 # Renode peripheral name for the UART/USART that klipper uses as the
@@ -87,6 +88,7 @@ _HOST_LINK_FOR_CHIP = {
     'sam4e8e': 'uart0',
     'same70q20b': 'uart2',
     'samd51p20': 'sercom0',
+    'lpc176x': 'uart0',
 }
 
 
@@ -114,6 +116,9 @@ _SAMD_OSC32KCTRL_STUB_PY = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'samd_osc32kctrl_stub.py')
 _SAMD_STOREBACK_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'samd_storeback.py')
+
+_LPC_SC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'lpc_sc_stub.py')
 
 # Per-chip RCC peripheral base address (RM cross-reference per
 # family). Most upstream Renode STM32 platforms ship some kind of
@@ -158,6 +163,9 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
         ('gclk', 0x40001C00, 0x200, _SAMD_GCLK_STUB_PY),
         ('mclk', 0x40000800, 0x40, _SAMD_STOREBACK_PY),
         ('cmcc', 0x41006000, 0x40, _SAMD_STOREBACK_PY),
+    ],
+    'lpc176x': [
+        ('lpc_sc', 0x400FC000, 0x200, _LPC_SC_STUB_PY),
     ],
 }
 
