@@ -1,0 +1,83 @@
+// Renode platform description for Raspberry Pi RP2040 (dual Cortex-M0+,
+// only core0 modelled; klipper firmware runs entirely on core0 and
+// never wakes core1).
+//
+// Renode upstream has no RP2040 platform and no RP2040-family
+// peripheral models in renode-infrastructure (search:repo:renode/
+// renode-infrastructure rp2040 returns 0 hits as of 1.16.x). Standalone
+// with only what klipper RP2040 firmware drives at boot:
+//
+//   - cpu (cortex-m0+) + nvic. SysTick frequency picked at 125MHz to
+//     match the chip's typical post-PLL clk_sys; klipper firmware
+//     attempts FREQ_SYS=200MHz but never reads back actual cycles
+//     (timer_read_time uses TIMERAWL @ 1MHz, not SysTick), so the
+//     value is observably irrelevant beyond keeping NVIC happy. No
+//     DWT - cortex-m0+ doesn't ship one and klipper's RP2040 timer.c
+//     uses the chip's TIMER peripheral exclusively.
+//   - flash (Memory.MappedMemory @ 0x10000000 size 2MB) - XIP
+//     window. CONFIG_RPXXXX_FLASH_START_4000 puts the application
+//     at 0x10004000 with its own vector table; ELF entry resolves
+//     to the application's ResetHandler so Renode `sysbus LoadELF`
+//     skips the boot-stage-2 SSI flash setup that runs on real
+//     silicon between 0x10000000 and 0x100000FF.
+//   - sram (Memory.MappedMemory @ 0x20000000 size 264KB) - main
+//     SRAM (CONFIG_RAM_SIZE = 0x42000). The split-bank striped
+//     view at 0x21000000-0x21030000 is also present on real silicon
+//     but klipper firmware doesn't link against it.
+//   - sio (Memory.MappedMemory @ 0xD0000000 size 4KB) - the
+//     single-cycle IO region klipper's gpio.c writes to
+//     (gpio_oe_set/clr, gpio_set/clr/xor). Pure storeback works
+//     here because the firmware writes mask-based commands and
+//     reads back GPIO_IN, never any side-effect register that needs
+//     synthesis. Mapped as memory rather than a peripheral so reads
+//     return whatever the firmware last wrote, and sized to the
+//     4KB page Renode's MappedMemory requires.
+//   - uart0 (UART.PL011 @ 0x40034000 -> nvic@20). klipper's
+//     RP2040 UART is a literal ARM PL011 PrimeCell (datasheet
+//     section 4.2.4 - register set is identical), so Renode's
+//     upstream UART.PL011 model handles it without local code.
+//     Wired to UART0_IRQ_IRQn = 20 per the cortex-m0+ vector
+//     table in pico-sdk/rp2040/cmsis_include/RP2040.h. UART1 isn't
+//     reachable in the test build (CONFIG_RPXXXX_SERIAL_UART0_PINS_0_1
+//     selects UART0 only) but defining it costs nothing and makes
+//     future UART1-pin variants drop in.
+//   - uart1 (UART.PL011 @ 0x40038000 -> nvic@21).
+//   - timer (Timers.RP2040_Timer @ 0x40054000). Local C# model
+//     loaded via `i @rp2040_timer.cs` emitted by renode_launcher
+//     before LoadPlatformDescription - same pattern as
+//     test/emulator/repl/hc32f460_uart.cs. ALARM0 IRQ wired to
+//     TIMER_IRQ_0_IRQn = 0.
+//
+// Storeback stubs runtime-injected by the launcher cover the rest of
+// the regions klipper writes during init (CLOCKS / RESETS / XOSC /
+// PLL_SYS / PLL_USB - synthesizing busy-wait status bits; PSM /
+// PADS_BANK0 / IO_BANK0 / VREG_AND_CHIP_RESET / WATCHDOG / ROSC -
+// plain dict-backed because the firmware never reads them back).
+// See _EXTRA_PERIPHERAL_STUBS_FOR_CHIP['rp2040'] in
+// test/emulator/renode_launcher.py for the per-region rationale.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 125000000
+
+flash: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x200000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x42000
+
+sio: Memory.MappedMemory @ sysbus 0xD0000000
+    size: 0x1000
+
+uart0: UART.PL011 @ sysbus 0x40034000
+    -> nvic@20
+
+uart1: UART.PL011 @ sysbus 0x40038000
+    -> nvic@21
+
+timer: Timers.RP2040_Timer @ sysbus 0x40054000
+    IRQ -> nvic@0

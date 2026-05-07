@@ -175,6 +175,23 @@ RUN for cfg in hc32f460-serial-PA3PA2 hc32f460-serial-PA7PA8; do \
         cp out/klipper.elf ci_build/elf/${cfg}.elf; \
     done
 
+# Raspberry Pi RP2040 firmware build for the renode backend. -serial.config
+# selects RPXXXX_SERIAL_UART0_PINS_0_1 + RPXXXX_FLASH_START_4000 so klippy
+# talks to the chip's PL011 UART0 at 0x40034000 (UART.PL011 in
+# test/emulator/repl/rp2040.repl) and the ELF's reset vector lands
+# directly at the application instead of behind a boot stage 2 image.
+# CLOCKS/RESETS/XOSC/PLL bit-set stubs (rp2040_*_stub.py) +
+# Timers.RP2040_Timer C# model (loaded via `i @repl/rp2040_timer.cs`)
+# are runtime-injected by renode_launcher.py - same path the HC32F460
+# C# UART model follows. printers.test references rp2040.dict for the
+# generic-bigtreetech-skr-pico-v1.0 config.
+RUN make distclean V=1 || true \
+    && cp test/configs/rp2040-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/rp2040.dict \
+    && cp out/klipper.elf ci_build/elf/rp2040.elf
+
 # Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
 # and links against libsimavr; produces the binary that runs the
 # klipper firmware and exposes its UART as a pty for klippy plus a

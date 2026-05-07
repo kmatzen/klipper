@@ -1247,7 +1247,10 @@ class TestCase:
         # with the upstream NS16550 UART model; HC32F460 carries a
         # full local USART model in C# loaded via `i @file.cs` plus
         # storeback stubs for INTC/PORT/PWC/SYSREG/EFM since HDSC
-        # has no upstream Renode peripheral models at all).
+        # has no upstream Renode peripheral models at all; RP2040
+        # carries a local 64-bit / 1MHz timer C# model plus four
+        # bit-set synthesis stubs for CLOCKS/RESETS/XOSC/PLL since
+        # the RPi RP2040 has zero upstream Renode coverage either).
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
@@ -1261,6 +1264,8 @@ class TestCase:
         if base.startswith('lpc176x'):
             return 'renode'
         if base.startswith('hc32f460'):
+            return 'renode'
+        if base.startswith('rp2040'):
             return 'renode'
         return 'simavr'
 

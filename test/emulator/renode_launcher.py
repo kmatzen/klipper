@@ -70,6 +70,7 @@ _PLATFORM_FOR_CHIP = {
     'samd51p20': _local('samd51p20.repl'),
     'lpc176x': _local('lpc176x.repl'),
     'hc32f460': _local('hc32f460.repl'),
+    'rp2040': _local('rp2040.repl'),
 }
 
 # Renode peripheral name for the UART/USART that klipper uses as the
@@ -91,6 +92,7 @@ _HOST_LINK_FOR_CHIP = {
     'samd51p20': 'sercom0',
     'lpc176x': 'uart0',
     'hc32f460': 'usart1',
+    'rp2040': 'uart0',
 }
 
 
@@ -131,6 +133,28 @@ _LPC_SC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # under test/emulator/repl/.
 _HC32F460_UART_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'repl', 'hc32f460_uart.cs')
+
+# Path to the RP2040 64-bit timer C# peripheral. Renode upstream has no
+# RP2040-family timer model; we ship one under test/emulator/repl/ and
+# load it the same way as hc32f460_uart.cs (Roslyn-compiled into the
+# running runtime via `i @<path>` before LoadPlatformDescription).
+_RP2040_TIMER_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'repl', 'rp2040_timer.cs')
+
+# Per-stub-region paths for the RP2040 clock-controller surface. Each
+# script implements one clock peripheral's busy-wait status synthesis
+# (RESET_DONE = ~RESET, XOSC.STATUS.STABLE from CTRL.ENABLE, PLL.CS.LOCK
+# from PLL.PWR.PD, CLK_<x>_SELECTED from CLK_<x>_CTRL.SRC) - splitting
+# them out keeps each script's `regs` dict per-instance rather than
+# trying to multiplex across base addresses.
+_RP2040_CLOCKS_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'rp2040_clocks_stub.py')
+_RP2040_RESETS_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'rp2040_resets_stub.py')
+_RP2040_XOSC_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'rp2040_xosc_stub.py')
+_RP2040_PLL_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'rp2040_pll_stub.py')
 
 # Per-chip RCC peripheral base address (RM cross-reference per
 # family). Most upstream Renode STM32 platforms ship some kind of
@@ -209,6 +233,47 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
         ('port', 0x40053800, 0x80, _SAMD_STOREBACK_PY),
         ('sysreg', 0x40054000, 0x1400, _SAMD_STOREBACK_PY),
     ],
+    # RP2040: every region klipper firmware writes during init except
+    # UART0 / UART1 (UART.PL011 in the .repl) and TIMER (Timers.
+    # RP2040_Timer C# model loaded via _CSHARP_INCLUDES_FOR_CHIP).
+    # Four regions need bit-set synthesis to clear busy-wait loops in
+    # main.c:clock_setup; the rest are plain dict-backed storeback
+    # because the firmware writes once and never reads back to gate
+    # progress.
+    #   - clocks (0x40008000, 0xD0)  CLK_<x>_SELECTED = 1<<CTRL.SRC.
+    #   - resets (0x4000C000, 0x10)  RESET_DONE = ~RESET.
+    #   - xosc   (0x40024000, 0x20)  STATUS.STABLE when
+    #                                CTRL.ENABLE field == 0xFAB.
+    #   - pll_sys (0x40028000, 0x10) CS.LOCK when PWR.PD bit cleared.
+    #   - pll_usb (0x4002C000, 0x10) same script as pll_sys; per-
+    #                                instance regs keep state separate.
+    #   - psm (0x40010000, 0x10)     watchdog source-select; klipper
+    #                                writes WDSEL but never reads.
+    #   - io_bank0 (0x40014000, 0x180) PORT_SetFunc per-pin CTRL writes.
+    #   - pads_bank0 (0x4001C000, 0x100) PADS_SetPad drive/pull writes.
+    #   - watchdog (0x40058000, 0x40) watchdog_init writes load/ctrl;
+    #                                clock_setup writes tick (RP2040
+    #                                only - RP2350 watchdog tick lives
+    #                                under the ticks block, which
+    #                                klipper RP2040 firmware doesn't
+    #                                touch).
+    #   - vreg (0x40064000, 0x10)    set_vsel writes VREG.VSEL field.
+    #   - rosc (0x40060000, 0x20)    not driven by klipper directly,
+    #                                but covered for safety - the
+    #                                cmsis startup may probe it.
+    'rp2040': [
+        ('psm', 0x40010000, 0x10, _SAMD_STOREBACK_PY),
+        ('clocks', 0x40008000, 0xD0, _RP2040_CLOCKS_STUB_PY),
+        ('resets', 0x4000C000, 0x10, _RP2040_RESETS_STUB_PY),
+        ('io_bank0', 0x40014000, 0x180, _SAMD_STOREBACK_PY),
+        ('pads_bank0', 0x4001C000, 0x100, _SAMD_STOREBACK_PY),
+        ('xosc', 0x40024000, 0x20, _RP2040_XOSC_STUB_PY),
+        ('pll_sys', 0x40028000, 0x10, _RP2040_PLL_STUB_PY),
+        ('pll_usb', 0x4002C000, 0x10, _RP2040_PLL_STUB_PY),
+        ('watchdog', 0x40058000, 0x40, _SAMD_STOREBACK_PY),
+        ('rosc', 0x40060000, 0x20, _SAMD_STOREBACK_PY),
+        ('vreg', 0x40064000, 0x10, _SAMD_STOREBACK_PY),
+    ],
 }
 
 # Per-chip C# peripherals to load (Roslyn-compiled into the running
@@ -222,6 +287,7 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
 # UART.HC32F460_USART for reference from the .repl.
 _CSHARP_INCLUDES_FOR_CHIP = {
     'hc32f460': [_HC32F460_UART_CS],
+    'rp2040': [_RP2040_TIMER_CS],
 }
 
 
