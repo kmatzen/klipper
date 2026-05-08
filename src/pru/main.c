@@ -8,7 +8,9 @@
 #include <pru/io.h> // read_r31
 #include <pru_iep.h> // CT_IEP
 
+#ifndef CONFIG_PRU_HOST_BUILD
 #include <rsc_types.h> // resource_table
+#endif
 #include "board/misc.h" // dynmem_start
 #include "board/io.h" // readl
 #include "board/irq.h" // irq_disable
@@ -16,6 +18,9 @@
 #include "generic/timer_irq.h" // timer_dispatch_many
 #include "internal.h" // SHARED_MEM
 #include "sched.h" // sched_main
+#ifdef CONFIG_PRU_HOST_BUILD
+#include "host_pru.h" // host_pru_init
+#endif
 
 DECL_CONSTANT_STR("MCU", "pru");
 
@@ -48,7 +53,15 @@ irq_restore(irqstatus_t flag)
 void
 irq_wait(void)
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    // Host build can't issue the PRU `slp 1` instruction; wait on
+    // the host_pru condvar instead so the firmware thread blocks
+    // until the IEP timer thread or the pty I/O thread sets a
+    // pending bit.
+    host_pru_irq_wait();
+#else
     asm("slp 1");
+#endif
     irq_poll();
 }
 
@@ -73,9 +86,17 @@ void
 timer_kick(void)
 {
     timer_set(timer_read_time() + 50);
+#ifdef CONFIG_PRU_HOST_BUILD
+    // Host build needs write-1-to-clear semantics; a struct store
+    // would overwrite all bits including any newly-set pending
+    // ones from the IEP timer thread.
+    host_pru_iep_cmp_sts_clear(0xff);
+    host_pru_intc_secr0_clear(1 << IEP_EVENT);
+#else
     CT_IEP.TMR_CMP_STS = 0xff;
     __delay_cycles(4);
     PRU_INTC.SECR0 = 1 << IEP_EVENT;
+#endif
 }
 
 static uint32_t in_timer_dispatch;
@@ -85,15 +106,27 @@ _irq_poll(void)
 {
     uint32_t secr0 = PRU_INTC.SECR0;
     if (secr0 & (1 << KICK_PRU1_EVENT)) {
+#ifdef CONFIG_PRU_HOST_BUILD
+        host_pru_intc_secr0_clear(1 << KICK_PRU1_EVENT);
+#else
         PRU_INTC.SECR0 = 1 << KICK_PRU1_EVENT;
+#endif
         sched_wake_tasks();
     }
     if (secr0 & (1 << IEP_EVENT)) {
+#ifdef CONFIG_PRU_HOST_BUILD
+        host_pru_iep_cmp_sts_clear(0xff);
+#else
         CT_IEP.TMR_CMP_STS = 0xff;
+#endif
         in_timer_dispatch = 1;
         uint32_t next = timer_dispatch_many();
         timer_set(next);
+#ifdef CONFIG_PRU_HOST_BUILD
+        host_pru_intc_secr0_clear(1 << IEP_EVENT);
+#else
         PRU_INTC.SECR0 = 1 << IEP_EVENT;
+#endif
         in_timer_dispatch = 0;
     }
 }
@@ -126,7 +159,12 @@ DECL_CONSTANT("RECEIVE_WINDOW", 496 - 1);
 void
 console_task(void)
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    const struct command_parser *cp =
+        __atomic_load_n(&SHARED_MEM->next_command, __ATOMIC_ACQUIRE);
+#else
     const struct command_parser *cp = SHARED_MEM->next_command;
+#endif
     if (!cp)
         return;
 
@@ -137,7 +175,17 @@ console_task(void)
         func(SHARED_MEM->next_command_args);
     }
 
+#ifdef CONFIG_PRU_HOST_BUILD
+    // Multi-threaded host build needs a release-store so the
+    // pty I/O thread sees the cleared next_command - writel's
+    // compiler-only barrier isn't enough on aarch64. The matching
+    // acquire-load lives in src/pru/host_pru.c::_dispatch_command.
+    __atomic_store_n(&SHARED_MEM->next_command,
+                     (const struct command_parser *)NULL,
+                     __ATOMIC_RELEASE);
+#else
     writel(&SHARED_MEM->next_command, 0);
+#endif
 }
 DECL_TASK(console_task);
 
@@ -145,6 +193,16 @@ DECL_TASK(console_task);
 void
 console_sendf(const struct command_encoder *ce, va_list args)
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    // Bypass SHARED_MEM->next_encoder + write_r31 + pru0 entirely.
+    // Routing the va_list through a void* field works on PRU
+    // because pru-cgt's va_list is just a uint32_t pointer, but
+    // x86_64's va_list is an array-of-struct - copying it through
+    // a void* and then back is non-portable. Since host_pru.c is
+    // already in the same process / same firmware stack frame, we
+    // can encode + write to the pty directly.
+    host_pru_send_response(ce, args);
+#else
     SHARED_MEM->next_encoder_args = args;
     writel(&SHARED_MEM->next_encoder, (uint32_t)ce);
 
@@ -154,6 +212,7 @@ console_sendf(const struct command_encoder *ce, va_list args)
     while (readl(&SHARED_MEM->next_encoder))
         if (!itd)
             irq_poll();
+#endif
 }
 
 void
@@ -186,15 +245,25 @@ const struct command_parser shutdown_request = {
 void *
 dynmem_start(void)
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    extern char _host_pru_heap[];
+    return _host_pru_heap;
+#else
     extern char _heap_start;
     return &_heap_start;
+#endif
 }
 
 // Return the end of memory available for dynamic allocations
 void *
 dynmem_end(void)
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    extern void *const _host_pru_heap_end;
+    return _host_pru_heap_end;
+#else
     return (void*)(8*1024 - STACK_SIZE);
+#endif
 }
 
 /****************************************************************
@@ -206,8 +275,19 @@ DECL_COMMAND_FLAGS(config_reset, HF_IN_SHUTDOWN, "config_reset");
 
 // Main entry point
 int
+#ifdef CONFIG_PRU_HOST_BUILD
+main(int argc, char **argv)
+#else
 main(void)
+#endif
 {
+#ifdef CONFIG_PRU_HOST_BUILD
+    // Set up the host SHARED_MEM, IEP timer thread, and pty bridge
+    // before the firmware spin-waits for SIGNAL_PRU0_WAITING -
+    // host_pru_init seeds the signal field so the wait below
+    // completes immediately.
+    host_pru_init(argc, argv);
+#endif
     // Wait for PRU0 to initialize
     while (readl(&SHARED_MEM->signal) != SIGNAL_PRU0_WAITING)
         ;

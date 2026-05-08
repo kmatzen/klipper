@@ -1257,6 +1257,15 @@ class TestCase:
         base = os.path.basename(dict_path)
         if base == 'linuxprocess.dict':
             return 'linuxprocess'
+        # linuxpru: src/pru/ compiled against host gcc (no pru-cgt,
+        # no Renode - PRU's instruction set has no upstream emulator
+        # coverage). The build produces a host-arch klipper.elf that
+        # opens its own pty (test/emulator/../src/pru/host_pru.c) and
+        # publishes the slave end at -I<slave-link>, same shape as
+        # the linuxprocess backend - so the runner spawns it the
+        # same way.
+        if base == 'linuxpru.dict':
+            return 'linuxprocess'
         if base.startswith('stm32'):
             return 'renode'
         if (base.startswith('sam3x') or base.startswith('sam4')

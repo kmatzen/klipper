@@ -95,6 +95,24 @@ RUN make distclean V=1 || true \
     && cp out/klipper.dict ci_build/dict/linuxprocess.dict \
     && cp out/klipper.elf ci_build/elf/linuxprocess.elf
 
+# linuxpru: src/pru/ compiled against host gcc instead of pru-cgt.
+# pru-specific intrinsics, the IEP timer, the PRU INTC, and the
+# four AM335x GPIO MMIO blocks are stubbed by src/pru/host_pru.c +
+# src/pru/host_inc/, and the pru0 rpmsg shuttle is replaced by a
+# pty-based console bridge. The resulting host-arch klipper.elf is
+# dispatched through the linuxprocess backend in test_klippy.py
+# (linuxpru.dict matches the linuxprocess shape: binary spawned
+# with -I <slave-link>, opens its own pty, no control socket). PRU
+# is the only chip family in scope for which Renode has no upstream
+# CPU model - the host build is the only path to end-to-end
+# coverage on PRU firmware.
+RUN make distclean V=1 || true \
+    && cp test/configs/linuxpru.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/linuxpru.dict \
+    && cp out/klipper.elf ci_build/elf/linuxpru.elf
+
 # STM32 firmware builds for the renode backend. Each chip's
 # -serial.config selects MACH_STM32{chip} + STM32_SERIAL_USART1; klippy
 # then talks to the firmware over the USART1 pty Renode exposes
@@ -218,6 +236,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/sht3x_crc_regression.test", \
      "test/klippy/linuxtest.test", \
      "test/klippy/samd21_smoke.test", \
+     "test/klippy/linuxpru.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
      "test/klippy/generic_cartesian_iqex.test"]
