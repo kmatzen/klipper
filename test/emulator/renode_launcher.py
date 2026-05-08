@@ -635,18 +635,43 @@ def _translate_fixture_command(line):
 
 def _control_socket_loop(sock_path, monitor_sock, stop_evt):
     # Accept connections from _push_fixture_to_control_socket. Each
-    # newline-terminated command is translated to a Renode python
-    # call and forwarded over the monitor socket. After all commands
-    # the test runner sends `start` (mirroring simavr_bridge.c's
-    # control protocol); on receipt we issue Renode's `start` to
-    # begin CPU execution.
+    # newline-terminated command is either a hook setter (translated
+    # to a Renode python call) or one of the bridge-protocol verbs
+    # the simavr bridge implements internally:
+    #
+    #   start            - kick off CPU execution. simavr's bridge
+    #                      starts running as soon as it spawns; Renode
+    #                      starts paused, so we have to issue `start`
+    #                      to the monitor explicitly. The runner does
+    #                      NOT send `start` today (the simavr bridge
+    #                      does not expose a `start` verb), so we also
+    #                      auto-trigger on the first `barrier`.
+    #   barrier <usec>   - wait simulated time and ACK. simavr blocks
+    #                      until its cycle counter advances <usec>;
+    #                      Renode runs in real-time, so a wall-clock
+    #                      sleep of usec microseconds is the closest
+    #                      equivalent (firmware activity scales with
+    #                      wall time after `start`). Auto-issues
+    #                      `start` first if the CPU has not begun -
+    #                      that is what makes klippy's identify+
+    #                      clocksync handshake actually see firmware
+    #                      output on the host pty.
+    #
+    # Hook commands (analog_in_default, step_trigger, ...) translate
+    # to `python "<call>"` against renode_hooks.py.
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock_path)
     srv.listen(1)
     srv.settimeout(0.5)
-    started = False
+    started = [False]
+
+    def _ensure_started():
+        if not started[0]:
+            _send_monitor(monitor_sock, 'start')
+            started[0] = True
+
     while not stop_evt[0]:
         try:
             conn, _ = srv.accept()
@@ -664,9 +689,28 @@ def _control_socket_loop(sock_path, monitor_sock, stop_evt):
                     text = line.decode('utf-8', 'replace').strip()
                     if not text:
                         continue
-                    if text == 'start' and not started:
-                        _send_monitor(monitor_sock, 'start')
-                        started = True
+                    if text == 'start':
+                        _ensure_started()
+                        try:
+                            conn.sendall(b'OK\n')
+                        except OSError:
+                            pass
+                        continue
+                    if (text == 'barrier'
+                            or text.startswith('barrier ')):
+                        _ensure_started()
+                        usec = 1000
+                        parts = text.split()
+                        if len(parts) > 1:
+                            try:
+                                usec = int(parts[1])
+                            except ValueError:
+                                pass
+                        # Cap the wall-clock wait so a malformed
+                        # fixture cannot hang the launcher; simavr
+                        # bridge's barrier is bounded by the runner's
+                        # 5 s timeout on the OK ack anyway.
+                        time.sleep(min(usec / 1e6, 5.0))
                         try:
                             conn.sendall(b'OK\n')
                         except OSError:
@@ -692,11 +736,11 @@ def _control_socket_loop(sock_path, monitor_sock, stop_evt):
                 conn.close()
             except OSError:
                 pass
-    if not started:
-        # No `start` was issued (test runner gave up early or never
-        # connected the control socket - happens in single-shot
-        # diagnostic runs). Start the CPU so the firmware at least
-        # boots and we can observe the failure mode.
+    if not started[0]:
+        # No `start`/`barrier` was issued (test runner gave up early
+        # or never connected the control socket - happens in
+        # single-shot diagnostic runs). Start the CPU so the firmware
+        # at least boots and we can observe the failure mode.
         try:
             _send_monitor(monitor_sock, 'start')
         except (OSError, RuntimeError):

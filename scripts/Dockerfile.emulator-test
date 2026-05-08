@@ -217,6 +217,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \
      "test/klippy/linuxtest.test", \
+     "test/klippy/samd21_smoke.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
      "test/klippy/generic_cartesian_iqex.test"]
