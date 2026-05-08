@@ -120,6 +120,24 @@ _RCC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _AFEC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'afec_stub.py')
 
+# SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
+# check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
+# the firmware enters the "configure GPNVM and request reset" branch
+# and spins in `for(;;)` waiting for an RSTC reset Renode has no
+# model for. The stub overrides FRR to return GPNVM_TCM_MASK so the
+# firmware sees TCM as already-set and skips the spin.
+_SAME70_EFC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'same70_efc_stub.py')
+
+# SAME70 XDMAC channel-0 busy-wait synthesis. klipper SystemInit
+# polls XDMAC->XDMAC_CIS0 for BIS after kicking off a flash->ITCM
+# DMA copy; Renode's SVD-tagged XDMAC returns 0, so BIS never latches
+# and the firmware spins. The stub overrides CIS0 to BIS=1 (no DMA
+# actually needed - useVirtualAddress=true loads the ELF at VMA
+# directly). See same70_xdmac_stub.py for the full reasoning.
+_SAME70_XDMAC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'same70_xdmac_stub.py')
+
 _SAMD_OSCCTRL_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      'samd_oscctrl_stub.py')
 _SAMD_GCLK_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -214,6 +232,20 @@ _AFEC_BASES_FOR_CHIP = {
 # (MCLK / CMCC) that klipper firmware touches during SystemInit() and
 # enable_pclock() - none of which Renode upstream models. Without
 # these the firmware spins forever in samd51_clock.c.
+_SAME70_EXTRA_STUBS = [
+    # EFC at 0x400E0C00 with 0x10-byte register window (FMR/FCR/FSR/FRR).
+    # See same70_efc_stub.py for the GPNVM-bypass synthesis.
+    ('efc', 0x400E0C00, 0x10, _SAME70_EFC_STUB_PY),
+    # XDMAC channel-0 register block at 0x40078050..0x4007808F covers
+    # CIE0/CID0/CIM0/CIS0/CSA0/CDA0/CNDA0/CNDC0/CUBC0/CBC0/CC0/...
+    # Stub synthesises CIS0.BIS = 1 to short-circuit the flash->ITCM
+    # DMA-copy busy-wait in same70_sysinit.c (the actual copy is
+    # unnecessary because useVirtualAddress=true loads the ELF at VMA
+    # 0x0 directly, same place the DMA would put it).
+    ('xdmac_ch0', 0x40078050, 0x40, _SAME70_XDMAC_STUB_PY),
+]
+
+
 _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
     # SAMD21G18: standalone .repl declares CPU/NVIC/SRAM/flash/SERCOM0
     # /TC4/PORT and the auxiliary fuse rows; this list adds the clock
@@ -323,7 +355,38 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
         ('rosc', 0x40060000, 0x20, _SAMD_STOREBACK_PY),
         ('vreg', 0x40064000, 0x10, _SAMD_STOREBACK_PY),
     ],
+    # SAME70 - both the serial-mode and USB-CDC firmware variants need
+    # the EFC GPNVM-bypass synthesis (klipper same70_sysinit.c reads
+    # EEFC_FRR for TCM bits before any peripheral-specific code runs).
+    'same70q20b': _SAME70_EXTRA_STUBS,
+    'same70q20b-usb': _SAME70_EXTRA_STUBS,
 }
+
+# Per-chip override controlling whether `sysbus LoadELF` uses the
+# segment's virtual address (VMA, the address the firmware code
+# actually executes from) or its physical address (LMA, where the
+# bytes get flashed on real hardware).
+#
+# SAME70 firmware compiled by `src/atsam/same70_link.lds.S` has
+# .text VMA=0x0..N (rom origin = CONFIG_FLASH_APPLICATION_ADDRESS = 0x0)
+# but LMA=0x400000..0x400000+N (the AT() clause sets LMA to
+# CONFIG_ARMCM_ITCM_FLASH_MIRROR_START). On real silicon, the
+# matrix-controller mirrors 0x400000 onto 0x0 at reset, so the CPU's
+# initial SP/PC read at 0x0/0x4 hits the vector table. Renode does
+# not model the matrix-controller mirror, so loading at LMA leaves
+# 0x0..0x100 zeroed and the CPU halts on its first fetch with
+# `PC does not lay in memory or PC and SP are equal to zero`.
+# Loading at VMA puts the bytes where the CPU expects them, which is
+# functionally equivalent to running on real silicon post-mirror-setup.
+#
+# All other Atmel chips (sam3x, sam4s, sam4e) use the generic
+# armcm linker script with VMA == LMA, so loading at LMA (the
+# default) works without override.
+_USE_VIRTUAL_ELF_LOAD = {
+    'same70q20b': True,
+    'same70q20b-usb': True,
+}
+
 
 # Per-chip C# peripherals to load (Roslyn-compiled into the running
 # Renode runtime via `i @<path>` / IncludeFileCommand) before the
@@ -427,6 +490,9 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
     # (mach create -> include @x.cs -> LoadPlatformDescription).
     cs_includes = _CSHARP_INCLUDES_FOR_CHIP.get(chip, ())
     cs_include_block = ''.join('i @%s\n' % p for p in cs_includes)
+    elf_load_args = ''
+    if _USE_VIRTUAL_ELF_LOAD.get(chip, False):
+        elf_load_args = ' useVirtualAddress=true'
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
@@ -435,7 +501,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
         '{rcc_block}'
         '{afec_block}'
         '{extra_block}'
-        'sysbus LoadELF @{elf}\n'
+        'sysbus LoadELF @{elf}{elf_load_args}\n'
         'logFile @{log}\n'
         'logLevel 1\n'
         'emulation CreateUartPtyTerminal "uartTerm" "{pty}"\n'
@@ -446,6 +512,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
              log=log_path, pty=pty_path, rcc_block=rcc_block,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
+             elf_load_args=elf_load_args,
              usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
 
 
@@ -829,7 +896,6 @@ def main():
         '-e', 'include @' + resc_path,
     ]
 
-    deadline = time.monotonic() + args.duration
     proc = subprocess.Popen(cmd, stdout=sys.stderr, stderr=sys.stderr)
 
     stop_evt = [False]
@@ -840,14 +906,27 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    # Renode startup can take 30+ seconds on a cold cache - the
+    # ATSAME70Q21.svd download alone is ~6MB and depending on network
+    # latency (macOS Docker in particular routes through vpnkit which
+    # caps throughput on first contact), the full mach create + LoadELF +
+    # CreateUartPtyTerminal sequence runs 25-50s before the pty link
+    # appears. The runner's --duration is sized for klippy work time
+    # (EMULATOR_KLIPPY_DEADLINE = 20s + 5s slack) and is too tight to
+    # also cover Renode startup. Use a startup deadline decoupled from
+    # --duration; once Renode is up and the pty is published, restart
+    # the duration clock so klippy gets its full work window regardless
+    # of how long startup took.
+    startup_deadline = time.monotonic() + 90.0
+    deadline = None
+
     try:
         # Wait for the pty Renode creates, then publish the symlink so
         # klippy's _wait_for_slave_link sees the slave path.
-        if not _wait_for_path(pty_path,
-                              min(deadline, time.monotonic() + 30.0)):
+        if not _wait_for_path(pty_path, startup_deadline):
             sys.stderr.write(
                 "renode_launcher: Renode did not create UART pty at "
-                "%s within 30s; aborting\n" % pty_path)
+                "%s within 90s; aborting\n" % pty_path)
             return 3
         # The pty file Renode creates IS the slave end (Renode opens
         # /dev/ptmx, then symlinks the published name to the slave
@@ -860,8 +939,7 @@ def main():
         os.symlink(pty_path, args.slave_link)
 
         monitor_sock = _connect_monitor(
-            '127.0.0.1', monitor_port,
-            min(deadline, time.monotonic() + 30.0))
+            '127.0.0.1', monitor_port, startup_deadline)
         _drain_monitor_until_prompt(monitor_sock)
 
         # Apply the fixture-resident hooks (ADC defaults, I2C ID
@@ -877,6 +955,10 @@ def main():
             args=(args.control_socket, monitor_sock, stop_evt),
             daemon=True)
         ctl_thread.start()
+
+        # Renode is up and the pty / monitor are wired - start the
+        # --duration clock now so klippy gets its full work window.
+        deadline = time.monotonic() + args.duration
 
         # Wait for Renode subprocess or duration cap.
         while not stop_evt[0]:
