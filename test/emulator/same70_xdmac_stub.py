@@ -30,7 +30,8 @@
 # is the only synthesised read; everything else falls back to the
 # stored value (or 0 default).
 
-regs = {}
+if 'regs' not in dir():
+    regs = {}
 
 # CIS_BIS (End of Block Interrupt Status). klipper reads CIS0 only
 # to gate on this bit; no other CIS bits matter for the firmware

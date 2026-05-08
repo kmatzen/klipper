@@ -490,9 +490,23 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
     # (mach create -> include @x.cs -> LoadPlatformDescription).
     cs_includes = _CSHARP_INCLUDES_FOR_CHIP.get(chip, ())
     cs_include_block = ''.join('i @%s\n' % p for p in cs_includes)
-    elf_load_args = ''
+    # SAME70 needs the ELF loaded TWICE - once at VMA so the vector
+    # table sits at 0x0 where the CPU's reset fetch reads SP/PC (the
+    # ITCM mirror real silicon would set up via the matrix-controller
+    # remap is not modelled by Renode), and again at LMA so the .data
+    # segment's flash-source bytes (referenced by `_data_flash` in
+    # armcm_link.lds.S) are present at 0x400000+_text_size for
+    # reset_handler_stage_two's boot_memcpy(&_data_start, &_data_flash,
+    # ...) to copy into RAM. With only the VMA load the LMA region is
+    # zero and boot_memcpy clobbers initialized variables (periodic_timer
+    # / sentinel_timer / etc.) with garbage, which then trips
+    # sched_add_timer's "timer too close" guard during ctr_run_initfuncs
+    # and longjmps against an uninitialized shutdown_jmp.
     if _USE_VIRTUAL_ELF_LOAD.get(chip, False):
-        elf_load_args = ' useVirtualAddress=true'
+        elf_load_block = ('sysbus LoadELF @{elf} useVirtualAddress=true\n'
+                          'sysbus LoadELF @{elf}\n').format(elf=elf_path)
+    else:
+        elf_load_block = 'sysbus LoadELF @{elf}\n'.format(elf=elf_path)
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
@@ -501,18 +515,18 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
         '{rcc_block}'
         '{afec_block}'
         '{extra_block}'
-        'sysbus LoadELF @{elf}{elf_load_args}\n'
+        '{elf_load_block}'
         'logFile @{log}\n'
         'logLevel 1\n'
         'emulation CreateUartPtyTerminal "uartTerm" "{pty}"\n'
         'connector Connect sysbus.{usart} uartTerm\n'
         'i @{hooks}\n'
         'python "import renode_hooks; renode_hooks.set_monitor(monitor)"\n'
-    ).format(chip=chip, platform=platform, elf=elf_path,
+    ).format(chip=chip, platform=platform,
              log=log_path, pty=pty_path, rcc_block=rcc_block,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
-             elf_load_args=elf_load_args,
+             elf_load_block=elf_load_block,
              usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
 
 
