@@ -7,12 +7,20 @@
 # fixture which makes the issue immediate.
 #
 # Implements the slice of AFEC behaviour klipper actually uses
-# (src/atsam/sam4e_afec.c, MACH_SAME70 path):
+# (src/atsam/sam4e_afec.c, MACH_SAM4E and MACH_SAME70 share this
+# file - both chips' boot init runs gpio_afec_init):
 #
-#   - AFE_ISR (offset 0x30) reads as DRDY|<active-channel-EOC> so
-#     gpio_afec_init's "is busy?" check returns false on first read,
-#     and so gpio_adc_sample's "(DRDY) && (1<<chan)" check completes
-#     whichever channel just got CR_START written.
+#   - AFE_ISR (offset 0x30) reads as 0 until the first AFE_CR_START
+#     write, then as DRDY|<all-channel-EOC>. The pre-START zero is
+#     what makes init_afec()'s `if (ISR & DRDY) return -1` busy-check
+#     fall through to the AFEC configuration block instead of returning
+#     -1 forever (and thereby spinning gpio_afec_init's
+#     `while(init_afec(AFEC0) != 0)` loop indefinitely - that loop is
+#     not bounded). After CR_START the synthesised DRDY|EOC satisfies
+#     gpio_adc_sample's "(DRDY) && (1<<chan)" check for whichever
+#     channel just got CR_START written. AFE_CR_SWRST reverts the
+#     synthesis to the pre-START state, matching real silicon's reset
+#     behaviour.
 #   - AFE_LCDR (offset 0x20) reads as the last converted value for
 #     the channel previously selected via AFE_CSELR (offset 0x64).
 #   - AFE_CDR (offset 0x68) reads as the per-channel data for the
@@ -42,12 +50,22 @@ if 'init_done' not in dir():
     default_value = 0
     channel_values = {}
     regs = {}
+    # ISR.DRDY synthesis is gated on AFE_CR_START having been written
+    # at least once since the last reset. See header comment.
+    drdy_armed = False
 
+AFE_CR    = 0x00
 AFE_CHSR  = 0x1C
 AFE_LCDR  = 0x20
 AFE_ISR   = 0x30
 AFE_CSELR = 0x64
 AFE_CDR   = 0x68
+
+# AFE_CR bit definitions (lib/sam4e/include/component/afec.h /
+# lib/same70b/include/component/afec.h - SWRST and START are bits 0
+# and 1 in both chip families).
+AFE_CR_SWRST = 0x1
+AFE_CR_START = 0x2
 
 MAGIC_DEFAULT = 0x100
 MAGIC_CH_BASE = 0x104  # 0x104 + ch * 4, channels 0..11
@@ -55,6 +73,7 @@ MAGIC_CH_BASE = 0x104  # 0x104 + ch * 4, channels 0..11
 if request.IsInit:
     init_done = True
     selected_channel = 0
+    drdy_armed = False
     regs.clear()
     # default_value / channel_values intentionally preserved across
     # reset: renode_hooks pushes fixture values BEFORE Renode's `start`
@@ -63,7 +82,18 @@ if request.IsInit:
 elif request.IsWrite:
     val = int(request.Value)
     off = request.Offset
-    if off == AFE_CSELR:
+    if off == AFE_CR:
+        # gpio_afec_init writes SWRST then later gpio_adc_sample writes
+        # START. SWRST returns the synthesised ISR state to "no
+        # conversion has happened" so init_afec()'s busy-check passes;
+        # START arms ISR.DRDY so the very next ISR poll observes the
+        # synthetic conversion-complete.
+        if val & AFE_CR_SWRST:
+            drdy_armed = False
+        if val & AFE_CR_START:
+            drdy_armed = True
+        regs[off] = val
+    elif off == AFE_CSELR:
         selected_channel = val & 0x1F
     elif off == MAGIC_DEFAULT:
         default_value = val & 0xFFF
@@ -78,10 +108,16 @@ elif request.IsRead:
         v = channel_values.get(selected_channel, default_value)
         request.Value = v & 0xFFF
     elif off == AFE_ISR:
-        # DRDY (bit 24) | per-channel EOC bits 11:0. Returning all
-        # channels ready is harmless - klipper only checks the bit
-        # for the channel it's currently sampling.
-        request.Value = (1 << 24) | 0xFFF
+        if drdy_armed:
+            # DRDY (bit 24) | per-channel EOC bits 11:0. Returning all
+            # channels ready is harmless - klipper only checks the bit
+            # for the channel it's currently sampling.
+            request.Value = (1 << 24) | 0xFFF
+        else:
+            # Pre-START / post-SWRST. init_afec()'s busy-check requires
+            # DRDY=0 here to fall through to the AFEC configuration
+            # block; without this gate gpio_afec_init spins forever.
+            request.Value = 0
     elif off == AFE_CHSR:
         # All 12 channels enabled. klipper's gpio_adc_sample early-
         # exits if the requested channel isn't in CHSR, but it also
