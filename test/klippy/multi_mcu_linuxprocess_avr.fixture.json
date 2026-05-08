@@ -1,0 +1,4 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_linuxprocess_avr.test under a mixed simavr (atmega2560) + native linuxprocess multi-bridge fan-out. The runner spawns the simavr bridge for the AVR main and the linuxprocess klipper.elf directly (the linux mcu opens its own pty via openpty() and symlinks the slave end). tick_mode is omitted: linuxprocess runs on real wall clock with no sim-time hook, so enabling it would create the same AVR-vs-real-time clock divergence as the AVR + renode mix. auto_trsync_trigger_ticks fires the X/Y/Z endstops after 100 step edges so G28 completes; the fixture pusher routes those step_trigger commands to the AVR bridge's control socket since all stepper pins are on [mcu], and skips the linuxprocess bridge entirely (no control socket on the linuxprocess backend -- peripheral state is staged via filesystem mocks before spawn).",
+    "auto_trsync_trigger_ticks": 100
+}

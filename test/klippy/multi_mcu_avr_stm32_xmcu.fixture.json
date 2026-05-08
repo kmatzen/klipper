@@ -1,0 +1,4 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_avr_stm32_xmcu.test under a mixed simavr (atmega2560) + renode (stm32f103) fan-out with stepper_z routed across the architecture boundary. tick_mode is omitted for the same reason as multi_mcu_avr_stm32: the renode launcher does not yet support tick-mode, and mixing it with simavr's tick-mode would point klippy's clock at the AVR sim_time mmap while renode kept running on wall clock. auto_trsync_trigger_ticks fires X/Y endstops on the AVR control socket and the Z endstop on the renode launcher's control socket, where renode_hooks.step_trigger registers a Renode StateChangedHook on gpioPortB[0] that drives gpioPortC[2] high after the configured number of rising edges. G28 must complete with all three step_triggers cooperating.",
+    "auto_trsync_trigger_ticks": 100
+}

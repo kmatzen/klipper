@@ -230,13 +230,24 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # they exercise STM32 dicts and so route through Renode in
 # scripts/test_klippy.py:_backend_for_dict. They run alongside the
 # pre-existing AVR + linuxprocess smoke tests so a regression in any
-# backend is caught by the same CMD.
+# backend is caught by the same CMD. The multi_mcu_* group exercises
+# the EMULATOR multi-bridge fan-out across every backend pairing the
+# runner has to span: AVR+AVR (simavr only), AVR+AVR cross-mcu
+# stepper routing, AVR+STM32 (simavr+renode), AVR+STM32 cross-mcu
+# stepper, STM32+STM32 (renode+renode), and AVR+linuxprocess
+# (simavr+native pty).
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \
      "test/klippy/linuxtest.test", \
      "test/klippy/samd21_smoke.test", \
      "test/klippy/linuxpru.test", \
+     "test/klippy/multi_mcu_avr.test", \
+     "test/klippy/multi_mcu_avr_xmcu.test", \
+     "test/klippy/multi_mcu_avr_stm32.test", \
+     "test/klippy/multi_mcu_avr_stm32_xmcu.test", \
+     "test/klippy/multi_mcu_stm32_stm32.test", \
+     "test/klippy/multi_mcu_linuxprocess_avr.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
      "test/klippy/generic_cartesian_iqex.test"]

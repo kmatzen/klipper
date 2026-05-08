@@ -1,0 +1,4 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_stm32_stm32.test under a two-renode multi-bridge fan-out (stm32f103 main + stm32f407 satellite). The runner spawns one renode_launcher.py instance per bridge, each loading its own platform .repl and firmware ELF; klippy connects to each pty independently and clocksyncs against each in real time. tick_mode is omitted because the renode launcher does not yet wire sim-time / tick-mode through to the underlying CPU model -- both bridges run wall-clock-locked, which is sufficient for clocksync stability when no simavr is in the mix. auto_trsync_trigger_ticks fires the X/Y/Z endstops after 100 step edges so G28 completes; the fixture pusher routes those step_trigger commands to the main bridge's control socket since all stepper pins are on [mcu].",
+    "auto_trsync_trigger_ticks": 100
+}
