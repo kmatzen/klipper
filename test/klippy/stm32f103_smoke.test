@@ -1,0 +1,22 @@
+# STM32F103 boot/connect smoke test. The local stm32f103.repl plus
+# the rcc_stub.py at 0x40021000 (RCC) is the F1-specific path - F0/G0
+# /F4/F4xx/F429/H7 each take a different Renode platform with its
+# own RCC model from upstream, so this test pins down the F1 path
+# end-to-end. The multi_mcu_avr_stm32 / multi_mcu_stm32_stm32 tests
+# already exercise stm32f103 in a multi-bridge context; this is the
+# narrower single-MCU regression target.
+DICTIONARY stm32f103.dict
+CONFIG stm32f103_smoke.cfg
+EMULATOR stm32f103_smoke.fixture.json
+
+# A few harmless gcode lines so klippy gets past klippy:ready.
+M114
+M105
+M105
+M105
+
+# klippy connected and stayed connected long enough to do the
+# clocksync handshake against the TIM2-driven firmware clock.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -241,6 +241,15 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/sht3x_crc_regression.test", \
      "test/klippy/linuxtest.test", \
      "test/klippy/samd21_smoke.test", \
+     "test/klippy/stm32f103_smoke.test", \
+     "test/klippy/samd51_smoke.test", \
+     "test/klippy/sam3x_smoke.test", \
+     "test/klippy/sam4s_smoke.test", \
+     "test/klippy/sam4e_smoke.test", \
+     "test/klippy/same70_smoke.test", \
+     "test/klippy/lpc176x_smoke.test", \
+     "test/klippy/hc32f460_smoke.test", \
+     "test/klippy/rp2040_smoke.test", \
      "test/klippy/linuxpru.test", \
      "test/klippy/multi_mcu_avr.test", \
      "test/klippy/multi_mcu_avr_xmcu.test", \

@@ -1,0 +1,23 @@
+# SAMD51 boot/connect smoke test. The local samd51p20.repl plus the
+# OSCCTRL/GCLK/OSC32KCTRL synthesis stubs (samd_oscctrl_stub.py,
+# samd_gclk_stub.py, samd_osc32kctrl_stub.py) plus the MCLK/CMCC
+# storeback regions are runtime-injected by renode_launcher.py
+# (_EXTRA_PERIPHERAL_STUBS_FOR_CHIP['samd51p20']); without these the
+# firmware spins forever in samd51_clock.c. There is no SAMD51-based
+# printer config in config/, so this is the only place SAMD51P20 is
+# wired through the test runner today.
+DICTIONARY samd51p20.dict
+CONFIG samd51_smoke.cfg
+EMULATOR samd51_smoke.fixture.json
+
+# A few harmless gcode lines so klippy gets past klippy:ready.
+M114
+M105
+M105
+M105
+
+# klippy connected and stayed connected long enough to do the
+# clocksync handshake against the firmware's generic/armcm_timer view.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
