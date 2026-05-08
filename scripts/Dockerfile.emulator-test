@@ -159,6 +159,25 @@ RUN for cfg in sam3x8c sam3x8e sam4s8c sam4e8e same70q20b samd21g18 samd51p20; d
         cp out/klipper.elf ci_build/elf/${cfg}.elf; \
     done
 
+# SAME70 USB-CDC firmware build for the renode backend. The duet3-6hc
+# / duet3-6xd printer configs are USB+CAN-only on real hardware (no
+# serial-mode firmware variant exists), so we build CONFIG_ATSAM_USB
+# alongside the serial-mode ${cfg}.dict above. The companion Renode
+# peripheral (test/emulator/repl/same70_usbhs.cs) uses a "skip-enum
+# cheat" - inject a SET_CONFIGURATION SETUP packet on EP0 so klipper's
+# CDC stack reaches bulk-active without needing a full USB host
+# emulation, then exposes BULK_IN/BULK_OUT as a UART pipe to the host
+# pty via UARTBase. Routing in test_klippy.py keys off the dict
+# basename (`same70q20b-usb` -> renode backend, `same70q20b-usb`
+# chip key in renode_launcher's _PLATFORM_FOR_CHIP / _HOST_LINK_FOR_CHIP
+# / _CSHARP_INCLUDES_FOR_CHIP). Validated by same70_usb_smoke.test.
+RUN make distclean V=1 || true \
+    && cp test/configs/same70q20b-usb.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/same70q20b-usb.dict \
+    && cp out/klipper.elf ci_build/elf/same70q20b-usb.elf
+
 # NXP LPC176x firmware build for the renode backend. -serial.config
 # selects LPC_SERIAL_UART0 (P0.3/P0.2) so klippy talks to the
 # classic 16550-style UART0 (NS16550 with wideRegisters: true in
@@ -247,6 +266,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/sam4s_smoke.test", \
      "test/klippy/sam4e_smoke.test", \
      "test/klippy/same70_smoke.test", \
+     "test/klippy/same70_usb_smoke.test", \
      "test/klippy/lpc176x_smoke.test", \
      "test/klippy/hc32f460_smoke.test", \
      "test/klippy/rp2040_smoke.test", \

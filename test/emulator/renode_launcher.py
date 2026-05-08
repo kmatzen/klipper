@@ -67,6 +67,7 @@ _PLATFORM_FOR_CHIP = {
     'sam4s8c': '@platforms/cpus/sam4s8b.repl',
     'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
+    'same70q20b-usb': _local('same70q20b.repl'),
     'samd21g18': _local('samd21g18.repl'),
     'samd51p20': _local('samd51p20.repl'),
     'lpc176x': _local('lpc176x.repl'),
@@ -90,6 +91,11 @@ _HOST_LINK_FOR_CHIP = {
     'sam4s8c': 'uart1',
     'sam4e8e': 'uart0',
     'same70q20b': 'uart2',
+    # The USB-CDC SAME70 build wires host I/O through USBHS instead of
+    # UART2; renode_launcher's UartPtyTerminal connector binds to whatever
+    # peripheral name lives here, and SAM_USBHS exposes UARTBase on its
+    # bulk endpoints (skip-enum cheat in same70_usbhs.cs).
+    'same70q20b-usb': 'usbhs',
     'samd21g18': 'sercom0',
     'samd51p20': 'sercom0',
     'lpc176x': 'uart0',
@@ -148,6 +154,14 @@ _HC32F460_UART_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _RP2040_TIMER_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'repl', 'rp2040_timer.cs')
 
+# Path to the SAME70 USBHS C# peripheral. Loaded into the running
+# Renode runtime via `i @<path>` (Roslyn-compiled into the live process
+# by IncludeFileCommand) BEFORE the platform LoadPlatformDescription so
+# the .repl's `USB.SAM_USBHS` reference resolves at platform-load
+# time. Renode upstream has no SAM USB-OTG peripheral model.
+_SAME70_USBHS_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'repl', 'same70_usbhs.cs')
+
 # Per-stub-region paths for the RP2040 clock-controller surface. Each
 # script implements one clock peripheral's busy-wait status synthesis
 # (RESET_DONE = ~RESET, XOSC.STATUS.STABLE from CTRL.ENABLE, PLL.CS.LOCK
@@ -190,6 +204,7 @@ _RCC_BASE_FOR_CHIP = {
 _AFEC_BASES_FOR_CHIP = {
     'sam4e8e': (0x400B0000, 0x400B4000),
     'same70q20b': (0x4003C000, 0x40064000),
+    'same70q20b-usb': (0x4003C000, 0x40064000),
 }
 
 # Per-chip extra Python.PythonPeripheral stubs to inject after the
@@ -322,6 +337,13 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
 _CSHARP_INCLUDES_FOR_CHIP = {
     'hc32f460': [_HC32F460_UART_CS],
     'rp2040': [_RP2040_TIMER_CS],
+    # Both same70q20b chip keys load the USBHS .cs even though only
+    # the USB-mode firmware exercises the peripheral - the .repl
+    # references USB.SAM_USBHS unconditionally so the type must
+    # resolve at LoadPlatformDescription time. The serial-mode
+    # firmware never writes to USBHS so the model stays idle.
+    'same70q20b': [_SAME70_USBHS_CS],
+    'same70q20b-usb': [_SAME70_USBHS_CS],
 }
 
 
