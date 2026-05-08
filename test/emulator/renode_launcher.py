@@ -67,6 +67,7 @@ _PLATFORM_FOR_CHIP = {
     'sam4s8c': '@platforms/cpus/sam4s8b.repl',
     'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
+    'samd21g18': _local('samd21g18.repl'),
     'samd51p20': _local('samd51p20.repl'),
     'lpc176x': _local('lpc176x.repl'),
     'hc32f460': _local('hc32f460.repl'),
@@ -89,6 +90,7 @@ _HOST_LINK_FOR_CHIP = {
     'sam4s8c': 'uart1',
     'sam4e8e': 'uart0',
     'same70q20b': 'uart2',
+    'samd21g18': 'sercom0',
     'samd51p20': 'sercom0',
     'lpc176x': 'uart0',
     'hc32f460': 'usart1',
@@ -120,6 +122,11 @@ _SAMD_OSC32KCTRL_STUB_PY = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'samd_osc32kctrl_stub.py')
 _SAMD_STOREBACK_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'samd_storeback.py')
+
+_SAMD21_GCLK_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'samd21_gclk_stub.py')
+_SAMD21_SYSCTRL_STUB_PY = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'samd21_sysctrl_stub.py')
 
 _LPC_SC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'lpc_sc_stub.py')
@@ -193,6 +200,33 @@ _AFEC_BASES_FOR_CHIP = {
 # enable_pclock() - none of which Renode upstream models. Without
 # these the firmware spins forever in samd51_clock.c.
 _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
+    # SAMD21G18: standalone .repl declares CPU/NVIC/SRAM/flash/SERCOM0
+    # /TC4/PORT and the auxiliary fuse rows; this list adds the clock
+    # peripherals (GCLK / SYSCTRL with custom synthesis stubs) and the
+    # plain store/return regions klipper firmware writes during
+    # SystemInit + enable_pclock (PM APBxMASK, NVMCTRL CTRLB,
+    # WDT CONFIG/CTRL/CLEAR). None of the storeback regions are read
+    # back to gate boot progress, so samd_storeback.py covers them.
+    #   - gclk    (0x40000C00, 0x20)  CTRL.SWRST self-clear +
+    #                                 STATUS.SYNCBUSY=0 synthesis.
+    #   - sysctrl (0x40000800, 0x80)  PCLKSR.{XOSC32KRDY,DFLLRDY} +
+    #                                 DPLLSTATUS.{LOCK,CLKRDY}
+    #                                 synthesised from the matching
+    #                                 ENABLE writes; otherwise storeback.
+    #   - pm      (0x40000400, 0x80)  APB{A,B,C}MASK clock-enable bits.
+    #   - nvmctrl (0x41004000, 0x80)  CTRLB wait-state cfg.
+    #   - wdt     (0x40001000, 0x10)  watchdog_init writes
+    #                                 CONFIG/CTRL; watchdog_reset
+    #                                 polls STATUS.SYNCBUSY (default
+    #                                 0 from storeback) and writes
+    #                                 CLEAR.
+    'samd21g18': [
+        ('gclk', 0x40000C00, 0x20, _SAMD21_GCLK_STUB_PY),
+        ('sysctrl', 0x40000800, 0x80, _SAMD21_SYSCTRL_STUB_PY),
+        ('pm', 0x40000400, 0x80, _SAMD_STOREBACK_PY),
+        ('nvmctrl', 0x41004000, 0x80, _SAMD_STOREBACK_PY),
+        ('wdt', 0x40001000, 0x10, _SAMD_STOREBACK_PY),
+    ],
     'samd51p20': [
         ('oscctrl', 0x40001000, 0x80, _SAMD_OSCCTRL_STUB_PY),
         ('osc32kctrl', 0x40001400, 0x40, _SAMD_OSC32KCTRL_STUB_PY),

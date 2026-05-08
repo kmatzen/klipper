@@ -1242,8 +1242,11 @@ class TestCase:
         # ships an upstream platform (SAM4S, SAME70) or for which we
         # carry a local platform + Python.PythonPeripheral stubs
         # (SAM3X / SAM4E reuse the SAM4S_EEFC + flipflop PMC_SR
-        # pattern; SAMD51 carries full OSCCTRL/GCLK/MCLK stubs;
-        # LPC176x carries an LPC_SC clock-controller stub paired
+        # pattern; SAMD21 carries GCLK SWRST self-clear and SYSCTRL
+        # PCLKSR/DPLLSTATUS bit synthesis on top of the upstream
+        # SAMD21_Timer + SAMD5_UART models; SAMD51 carries full
+        # OSCCTRL/GCLK/MCLK stubs; LPC176x carries an LPC_SC
+        # clock-controller stub paired
         # with the upstream NS16550 UART model; HC32F460 carries a
         # full local USART model in C# loaded via `i @file.cs` plus
         # storeback stubs for INTC/PORT/PWC/SYSREG/EFM since HDSC
@@ -1258,6 +1261,8 @@ class TestCase:
             return 'renode'
         if (base.startswith('sam3x') or base.startswith('sam4')
                 or base.startswith('same70')):
+            return 'renode'
+        if base.startswith('samd21'):
             return 'renode'
         if base.startswith('samd51'):
             return 'renode'
