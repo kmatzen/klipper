@@ -20,7 +20,7 @@ TEMP_EMU_CTL = "_test_emu.ctl"
 # Maximum wall-clock seconds klippy is allowed to run in emulator mode
 # before we conclude the test is hung. Klippy in real-mcu mode does not
 # exit on stdin EOF; we kill it after a timeout and rely on log checks.
-EMULATOR_KLIPPY_DEADLINE = 20.0
+EMULATOR_KLIPPY_DEADLINE = 180.0
 SERIAL_PLACEHOLDER = "__EMULATOR_PTY__"
 
 
@@ -393,14 +393,15 @@ class TestCase:
                 # simavr_bridge: --slave-link is a pty symlink klippy
                 # connects to, --control-socket accepts the same
                 # newline-terminated fixture commands that
-                # _push_fixture_to_control_socket emits. Sim-time and
-                # tick-mode are not yet wired through Renode (real-time
-                # only on first cut); the flags are accepted-and-ignored
-                # by the launcher so the dispatch above can stay
-                # uniform. --fixture-file lets the launcher self-apply
-                # the fixture's analog_in / i2c_default keys (which
-                # simavr_bridge.c handles internally from the file
-                # rather than over the control socket).
+                # _push_fixture_to_control_socket emits.
+                # --tick-socket activates deterministic mode: the
+                # launcher RunFor's renode for exactly the virtual
+                # time klippy requests over the unix socket, same
+                # wire protocol as simavr's tick mode. --fixture-file
+                # lets the launcher self-apply the fixture's
+                # analog_in / i2c_default keys (which simavr_bridge.c
+                # handles internally from the file rather than over
+                # the control socket).
                 renode_args = [
                     sys.executable, renode_launcher,
                     '--elf', b['elf'],
@@ -411,6 +412,24 @@ class TestCase:
                 ]
                 if fixture_path is not None:
                     renode_args += ['--fixture-file', fixture_path]
+                if sim_time_enabled:
+                    stf = os.path.join(self.tempdir, 'sim_time' + sfx)
+                    try:
+                        os.unlink(stf)
+                    except OSError:
+                        pass
+                    renode_args += ['--sim-time-file', stf]
+                    if canonical_sim_time_file is None:
+                        canonical_sim_time_file = stf
+                if tick_mode_enabled:
+                    tsp = os.path.join(self.tempdir,
+                                       'tick_sock' + sfx)
+                    try:
+                        os.unlink(tsp)
+                    except OSError:
+                        pass
+                    renode_args += ['--tick-socket', tsp]
+                    tick_socket_paths.append(tsp)
                 b['args'] = renode_args
                 continue
             args = [
@@ -494,7 +513,7 @@ class TestCase:
                 self._push_fixture_to_control_socket(
                     b['ctl_socket'], fixture_path, config_fname,
                     sim_time_enabled=sim_time_enabled,
-                    mcu_name=b['mcu'])
+                    mcu_name=b['mcu'], backend=b['backend'])
             self._materialize_emulator_config(config_fname, cfg_path,
                                               bridges)
             klippy_args = [sys.executable, './klippy/klippy.py', cfg_path,
@@ -626,6 +645,8 @@ class TestCase:
         r'^\[(tmc220[89])\s+\S+\]\s*$')
     _TMC_UART_PIN_RE = re.compile(
         r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+    _TMC_UART_TX_PIN_RE = re.compile(
+        r'^\s*tx_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
     _TMC2660_SECTION_RE = re.compile(
         r'^\[tmc2660\s+\S+\]\s*$')
     _TMC2660_CS_PIN_RE = re.compile(
@@ -643,10 +664,15 @@ class TestCase:
 
     @classmethod
     def _parse_tmc_uart_pins(cls, config_fname):
-        # Yield uart_pin (e.g. "PA5") for every [tmc2208 ...] / [tmc2209
-        # ...] section. Pins are emitted in section-declaration order.
+        # Yield (uart_pin, tx_pin) for every [tmc2208 ...] / [tmc2209
+        # ...] section. uart_pin (the firmware-side RX) always exists;
+        # tx_pin defaults to uart_pin (single-wire mode) when the
+        # section omits it. Pins are emitted in section-declaration
+        # order.
         pins = []
         in_section = False
+        cur_uart = None
+        cur_tx = None
         try:
             f = open(config_fname)
         except OSError:
@@ -655,14 +681,26 @@ class TestCase:
             for line in f:
                 stripped = line.strip()
                 if stripped.startswith('['):
+                    if in_section and cur_uart is not None:
+                        pins.append((cur_uart,
+                                     cur_tx if cur_tx is not None else cur_uart))
                     in_section = bool(cls._TMC_UART_SECTION_RE.match(stripped))
+                    cur_uart = None
+                    cur_tx = None
                     continue
                 if not in_section:
                     continue
                 m = cls._TMC_UART_PIN_RE.match(line)
                 if m:
-                    pins.append(m.group(2))
-                    in_section = False
+                    cur_uart = m.group(2)
+                    continue
+                m = cls._TMC_UART_TX_PIN_RE.match(line)
+                if m:
+                    cur_tx = m.group(2)
+                    continue
+            if in_section and cur_uart is not None:
+                pins.append((cur_uart,
+                             cur_tx if cur_tx is not None else cur_uart))
         finally:
             f.close()
         return pins
@@ -865,7 +903,7 @@ class TestCase:
     def _push_fixture_to_control_socket(self, socket_path, fixture_path,
                                         config_fname=None,
                                         sim_time_enabled=False,
-                                        mcu_name='mcu'):
+                                        mcu_name='mcu', backend='simavr'):
         # Translate the JSON fixture into newline-terminated commands
         # the simavr bridge understands and write them through the
         # control socket. Connection retries briefly because the
@@ -996,18 +1034,28 @@ class TestCase:
             # so round-trip: raw / 8184 ~= mv / 5000.
             return int(raw_value * 5000 / 8184)
 
-        if 'default_value' in adc_default:
+        # The simavr bridge speaks mV-at-5V over the control socket;
+        # the renode launcher reads the fixture file directly via
+        # --fixture-file and applies analog_in_default / analog_in
+        # through renode_hooks.adc_default / adc_set against whatever
+        # ADC peripheral the platform mounts (AFEC for SAM, STM32_ADC
+        # for STM32, ...). Don't dual-emit on the control socket - the
+        # mV value would arrive at the launcher passthrough as
+        # `renode_hooks.adc(ch, mv)` which doesn't exist.
+        renode_backend = (backend == 'renode')
+        if 'default_value' in adc_default and not renode_backend:
             mv = _raw_to_mv(adc_default['default_value'])
             for ch in range(16):
                 lines.append("adc %d %d" % (ch, mv))
         # by_pin overrides for specific physical ADC pins. atmega
         # ADC channel mapping: ADC0..ADC7 = PF0..PF7, ADC8..ADC15 =
         # PK0..PK7 (atmega2560 only - the smaller AVRs cap at ADC7).
-        for pin_name, raw_value in adc_default.get('by_pin', {}).items():
-            ch = self._adc_channel_for_pin(pin_name)
-            if ch is None:
-                continue
-            lines.append("adc %d %d" % (ch, _raw_to_mv(raw_value)))
+        if not renode_backend:
+            for pin_name, raw_value in adc_default.get('by_pin', {}).items():
+                ch = self._adc_channel_for_pin(pin_name)
+                if ch is None:
+                    continue
+                lines.append("adc %d %d" % (ch, _raw_to_mv(raw_value)))
         # _hot_extruder_N entries in the fixture's analog_in block
         # apply a hot ADC value (default ~190 C with EPCOS 100K) to
         # the Nth [extruder*] section's sensor_pin in the cfg, so
@@ -1032,6 +1080,8 @@ class TestCase:
                     continue
                 rv = spec.get('default_value')
                 if rv is None:
+                    continue
+                if renode_backend:
                     continue
                 lines.append("adc %d %d" % (ch, _raw_to_mv(rv)))
         # spi_response: a hex byte stream the bridge round-robins
@@ -1122,18 +1172,39 @@ class TestCase:
                     sda[1], int(sda[2:])))
         # Software UART: scan the cfg for [tmc2208/2209 ...] sections
         # and configure the bridge's UART slave model on each uart_pin.
-        # The bridge decodes the bit-banged datagrams (TMC2208/2209
-        # half-duplex single-wire UART), services WREG/RREG against a
-        # per-chip register file, and pulses the response back over
-        # the same wire so klippy's tmc_uart driver succeeds in
-        # emulator mode.  bit_time defaults to 1778 cycles
-        # (TMC_BAUD_RATE_AVR=9000 baud at 16 MHz).  Override via
-        # `sw_uart_bit_time_cycles` in the fixture if needed.
+        # Two emit forms:
+        #
+        #   simavr (4 args): "sw_uart <port> <pin> <bit_time> <addr>"
+        #     The simavr bridge handles AVR firmware which uses
+        #     single-wire mode (rx_pin == tx_pin); the sw_uart hook
+        #     decodes RX and drives TX from the same wire. bit_time is
+        #     in AVR cycles (1778 = TMC_BAUD_RATE_AVR 9000 baud at 16
+        #     MHz).
+        #
+        #   renode (6 args): "sw_uart <rx_port> <rx_pin> <tx_port>
+        #                              <tx_pin> <bit_time> <addr>"
+        #     ARM firmware (e.g. duet2-maestro) uses separate
+        #     uart_pin/tx_pin. renode_hooks.sw_uart drives the firmware-
+        #     side RX pin via CPU PC hooks on tmcuart_read_event etc.;
+        #     bit_time is unused on this path (the hooks fire at the
+        #     firmware's own bit boundaries) but kept for arg-shape
+        #     symmetry with the simavr form.
         if raw.get('sw_uart_auto', True) and config_fname is not None:
             bit_time = int(raw.get('sw_uart_bit_time_cycles', 1778))
-            for upin in self._parse_tmc_uart_pins(config_fname):
-                if (len(upin) >= 3 and upin[0] == 'P'
+            for entry in self._parse_tmc_uart_pins(config_fname):
+                upin, tpin = entry
+                if not (len(upin) >= 3 and upin[0] == 'P'
                         and upin[1].isalpha()):
+                    continue
+                if backend == 'renode':
+                    if not (len(tpin) >= 3 and tpin[0] == 'P'
+                            and tpin[1].isalpha()):
+                        continue
+                    lines.append("sw_uart %s %d %s %d %d 0" % (
+                        upin[1], int(upin[2:]),
+                        tpin[1], int(tpin[2:]),
+                        bit_time))
+                else:
                     lines.append("sw_uart %s %d %d 0" % (
                         upin[1], int(upin[2:]), bit_time))
         # gpio: list of [port_letter, pin, value] triples. Drives the
@@ -1217,7 +1288,12 @@ class TestCase:
                 # before all 3 inputs have updated.
                 barrier_us = 2000000 if sim_time_enabled else 500000
                 sock.sendall(b'barrier %d\n' % barrier_us)
-                sock.settimeout(5.0)
+                # Renode boot takes ~30s; the launcher pre-binds the
+                # control socket so sendall doesn't block, but the
+                # ctl_thread only processes the queued commands +
+                # barrier after Renode is up. Wait long enough to
+                # cover boot plus the barrier's RunFor.
+                sock.settimeout(60.0 if backend == 'renode' else 5.0)
                 ack = b''
                 while b'\n' not in ack and len(ack) < 16:
                     chunk = sock.recv(16 - len(ack))

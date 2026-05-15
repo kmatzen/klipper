@@ -64,7 +64,11 @@ _PLATFORM_FOR_CHIP = {
     'stm32h743': '@platforms/cpus/stm32h743.repl',
     'sam3x8c': _local('sam3x8e.repl'),
     'sam3x8e': _local('sam3x8e.repl'),
-    'sam4s8c': '@platforms/cpus/sam4s8b.repl',
+    # Local copy of upstream sam4s.repl that OMITS the upstream
+    # `adc: Analog.SAM4S_ADC` so test/emulator/sam4s_adc_stub.py can
+    # claim 0x40038000. Memory layout matches sam4s8b (512KB flash +
+    # 128KB sram) which is the same as sam4s8c.
+    'sam4s8c': _local('sam4s8c.repl'),
     'sam4e8e': _local('sam4e8e.repl'),
     'same70q20b': _local('same70q20b.repl'),
     'same70q20b-usb': _local('same70q20b.repl'),
@@ -119,6 +123,14 @@ _RCC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 _AFEC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'afec_stub.py')
+
+# SAM4S has an `ADC` peripheral (not AFEC) at 0x40038000 with a
+# different register layout. Renode upstream's Analog.SAM4S_ADC model
+# accepts the register writes but never feeds samples, so all channels
+# read 0 - which trips adc_scaled's (vref - vssa) divisor in klippy.
+# This stub mimics the AFEC stub but with the ADC register map.
+_SAM4S_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'sam4s_adc_stub.py')
 
 # SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
 # check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
@@ -223,6 +235,17 @@ _AFEC_BASES_FOR_CHIP = {
     'sam4e8e': (0x400B0000, 0x400B4000),
     'same70q20b': (0x4003C000, 0x40064000),
     'same70q20b-usb': (0x4003C000, 0x40064000),
+    # SAM4S has an ADC (not AFEC) at 0x40038000. Local sam4s8c.repl
+    # OMITS the upstream `adc: Analog.SAM4S_ADC` so this Python stub
+    # can claim the address.
+    'sam4s8c': (0x40038000,),
+}
+
+# Override the default afec_stub.py per chip. The SAM4S ADC uses
+# different registers (ADC_CHER/CHDR/CHSR/CR/ISR/LCDR) from AFEC
+# (AFE_CR/CHSR/LCDR/ISR/CSELR/CDR), so it needs its own stub.
+_ADC_STUB_FOR_CHIP = {
+    'sam4s8c': _SAM4S_ADC_STUB_PY,
 }
 
 # Per-chip extra Python.PythonPeripheral stubs to inject after the
@@ -444,7 +467,8 @@ def _allocate_tcp_port():
     return port
 
 
-def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
+def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
+                 tick_mode=False):
     # The .resc Renode runs on startup. mach create + LoadPlatform +
     # the RCC PythonPeripheral stub (so clock setup completes) +
     # LoadELF + UartPtyTerminal connected to USART1 + include of
@@ -466,6 +490,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
             'filename: \\"{stub}\\" }}"\n'
         ).format(rcc=rcc_base, stub=_RCC_STUB_PY)
     afec_bases = _AFEC_BASES_FOR_CHIP.get(chip, ())
+    afec_stub = _ADC_STUB_FOR_CHIP.get(chip, _AFEC_STUB_PY)
     afec_block = ''
     for idx, base in enumerate(afec_bases):
         afec_block += (
@@ -473,7 +498,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
             '"afec{idx}: Python.PythonPeripheral @ sysbus 0x{base:08X} '
             '{{ size: 0x200; initable: true; '
             'filename: \\"{stub}\\" }}"\n'
-        ).format(idx=idx, base=base, stub=_AFEC_STUB_PY)
+        ).format(idx=idx, base=base, stub=afec_stub)
     extra_stubs = _EXTRA_PERIPHERAL_STUBS_FOR_CHIP.get(chip, ())
     extra_block = ''
     for name, base, size, stub in extra_stubs:
@@ -507,6 +532,18 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
                           'sysbus LoadELF @{elf}\n').format(elf=elf_path)
     else:
         elf_load_block = 'sysbus LoadELF @{elf}\n'.format(elf=elf_path)
+    usart = _host_link_peripheral(chip)
+    if tick_mode:
+        # Tick mode: skip Renode's pty terminal entirely. The launcher
+        # creates an openpty() pair itself and shuttles bytes through
+        # renode_hooks.serial_init / serial_write_hex / serial_drain_hex
+        # synchronously with each emulation RunFor.
+        uart_block = ''
+    else:
+        uart_block = (
+            'emulation CreateUartPtyTerminal "uartTerm" "%s"\n'
+            'connector Connect sysbus.%s uartTerm\n'
+        ) % (pty_path, usart)
     return (
         'using sysbus\n'
         'mach create "klipper-{chip}"\n'
@@ -518,16 +555,28 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path):
         '{elf_load_block}'
         'logFile @{log}\n'
         'logLevel 1\n'
-        'emulation CreateUartPtyTerminal "uartTerm" "{pty}"\n'
-        'connector Connect sysbus.{usart} uartTerm\n'
-        'i @{hooks}\n'
+        '{uart_block}'
+        # Add the hooks directory to sys.path so `import renode_hooks`
+        # resolves it as a module, then import and call set_monitor.
+        # Earlier launcher iterations used `i @file.py` which evaluates
+        # the file's contents in the Monitor's Python ScriptScope and
+        # copies top-level names into the Monitor scope - which makes
+        # bare-name step_trigger() calls work but leaves the *module*
+        # namespace's `_M = None`, so cpu-PC-hook callbacks dispatched
+        # by Renode (which run in the renode_hooks module scope, not
+        # the Monitor scope) crash with 'NoneType has no attribute
+        # Machine'. Importing as a real module and using the qualified
+        # `renode_hooks.X(...)` form on the call side keeps a single
+        # consistent namespace.
+        'python "import sys; sys.path.append(\\"{hooks_dir}\\")"\n'
         'python "import renode_hooks; renode_hooks.set_monitor(monitor)"\n'
     ).format(chip=chip, platform=platform,
-             log=log_path, pty=pty_path, rcc_block=rcc_block,
+             log=log_path, rcc_block=rcc_block,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
              elf_load_block=elf_load_block,
-             usart=_host_link_peripheral(chip), hooks=_HOOKS_PY)
+             uart_block=uart_block,
+             hooks_dir=os.path.dirname(_HOOKS_PY))
 
 
 def _wait_for_path(path, deadline, poll=0.05):
@@ -583,10 +632,10 @@ def _drain_monitor_until_prompt(sock, timeout=10.0):
             return buf
 
 
-def _send_monitor(sock, line):
+def _send_monitor(sock, line, timeout=10.0):
     # Trailing \n is required; carriage return optional but harmless.
     sock.sendall((line + '\n').encode('utf-8'))
-    return _drain_monitor_until_prompt(sock)
+    return _drain_monitor_until_prompt(sock, timeout=timeout)
 
 
 # ---------------------------------------------------------------------
@@ -600,10 +649,10 @@ def _send_monitor(sock, line):
 
 def _xlat_step_trigger(parts):
     # step_trigger <step_port> <step_pin> <count> <trig_port> <trig_pin> <val>
-    # eg "step_trigger A 5 100 B 7 1" -> "step_trigger('A', 5, 100, 'B', 7, 1)"
+    # eg "step_trigger A 5 100 B 7 1" -> "renode_hooks.step_trigger(...)"
     if len(parts) != 7:
         return None
-    return ("step_trigger('%s', %d, %d, '%s', %d, %d)"
+    return ("renode_hooks.step_trigger('%s', %d, %d, '%s', %d, %d)"
             % (parts[1], int(parts[2]), int(parts[3]),
                parts[4], int(parts[5]), int(parts[6])))
 
@@ -613,7 +662,7 @@ def _xlat_probe_step(parts):
     #            <trig_port> <trig_pin> <val>
     if len(parts) != 8:
         return None
-    return ("probe_step('%s', %d, %d, %d, '%s', %d, %d)"
+    return ("renode_hooks.probe_step('%s', %d, %d, %d, '%s', %d, %d)"
             % (parts[1], int(parts[2]), int(parts[3]), int(parts[4]),
                parts[5], int(parts[6]), int(parts[7])))
 
@@ -622,7 +671,7 @@ def _xlat_bltouch(parts):
     # bltouch <ctrl_port> <ctrl_pin> <sensor_port> <sensor_pin> <invert>
     if len(parts) != 6:
         return None
-    return ("bltouch('%s', %d, '%s', %d, %d)"
+    return ("renode_hooks.bltouch('%s', %d, '%s', %d, %d)"
             % (parts[1], int(parts[2]), parts[3], int(parts[4]),
                int(parts[5])))
 
@@ -631,8 +680,31 @@ def _xlat_gpio(parts):
     # gpio <port> <pin> <val>
     if len(parts) != 4:
         return None
-    return ("gpio_set('%s', %d, %d)"
+    return ("renode_hooks.gpio_set('%s', %d, %d)"
             % (parts[1], int(parts[2]), int(parts[3])))
+
+
+def _xlat_sw_uart(parts):
+    # The fixture runner emits two forms of `sw_uart`:
+    #   simavr (4 args): sw_uart <port> <pin> <bit_time> <addr>
+    #     - AVR firmware uses single-wire mode (rx_pin == tx_pin); the
+    #       simavr bridge takes one pin and registers an IRQ hook that
+    #       both decodes RX and drives TX from the same wire.
+    #   renode (6 args): sw_uart <rx_port> <rx_pin> <tx_port> <tx_pin>
+    #                            <bit_time> <addr>
+    #     - ARM firmware (e.g. duet2-maestro on SAM4S) uses separate
+    #       uart_pin/tx_pin. Renode's hook implementation
+    #       (renode_hooks.sw_uart) drives RX bit-by-bit via CPU PC hooks
+    #       on tmcuart_read_event etc., so it needs both pins explicitly.
+    #
+    # AVR runs through simavr, never through this launcher, so the 4-arg
+    # form would only land here if someone misroutes a fixture. Reject
+    # it cleanly rather than silently registering a half-broken hook.
+    if len(parts) == 7:
+        return ("renode_hooks.sw_uart('%s', %d, '%s', %d, %d, %d)"
+                % (parts[1], int(parts[2]), parts[3], int(parts[4]),
+                   int(parts[5]), int(parts[6])))
+    return None
 
 
 def _xlat_passthrough(parts):
@@ -641,7 +713,7 @@ def _xlat_passthrough(parts):
     # long as renode_hooks.py grows the matching function.
     name = parts[0]
     args = ', '.join(repr(p) for p in parts[1:])
-    return "%s(%s)" % (name, args)
+    return "renode_hooks.%s(%s)" % (name, args)
 
 
 _XLAT = {
@@ -649,7 +721,63 @@ _XLAT = {
     'probe_step': _xlat_probe_step,
     'bltouch': _xlat_bltouch,
     'gpio': _xlat_gpio,
+    'sw_uart': _xlat_sw_uart,
 }
+
+
+# Firmware symbols renode_hooks.sw_uart needs to attach CPU PC hooks
+# to. The launcher resolves these via sysbus.GetAllSymbolAddresses
+# right after LoadELF and pushes the dict to renode_hooks via
+# apply_sw_uart_symbols(). Symbols absent from the firmware (e.g.
+# configs without [tmc2208 ...] sections that don't link tmcuart.o)
+# are silently skipped - the hook installer no-ops if any required
+# symbol is missing.
+_SW_UART_SYMBOLS = (
+    'command_tmcuart_send',
+    'tmcuart_send_finish_event',
+    'tmcuart_read_sync_event',
+    'tmcuart_read_event',
+)
+
+
+def _resolve_sched_status_addr(monitor_sock):
+    # Resolve the firmware's SchedStatus struct address so
+    # renode_hooks.peek_shutdown_reason() can read byte +11
+    # (shutdown_reason) directly. Used to surface the firmware's
+    # shutdown reason BEFORE klippy decodes it - klippy can't decode
+    # the shutdown response message until the dict is loaded, so
+    # firmware shutdowns during identify are otherwise opaque.
+    cmd = (
+        'python "import renode_hooks; '
+        'sb = monitor.Machine[\\"sysbus\\"]; '
+        'a = list(sb.GetAllSymbolAddresses(\\"SchedStatus\\")); '
+        'renode_hooks.apply_sched_status_addr(int(a[0]) if a else 0)"')
+    try:
+        _send_monitor(monitor_sock, cmd)
+    except Exception as e:
+        sys.stderr.write("renode_launcher: SchedStatus resolve err %s\n" % e)
+
+
+def _resolve_sw_uart_symbols(monitor_sock):
+    # Resolve the firmware tmcuart_* symbols and push the dict to
+    # renode_hooks via apply_sw_uart_symbols. Configs without
+    # [tmc2208 ...] sections don't link tmcuart.o; absent symbols
+    # come back as empty lists from GetAllSymbolAddresses and are
+    # omitted by the dict comprehension's `if` guard. The hook
+    # installer no-ops if any required symbol is missing.
+    sym_list = ', '.join("'%s'" % s for s in _SW_UART_SYMBOLS)
+    cmd = (
+        'python "import renode_hooks; '
+        'sb = monitor.Machine[\\"sysbus\\"]; '
+        'renode_hooks.apply_sw_uart_symbols(dict('
+        '(n, int(list(sb.GetAllSymbolAddresses(n))[0])) '
+        'for n in [%s] if list(sb.GetAllSymbolAddresses(n))))"'
+        % sym_list)
+    try:
+        _send_monitor(monitor_sock, cmd)
+    except Exception as e:
+        sys.stderr.write("renode_launcher: sw_uart symbol resolve "
+                         "send err %s\n" % e)
 
 
 # Default I2C addresses to register the empty fixture's
@@ -660,6 +788,446 @@ _XLAT = {
 # I2C devices in printer configs get probed with their own register
 # vocabularies; expand this list as concrete tests surface failures.
 _DEFAULT_I2C_ADDRS = (0x2a, 0x29)
+
+
+# --------------------------------------------------------------------
+# Deterministic tick-mode driver.
+#
+# When --tick-socket is set we DO NOT issue Renode's `start` Monitor
+# command (which kicks off wall-clock-paced execution). Instead the
+# CPU only advances inside Monitor `python "...RunFor(...)"` calls
+# the tick thread issues in response to klippy's `advance T\n` lines.
+# All RunFor calls go through a single lock so the control-socket
+# loop's barrier / fixture-push paths can also use the helper without
+# racing.
+#
+# Probed and confirmed against Renode 1.16.1:
+#   monitor.Machine.LocalTimeSource.RunFor(TimeInterval.FromMicroseconds(N))
+#   monitor.Machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds
+# RunFor is synchronous (the `python "..."` Monitor response only
+# arrives after RunFor returns) so the launcher can treat the
+# Monitor reply as the "advance complete" signal.
+
+def _setup_tick_pty(slave_link):
+    # Open a fresh pty pair; keep the master fd in this process for
+    # synchronous byte shuttle between klippy and the firmware UART.
+    # Klippy connects to the slave end via slave_link; we close the
+    # slave fd here since klippy reopens it. Master is set raw so 8-bit
+    # binary klipper protocol bytes pass through unchanged AND
+    # non-blocking so _drain_pty_klippy_writes can poll without hanging
+    # the tick loop.
+    import pty as _pty
+    import termios
+    import fcntl
+    master_fd, slave_fd = _pty.openpty()
+    slave_path = os.ttyname(slave_fd)
+    os.close(slave_fd)
+    try:
+        attrs = termios.tcgetattr(master_fd)
+        iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+        iflag = 0
+        oflag = 0
+        lflag = 0
+        cflag |= termios.CS8
+        cc[termios.VMIN] = 0
+        cc[termios.VTIME] = 0
+        termios.tcsetattr(master_fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag,
+                           ispeed, ospeed, cc])
+    except (termios.error, OSError) as e:
+        sys.stderr.write("renode_launcher: tick pty raw mode err %s\n"
+                         % e)
+    try:
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except OSError as e:
+        sys.stderr.write("renode_launcher: tick pty O_NONBLOCK err %s\n"
+                         % e)
+    try:
+        os.unlink(slave_link)
+    except OSError:
+        pass
+    os.symlink(slave_path, slave_link)
+    return master_fd
+
+
+def _make_tick_state(sim_time_file=None):
+    import threading
+    state = {
+        'lock': threading.Lock(),
+        # Cumulative microseconds we have requested via RunFor. Used
+        # to compute the per-call delta for klippy's monotonic
+        # `advance T` targets and to populate the `done T_actual`
+        # reply.
+        'virt_us': 0,
+        'tx_bytes_total': 0,
+        'rx_bytes_total': 0,
+        # Optional mmap'd 8-byte double matching simavr_bridge.c's
+        # --sim-time-file format. Klippy reads this via
+        # KLIPPY_SIM_TIME_FILE so its monotonic clock advances in
+        # lockstep with our RunFor calls. Without it klippy would
+        # use wall time and immediately race ahead of virtual time.
+        'sim_time_mmap': None,
+    }
+    if sim_time_file:
+        try:
+            import mmap as _mmap
+            fd = os.open(sim_time_file,
+                         os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.write(fd, b'\x00' * 8)
+                state['sim_time_mmap'] = _mmap.mmap(
+                    fd, 8, _mmap.MAP_SHARED,
+                    _mmap.PROT_READ | _mmap.PROT_WRITE)
+            finally:
+                os.close(fd)
+        except (OSError, ValueError) as e:
+            sys.stderr.write(
+                "renode_launcher: sim-time-file %s init err %s\n"
+                % (sim_time_file, e))
+    return state
+
+
+def _tick_publish_sim_time(tick_state):
+    m = tick_state['sim_time_mmap']
+    if m is None:
+        return
+    try:
+        import struct
+        struct.pack_into('d', m, 0, tick_state['virt_us'] / 1e6)
+    except Exception as e:
+        sys.stderr.write("renode_launcher: sim-time write err %s\n"
+                         % e)
+
+
+_HEX_RE = re.compile(rb'\n\r([0-9a-fA-F]*)\([\w-]+\)\s')
+
+
+def _drain_pty_klippy_writes(master_fd):
+    # Non-blocking drain of bytes klippy wrote to the slave. Returns
+    # bytes object (possibly empty). BlockingIOError is the normal
+    # "nothing to read" exit; OSError (typically EIO when the slave
+    # has been closed between klippy attempts) is also non-fatal -
+    # the next slave open will reopen the pty.
+    if master_fd is None:
+        return b''
+    chunks = []
+    while True:
+        try:
+            d = os.read(master_fd, 4096)
+        except (BlockingIOError, OSError):
+            break
+        if not d:
+            break
+        chunks.append(d)
+    return b''.join(chunks)
+
+
+def _tick_run_for(monitor_sock, tick_state, delta_us, master_fd=None):
+    # Advance virtual time by `delta_us` microseconds via the
+    # `emulation RunFor "<seconds>"` Monitor command (= EmulationManager
+    # .Instance.CurrentEmulation.RunFor, the global master time source).
+    # Routing through Machine.LocalTimeSource.RunFor instead is also
+    # offered by the API but is wall-clock-paced (1100x slower than
+    # real-time even on idle firmware) and not viable for CI. The
+    # Monitor variant runs at near 1:1 virtual:wall on this host,
+    # actually faster than real-time when firmware is idle.
+    #
+    # In tick mode (master_fd != None) we additionally shuttle UART
+    # bytes synchronously: drain klippy writes BEFORE RunFor so the
+    # firmware sees them this quantum, drain firmware-emitted bytes
+    # AFTER RunFor and write them to the pty so klippy's serialqueue
+    # poll() sees them on its next wake-up.
+    if delta_us <= 0 and master_fd is None:
+        return
+    tx_bytes = b''
+    with tick_state['lock']:
+        if master_fd is not None:
+            tx_bytes = _drain_pty_klippy_writes(master_fd)
+            if tx_bytes:
+                tick_state['tx_bytes_total'] += len(tx_bytes)
+        if delta_us > 0 and master_fd is not None:
+            # 3-step shuttle:
+            #   1. serial_write_hex(klippy_tx_bytes)   - inject to UART
+            #   2. emulation RunFor "<sec>"            - advance virt time
+            #   3. serial_drain_hex()                  - capture firmware TX
+            # The RunFor must go through the Monitor command form
+            # (`emulation RunFor "X"`), NOT through the IronPython
+            # call EmulationManager.Instance.CurrentEmulation.RunFor:
+            # the latter is wall-clock-paced (1000x slower than
+            # real-time even on idle firmware), the Monitor command
+            # is near 1:1.
+            if tx_bytes:
+                tx_hex = ''.join('%02x' % b for b in tx_bytes)
+                cmd = ('python "renode_hooks.serial_write_hex(\'%s\')"'
+                       % tx_hex)
+                try:
+                    _send_monitor(monitor_sock, cmd, timeout=30.0)
+                except Exception as e:
+                    sys.stderr.write(
+                        "renode_launcher: tick TX err %s\n" % e)
+                    return
+            cmd = 'emulation RunFor "%.6f"' % (delta_us / 1e6)
+            try:
+                _send_monitor(monitor_sock, cmd, timeout=120.0)
+            except Exception as e:
+                sys.stderr.write(
+                    "renode_launcher: tick RunFor err %s\n" % e)
+                return
+            tick_state['virt_us'] += int(delta_us)
+            _tick_publish_sim_time(tick_state)
+            cmd = ('python "import sys; '
+                   'sys.stdout.write(renode_hooks.serial_drain_hex() '
+                   'or \\"\\")"')
+            try:
+                resp = _send_monitor(monitor_sock, cmd, timeout=30.0)
+            except Exception as e:
+                sys.stderr.write(
+                    "renode_launcher: tick RX drain err %s\n" % e)
+                return
+            m = _HEX_RE.search(resp)
+            if m:
+                hex_b = m.group(1)
+                if hex_b:
+                    try:
+                        rx_bytes = bytes.fromhex(
+                            hex_b.decode('ascii'))
+                    except ValueError as e:
+                        sys.stderr.write(
+                            "renode_launcher: tick RX bad hex %r: %s\n"
+                            % (hex_b[:60], e))
+                        return
+                    tick_state['rx_bytes_total'] += len(rx_bytes)
+                    try:
+                        os.write(master_fd, rx_bytes)
+                    except OSError:
+                        pass
+            return
+        if delta_us > 0:
+            # Adaptive RunFor with early-out:
+            #
+            # If klippy just sent TX bytes (it's expecting a response),
+            # break the advance into small chunks and bail out as soon
+            # as the firmware emits bytes. This keeps each request /
+            # response round trip to ~1 ms of sim time so klippy's
+            # 5 s connect window can fit hundreds of round trips
+            # (identify of a 9.7 KB dictionary at 40 bytes/chunk
+            # needs ~250 round trips).
+            #
+            # One RunFor per advance request; drain firmware-emitted
+            # bytes afterwards.
+            cmd = 'emulation RunFor "%.6f"' % (delta_us / 1e6)
+            try:
+                _send_monitor(monitor_sock, cmd, timeout=120.0)
+            except Exception as e:
+                sys.stderr.write(
+                    "renode_launcher: tick RunFor err %s\n" % e)
+                return
+            tick_state['virt_us'] += delta_us
+            _tick_publish_sim_time(tick_state)
+            if master_fd is not None:
+                _drain_firmware_to_pty(
+                    monitor_sock, tick_state, master_fd)
+        elif master_fd is not None:
+            # delta_us == 0: still drain any pending firmware emission
+            # in case bytes arrived during a previous RunFor that we
+            # bailed out of early.
+            _drain_firmware_to_pty(monitor_sock, tick_state, master_fd)
+
+
+def _drain_firmware_to_pty(monitor_sock, tick_state, master_fd):
+    cmd = ('python "import sys; '
+           'sys.stdout.write(renode_hooks.serial_drain_hex() '
+           'or \\"\\")"')
+    try:
+        resp = _send_monitor(monitor_sock, cmd, timeout=30.0)
+    except Exception as e:
+        sys.stderr.write(
+            "renode_launcher: tick RX drain err %s\n" % e)
+        return b''
+    m = _HEX_RE.search(resp)
+    if not m:
+        return b''
+    hex_b = m.group(1)
+    if not hex_b:
+        return b''
+    try:
+        rx_bytes = bytes.fromhex(hex_b.decode('ascii'))
+    except ValueError as e:
+        sys.stderr.write(
+            "renode_launcher: tick RX bad hex %r: %s\n"
+            % (hex_b[:60], e))
+        return b''
+    tick_state['rx_bytes_total'] += len(rx_bytes)
+    sys.stderr.write(
+        "renode_launcher: tick RX %d bytes (head=%r)\n"
+        % (len(rx_bytes), rx_bytes[:32]))
+    try:
+        os.write(master_fd, rx_bytes)
+    except OSError as e:
+        sys.stderr.write(
+            "renode_launcher: tick RX pty write err %s\n" % e)
+    return rx_bytes
+
+
+def _bind_control_socket(sock_path):
+    # Bind+listen the AF_UNIX control socket synchronously at launcher
+    # startup. The runner's _push_fixture_to_control_socket connect
+    # retry is short (~2s); Renode boot is ~30s. Without early bind
+    # the runner would silently miss publishing the fixture and the
+    # sw_uart / step_trigger / gpio hooks would never register. The
+    # ctl_thread launched after Renode boots accepts on this pre-bound
+    # srv and reads any commands the runner queued during boot.
+    try:
+        os.unlink(sock_path)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(sock_path)
+    except OSError as e:
+        sys.stderr.write("renode_launcher: ctl bind(%s) err %s\n"
+                         % (sock_path, e))
+        return None
+    try:
+        os.chmod(sock_path, 0o666)
+    except OSError:
+        pass
+    srv.listen(1)
+    srv.settimeout(0.5)
+    return srv
+
+
+def _bind_tick_socket(tick_path):
+    # Bind+listen the AF_UNIX tick socket synchronously at launcher
+    # startup. Klippy's reactor.py only retries _tick_connect for ~5 s
+    # of wall clock, but Renode boot takes ~30 s before the tick
+    # thread would otherwise come up - klippy would fail with
+    # ECONNREFUSED. Binding here returns a listening socket so klippy
+    # can connect immediately; the actual accept() happens later in
+    # _tick_socket_loop.
+    try:
+        os.unlink(tick_path)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(tick_path)
+    except OSError as e:
+        sys.stderr.write("renode_launcher: tick bind(%s) err %s\n"
+                         % (tick_path, e))
+        return None
+    try:
+        os.chmod(tick_path, 0o666)
+    except OSError:
+        pass
+    srv.listen(1)
+    srv.settimeout(0.5)
+    return srv
+
+
+def _tick_socket_loop(srv, monitor_sock, tick_state, stop_evt,
+                      master_fd=None):
+    # AF_UNIX accept loop on the pre-bound `srv`. Klippy connects,
+    # sends `advance T\n` (T in seconds, monotonic), launcher RunFor's
+    # the delta, replies `done T_actual\n`. Same wire protocol as
+    # simavr_bridge.c so klippy's reactor.py is unchanged.
+    #
+    # Klippy's main loop spawns multiple Printer instances if connect
+    # fails the first time (klippy.py:main while 1), each of which
+    # opens its own tick socket. Outer loop re-accepts after each
+    # client EOF so subsequent klippy attempts can also drive the
+    # tick.
+    while not stop_evt[0]:
+        cli = None
+        while not stop_evt[0]:
+            try:
+                cli, _ = srv.accept()
+                break
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+        if cli is None:
+            return
+        _tick_serve_client(cli, monitor_sock, tick_state, stop_evt,
+                           master_fd=master_fd)
+    try:
+        srv.close()
+    except OSError:
+        pass
+
+
+def _tick_serve_client(cli, monitor_sock, tick_state, stop_evt,
+                       master_fd=None):
+    cli.settimeout(0.5)
+    buf = b''
+    while not stop_evt[0]:
+        try:
+            chunk = cli.recv(256)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            # Don't set stop_evt - klippy's main loop spawns a new
+            # Printer on connect failure and reconnects to the tick
+            # socket; we want to accept again, not unlink it.
+            break
+        buf += chunk
+        while b'\n' in buf:
+            line, buf = buf.split(b'\n', 1)
+            text = line.decode('ascii', 'replace').strip()
+            parts = text.split()
+            if len(parts) != 2 or parts[0] != 'advance':
+                # Unknown line: ack with current virtual time so
+                # klippy doesn't wedge. Mirrors simavr_bridge.c
+                # tick-mode bad-line handling.
+                _tick_reply_done(cli, tick_state)
+                continue
+            try:
+                target_s = float(parts[1])
+            except ValueError:
+                _tick_reply_done(cli, tick_state)
+                continue
+            import math
+            target_us = int(math.ceil(target_s * 1e6))
+            delta_us = target_us - tick_state['virt_us']
+            # Klippy can request advance with target == current virt
+            # (delta_us=0) when its reactor's next-timer waketime ==
+            # eventtime in float - the for-loop in _check_timers ought
+            # to fire that timer, but float precision in the
+            # monotonic/timer arithmetic plus async-callback chains
+            # keep pushing _next_timer to "right now" so the reactor
+            # asks us to "advance to where we already are" without
+            # ever firing the pending timer. Force a 1 us advance so
+            # the firmware has cycles to keep firing its own
+            # interrupts and klippy's monotonic ticks past the
+            # equality.
+            if delta_us == 0:
+                # 1 ms nudge: enough virtual time for any pending
+                # firmware interrupt to fire (1 ms >> bit_time at
+                # 250 kbaud), but small enough that 5 sim-seconds of
+                # connect timeout fit in well under 5000 nudge
+                # round-trips. Shorter nudges (1 us) bottlenecked on
+                # Monitor TCP overhead.
+                delta_us = 1000
+            _tick_run_for(monitor_sock, tick_state, delta_us,
+                          master_fd=master_fd)
+            _tick_reply_done(cli, tick_state)
+    try:
+        cli.close()
+    except OSError:
+        pass
+
+
+def _tick_reply_done(cli, tick_state):
+    actual_s = tick_state['virt_us'] / 1e6
+    msg = ('done %.9f\n' % actual_s).encode('ascii')
+    try:
+        cli.sendall(msg)
+    except OSError:
+        pass
 
 
 def _apply_fixture_to_renode(fixture_path, monitor_sock):
@@ -691,15 +1259,17 @@ def _apply_fixture_to_renode(fixture_path, monitor_sock):
     if isinstance(default_block, dict):
         dv = default_block.get('default_value')
         if dv is not None:
-            _send('adc_default(%d)' % int(dv))
+            _send('renode_hooks.adc_default(%d)' % int(dv))
 
     # Per-channel overrides. The keys in `analog_in` are labels
     # (typically `_hot_extruder_N`) that the AVR fixture pusher maps
     # to the FIRST few configured analog_in OIDs. We don't have the
-    # OID assignment here, so we use the order of dict iteration as
-    # the channel index - close enough for the empty-fixture case
-    # where the goal is just to get extruder thermistors to decode
-    # to plausible temperatures rather than min_temp shutdowns.
+    # OID assignment here, so we default to dict iteration order as
+    # the channel index. Tests that need to pin a specific override
+    # to a specific MCU ADC channel (e.g. adc_scaled's vref_pin /
+    # vssa_pin where channel mismatch causes division by zero in
+    # klippy's adc_scaled callback) supply an explicit `channel`
+    # field in the spec; we honour that when present.
     analog_in = fx.get('analog_in')
     if isinstance(analog_in, dict):
         for ch_idx, (_label, spec) in enumerate(analog_in.items()):
@@ -708,7 +1278,9 @@ def _apply_fixture_to_renode(fixture_path, monitor_sock):
             v = spec.get('default_value')
             if v is None:
                 continue
-            _send('adc_set(%d, %d)' % (ch_idx, int(v)))
+            target_ch = spec.get('channel', ch_idx)
+            _send('renode_hooks.adc_set(%d, %d)'
+                  % (int(target_ch), int(v)))
 
     # I2C ID-probe responses.
     i2c_default = fx.get('i2c_default')
@@ -722,7 +1294,7 @@ def _apply_fixture_to_renode(fixture_path, monitor_sock):
             normalised = {str(k): list(v) for k, v in reg_resp.items()}
             payload_json = json.dumps(normalised)
             for addr in _DEFAULT_I2C_ADDRS:
-                _send('i2c_register_response(1, %d, %s)'
+                _send('renode_hooks.i2c_register_response(1, %d, %s)'
                       % (addr, payload_json))
 
 
@@ -736,7 +1308,8 @@ def _translate_fixture_command(line):
 
 # ---------------------------------------------------------------------
 
-def _control_socket_loop(sock_path, monitor_sock, stop_evt):
+def _control_socket_loop(srv, monitor_sock, stop_evt,
+                         tick_state=None, master_fd=None):
     # Accept connections from _push_fixture_to_control_socket. Each
     # newline-terminated command is either a hook setter (translated
     # to a Renode python call) or one of the bridge-protocol verbs
@@ -749,31 +1322,36 @@ def _control_socket_loop(sock_path, monitor_sock, stop_evt):
     #                      NOT send `start` today (the simavr bridge
     #                      does not expose a `start` verb), so we also
     #                      auto-trigger on the first `barrier`.
+    #                      In tick mode `start` is a no-op: the CPU
+    #                      only runs inside klippy-driven RunFor calls.
     #   barrier <usec>   - wait simulated time and ACK. simavr blocks
     #                      until its cycle counter advances <usec>;
-    #                      Renode runs in real-time, so a wall-clock
-    #                      sleep of usec microseconds is the closest
-    #                      equivalent (firmware activity scales with
-    #                      wall time after `start`). Auto-issues
-    #                      `start` first if the CPU has not begun -
-    #                      that is what makes klippy's identify+
-    #                      clocksync handshake actually see firmware
-    #                      output on the host pty.
+    #                      Renode in real-time mode does a wall-clock
+    #                      sleep of usec microseconds (firmware activity
+    #                      scales with wall time after `start`). In tick
+    #                      mode, we RunFor <usec> of virtual time so the
+    #                      firmware has cycles to apply queued GPIO
+    #                      drives before klippy's first advance arrives.
     #
     # Hook commands (analog_in_default, step_trigger, ...) translate
     # to `python "<call>"` against renode_hooks.py.
-    if os.path.exists(sock_path):
-        os.unlink(sock_path)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(sock_path)
-    srv.listen(1)
-    srv.settimeout(0.5)
+    #
+    # `srv` is bound+listening before this thread starts (see
+    # _bind_control_socket called from main()); we just accept here.
     started = [False]
 
     def _ensure_started():
-        if not started[0]:
-            _send_monitor(monitor_sock, 'start')
+        if started[0]:
+            return
+        if tick_state is not None:
+            # Tick-driven: the CPU only runs inside RunFor calls
+            # initiated by klippy's tick socket. Do NOT issue `start`
+            # to the monitor or the wall-clock executor will steal
+            # cycles concurrently with our deterministic advances.
             started[0] = True
+            return
+        _send_monitor(monitor_sock, 'start')
+        started[0] = True
 
     while not stop_evt[0]:
         try:
@@ -809,11 +1387,23 @@ def _control_socket_loop(sock_path, monitor_sock, stop_evt):
                                 usec = int(parts[1])
                             except ValueError:
                                 pass
-                        # Cap the wall-clock wait so a malformed
-                        # fixture cannot hang the launcher; simavr
-                        # bridge's barrier is bounded by the runner's
-                        # 5 s timeout on the OK ack anyway.
-                        time.sleep(min(usec / 1e6, 5.0))
+                        # Cap the wait so a malformed fixture cannot
+                        # hang the launcher; simavr bridge's barrier
+                        # is bounded by the runner's 5 s ack timeout
+                        # anyway.
+                        usec = min(usec, 5000000)
+                        if tick_state is not None:
+                            # Tick mode: advance virtual time by the
+                            # requested microseconds so any GPIO drives
+                            # / IRQ schedules pushed in fixture setup
+                            # take effect before klippy's first advance
+                            # arrives. Serialised with the monitor lock
+                            # so this doesn't race a klippy-driven
+                            # RunFor.
+                            _tick_run_for(monitor_sock, tick_state,
+                                          usec, master_fd=master_fd)
+                        else:
+                            time.sleep(usec / 1e6)
                         try:
                             conn.sendall(b'OK\n')
                         except OSError:
@@ -825,9 +1415,13 @@ def _control_socket_loop(sock_path, monitor_sock, stop_evt):
                             "renode_launcher: unrecognized fixture "
                             "command %r\n" % text)
                         continue
-                    _send_monitor(
-                        monitor_sock,
-                        'python "%s"' % py_call.replace('"', r'\"'))
+                    full_cmd = ('python "%s"'
+                                % py_call.replace('"', r'\"'))
+                    try:
+                        _send_monitor(monitor_sock, full_cmd)
+                    except Exception as e:
+                        sys.stderr.write(
+                            "renode_launcher: ctl send err %s\n" % e)
                     try:
                         conn.sendall(b'OK\n')
                     except OSError:
@@ -890,8 +1484,9 @@ def main():
     log_path = os.path.join(workdir, 'renode.log')
 
     monitor_port = _allocate_tcp_port()
+    tick_mode = bool(args.tick_socket)
     resc = _render_resc(chip, os.path.abspath(args.elf), pty_path,
-                        monitor_port, log_path)
+                        monitor_port, log_path, tick_mode=tick_mode)
     with open(resc_path, 'w') as f:
         f.write(resc)
 
@@ -934,27 +1529,84 @@ def main():
     startup_deadline = time.monotonic() + 90.0
     deadline = None
 
+    serial_master_fd = None
+    early_tick_state = None
+    early_tick_srv = None
+    # Pre-bind the control socket at launcher startup so the runner's
+    # _push_fixture_to_control_socket call (which fires while Renode is
+    # still booting) succeeds immediately. The ctl_thread accepts on
+    # this srv after Renode is up and processes queued commands.
+    early_ctl_srv = _bind_control_socket(args.control_socket)
+    if early_ctl_srv is None:
+        sys.stderr.write("renode_launcher: control socket bind failed\n")
+        return 4
+    if tick_mode:
+        # Pre-create the tick_state (lock, sim_time mmap, counters)
+        # IMMEDIATELY at launcher startup. Klippy spawns shortly after
+        # the slave_link symlink appears (which we publish below in
+        # _setup_tick_pty), well before Renode finishes booting and
+        # we get to the post-prompt setup. If sim_time_file doesn't
+        # exist when klippy first calls get_monotonic(), klippy falls
+        # back to wall-clock and immediately requests a huge advance,
+        # blowing the test out of the water. By creating the file
+        # here with an initial 0.0 we guarantee klippy sees a sane
+        # starting time.
+        early_tick_state = _make_tick_state(
+            sim_time_file=args.sim_time_file)
+        # Same problem for the tick socket itself: klippy's
+        # _tick_connect retries only ~5 s of wall clock, so it would
+        # ECONNREFUSED before Renode finishes booting. Bind+listen
+        # here so the socket exists from launcher start; accept()
+        # happens later in _tick_socket_loop.
+        early_tick_srv = _bind_tick_socket(args.tick_socket)
     try:
-        # Wait for the pty Renode creates, then publish the symlink so
-        # klippy's _wait_for_slave_link sees the slave path.
-        if not _wait_for_path(pty_path, startup_deadline):
-            sys.stderr.write(
-                "renode_launcher: Renode did not create UART pty at "
-                "%s within 90s; aborting\n" % pty_path)
-            return 3
-        # The pty file Renode creates IS the slave end (Renode opens
-        # /dev/ptmx, then symlinks the published name to the slave
-        # pts/N). Mirror linuxprocess: publish slave_link as a
-        # symlink to it.
-        try:
-            os.unlink(args.slave_link)
-        except OSError:
-            pass
-        os.symlink(pty_path, args.slave_link)
+        if tick_mode:
+            # Launcher-managed pty: we open the master end and hand
+            # the slave to klippy via the symlink. Renode never sees
+            # the pty - we shuttle bytes through renode_hooks instead
+            # of CreateUartPtyTerminal.
+            serial_master_fd = _setup_tick_pty(args.slave_link)
+        else:
+            # Wait for the pty Renode creates, then publish the
+            # symlink so klippy's _wait_for_slave_link sees the slave
+            # path.
+            if not _wait_for_path(pty_path, startup_deadline):
+                sys.stderr.write(
+                    "renode_launcher: Renode did not create UART pty"
+                    " at %s within 90s; aborting\n" % pty_path)
+                return 3
+            try:
+                os.unlink(args.slave_link)
+            except OSError:
+                pass
+            os.symlink(pty_path, args.slave_link)
 
         monitor_sock = _connect_monitor(
             '127.0.0.1', monitor_port, startup_deadline)
         _drain_monitor_until_prompt(monitor_sock)
+
+        if tick_mode:
+            # Subscribe to UART CharReceived in renode_hooks so
+            # firmware-emitted bytes accumulate in a Python buffer we
+            # can drain after each RunFor.
+            usart = _host_link_peripheral(chip)
+            cmd = (
+                'python "import renode_hooks; '
+                'renode_hooks.serial_init(\\"sysbus.%s\\")"' % usart)
+            try:
+                _send_monitor(monitor_sock, cmd)
+            except Exception as e:
+                sys.stderr.write(
+                    "renode_launcher: serial_init err %s\n" % e)
+
+        # Resolve firmware symbols renode_hooks.sw_uart attaches CPU
+        # PC hooks to (tmcuart_read_event etc). Done here so the
+        # symbols are in place before the first sw_uart fixture
+        # command arrives over the control socket. Configs that don't
+        # link tmcuart.o report no addresses and the hook installer
+        # no-ops cleanly.
+        _resolve_sw_uart_symbols(monitor_sock)
+        _resolve_sched_status_addr(monitor_sock)
 
         # Apply the fixture-resident hooks (ADC defaults, I2C ID
         # responses) BEFORE the control loop accepts the runner's
@@ -963,12 +1615,37 @@ def main():
         # peripheral and shutdown before the response arrives.
         _apply_fixture_to_renode(args.fixture_file, monitor_sock)
 
+        # Tick-mode lockstep. With --tick-socket the launcher runs the
+        # CPU exclusively via klippy-driven RunFor calls (deterministic
+        # virtual time); without it we fall back to Renode's wall-clock
+        # paced execution. The control loop and tick loop share the
+        # monitor TCP, so they coordinate via tick_state['lock'] to
+        # avoid interleaved Monitor responses.
+        # Reuse the early_tick_state we created at launcher startup so
+        # the sim_time file is in place before klippy's first call to
+        # get_monotonic(). _make_tick_state again here would re-truncate
+        # the file and lose any progress; just point at the existing
+        # state.
+        tick_state = early_tick_state
+
         import threading
         ctl_thread = threading.Thread(
             target=_control_socket_loop,
-            args=(args.control_socket, monitor_sock, stop_evt),
+            args=(early_ctl_srv, monitor_sock, stop_evt),
+            kwargs={'tick_state': tick_state,
+                    'master_fd': serial_master_fd},
             daemon=True)
         ctl_thread.start()
+
+        tick_thread = None
+        if tick_state is not None and early_tick_srv is not None:
+            tick_thread = threading.Thread(
+                target=_tick_socket_loop,
+                args=(early_tick_srv, monitor_sock, tick_state,
+                      stop_evt),
+                kwargs={'master_fd': serial_master_fd},
+                daemon=True)
+            tick_thread.start()
 
         # Renode is up and the pty / monitor are wired - start the
         # --duration clock now so klippy gets its full work window.
@@ -994,9 +1671,17 @@ def main():
                 proc.kill()
             except OSError:
                 pass
-        for p in (args.slave_link, args.control_socket):
+        cleanup_paths = [args.slave_link, args.control_socket]
+        if args.tick_socket:
+            cleanup_paths.append(args.tick_socket)
+        for p in cleanup_paths:
             try:
                 os.unlink(p)
+            except OSError:
+                pass
+        if serial_master_fd is not None:
+            try:
+                os.close(serial_master_fd)
             except OSError:
                 pass
         try:

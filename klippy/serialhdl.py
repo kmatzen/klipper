@@ -92,9 +92,19 @@ class SerialReader:
             self.ffi_lib.serialqueue_free)
         self.background_thread = threading.Thread(target=self._bg_thread)
         self.background_thread.start()
-        # Obtain and load the data dictionary from the firmware
+        # Obtain and load the data dictionary from the firmware.
+        # In tick-mode lockstep (KLIPPY_TICK_SOCKET set) the reactor's
+        # monotonic advances only via the tick-socket round trip, and
+        # 5 sim-seconds at klippy's 100 ms tick cap is only ~50 round
+        # trips - not enough for the ~250 chunks of a 10 KB firmware
+        # dictionary. Use a much longer deadline in tick mode so
+        # identify can complete before this times out.
+        connect_timeout = 5.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            connect_timeout = 300.
         completion = self.reactor.register_callback(self._get_identify_data)
-        identify_data = completion.wait(self.reactor.monotonic() + 5.)
+        identify_data = completion.wait(
+            self.reactor.monotonic() + connect_timeout)
         if identify_data is None:
             logging.info("%sTimeout on connect", self.warn_prefix)
             self.disconnect()
@@ -186,8 +196,16 @@ class SerialReader:
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
+        # Outer connect deadline. In tick-mode lockstep with the
+        # MCU emulator, sim time advances slowly relative to wall and
+        # the inner connect_timeout (in _start_session) is much
+        # longer than the AVR-real-mcu default, so this outer guard
+        # has to be widened to match.
+        outer_timeout = 90.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            outer_timeout = 900.
         while 1:
-            if self.reactor.monotonic() > start_time + 90.:
+            if self.reactor.monotonic() > start_time + outer_timeout:
                 self._error("Unable to connect")
             try:
                 serial_dev = serial.Serial(baudrate=baud, timeout=0,

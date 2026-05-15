@@ -49,8 +49,44 @@ def set_monitor(m):
     _M = m
 
 
+# GPIO peripheral naming varies by chip family in Renode platforms:
+#   STM32 family    -> sysbus.gpioPortA / gpioPortB / ...
+#   Atmel SAM3/4/E7 -> sysbus.pioA / pioB / pioC / ...
+#   SAMD21 / SAMD51 -> sysbus.gpio_a / gpio_b / ...
+# Probe in that order, cache the form that works for each port letter
+# so subsequent calls are O(1). On unresolved letters we fall through
+# to a clear error rather than silently no-op'ing.
+_GPIO_PORT_CACHE = {}
+_GPIO_PORT_NAME_FORMS = (
+    'gpioPort%s',     # STM32: gpioPortA
+    'pio%s',          # SAM3/SAM4S/SAM4E/SAME70: pioA
+    'gpio_%s',        # SAMD21/SAMD51: gpio_a (lowercase)
+)
+
+
 def _gpio_port(letter):
-    return _M.Machine['sysbus.gpioPort' + letter.upper()]
+    upper = letter.upper()
+    cached = _GPIO_PORT_CACHE.get(upper)
+    if cached is not None:
+        return cached
+    sysbus = _M.Machine
+    tried = []
+    for fmt in _GPIO_PORT_NAME_FORMS:
+        if '_%s' in fmt:
+            name = fmt % upper.lower()
+        else:
+            name = fmt % upper
+        path = 'sysbus.' + name
+        tried.append(path)
+        try:
+            p = sysbus[path]
+        except Exception:
+            continue
+        _GPIO_PORT_CACHE[upper] = p
+        return p
+    raise RuntimeError(
+        "no gpio port found for letter %s (tried %s)"
+        % (upper, ', '.join(tried)))
 
 
 def _pin(port, idx):
@@ -167,7 +203,13 @@ _ADC_PERIPHS = ('sysbus.adc1', 'sysbus.adc2', 'sysbus.adc3',
 # AFEC0 and AFEC1 are listed; sysbus.WriteDoubleWord on a base that
 # isn't mapped (e.g. SAM4S where there's no AFEC) raises, so the
 # pokes below are wrapped in try/except.
-_AFEC_BASES = (0x4003C000, 0x40064000)
+_AFEC_BASES = (
+    0x4003C000,  # SAME70 AFEC0
+    0x40064000,  # SAME70 AFEC1
+    0x400B0000,  # SAM4E AFEC0
+    0x400B4000,  # SAM4E AFEC1
+    0x40038000,  # SAM4S ADC (single peripheral, 16 channels)
+)
 _AFEC_MAGIC_DEFAULT = 0x100
 _AFEC_MAGIC_CH_BASE = 0x104
 
@@ -303,3 +345,529 @@ def i2c_register_response(bus, addr, register_responses):
     slave.ReadRequested += on_read_requested
     bus_obj.Register(slave, addr_int)
     _i2c_slaves[key] = (slave, last_reg_box, responses)
+
+
+# --------------------------------------------------------------------
+# TMC2208/2209 software UART support.
+#
+# Goal: when klippy sends a TMC UART read request, drive a synthetic
+# response onto the firmware's RX pin so klippy reads back what looks
+# like a real chip response. Writes update an in-memory register file
+# so subsequent reads return the just-written value, IFCNT advances,
+# GSTAT clears, etc - matching the simavr bridge's sw_uart behaviour.
+#
+# Mechanism: 4 CPU PC hooks on the firmware's tmcuart_* event functions.
+# Each hook fires BEFORE the function body runs, so a gpio drive done
+# in the hook is the value the function's gpio_in_read sees.
+#
+#   command_tmcuart_send       - decode the request, build the response
+#                                bit stream, mark the uart "active"
+#   tmcuart_send_finish_event  - drive RX HIGH (idle for sync)
+#   tmcuart_read_sync_event    - 1st fire: leave HIGH (firmware will
+#                                set TU_READ_SYNC); 2nd fire: drive LOW
+#                                start bit, transition to bit-driving
+#   tmcuart_read_event         - drive next response bit on each fire
+#
+# Symbol addresses come from the launcher via apply_sw_uart_symbols(),
+# called once after ELF load. Configs that don't link tmcuart.o report
+# no addresses; the hook installer no-ops.
+#
+# This file is the ONLY trace channel: every hook fire, state transition,
+# register access, and error logs to stderr via _log(). The launcher
+# wires Renode's stdout/stderr to its own stderr, which the test runner
+# captures, so [sw_uart] lines surface in the test log.
+
+try:
+    from Antmicro.Renode.Peripherals.CPU import CpuAddressHook
+    _HAVE_CPU_HOOK = True
+except ImportError:
+    _HAVE_CPU_HOOK = False
+
+
+_sw_uart_states = {}      # (rx_port, rx_pin, tx_port, tx_pin) -> _SwUart
+_sw_uart_active = [None]  # uart currently driving a response (or None)
+_sw_uart_symbols = {}     # symbol name -> firmware addr
+_sw_uart_cpu_hooks_installed = [False]
+
+
+# Dual-route logger. Hooks fire from C# event-dispatch context where
+# sys.stderr does not always flow back to the renode subprocess stderr
+# (Monitor-driven `python "..."` calls do flow because Renode wraps
+# stdout/stderr around the python call). To be sure traces survive
+# regardless of context, also append to a flat file the test harness
+# can read after the run via a tempdir mount.
+_LOG_PATH = '/tmp/sw_uart_trace.log'
+
+
+def _log(msg, *args):
+    import sys
+    if args:
+        msg = msg % args
+    line = "[sw_uart] " + msg
+    try:
+        f = open(_LOG_PATH, 'a')
+        try:
+            f.write(line + "\n")
+        finally:
+            f.close()
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _crc8_atm(data):
+    crc = 0
+    for b in data:
+        b = int(b) & 0xff
+        for _ in range(8):
+            if ((crc >> 7) ^ (b & 0x01)) & 0x01:
+                crc = ((crc << 1) ^ 0x07) & 0xff
+            else:
+                crc = (crc << 1) & 0xff
+            b >>= 1
+    return crc
+
+
+def _strip_serial_bits(serial_bytes):
+    # Reverse klippy's _add_serial_bits packing: each data byte was
+    # framed as 10 bits (start=0, 8 data LSB-first, stop=1) and the
+    # bitstream was repacked into bytes LSB-first. Recover the
+    # underlying data bytes; return None on framing error.
+    if not serial_bytes:
+        return None
+    bits = []
+    for b in serial_bytes:
+        for i in range(8):
+            bits.append((int(b) >> i) & 1)
+    out = []
+    pos = 0
+    while pos + 10 <= len(bits):
+        if bits[pos] != 0 or bits[pos + 9] != 1:
+            return None
+        v = 0
+        for i in range(8):
+            v |= bits[pos + 1 + i] << i
+        out.append(v)
+        pos += 10
+    return out
+
+
+class _SwUart(object):
+    def __init__(self, rx_port, rx_pin, tx_port, tx_pin, bit_time, addr):
+        self.rx_port = rx_port.upper()
+        self.rx_pin = int(rx_pin)
+        self.tx_port = tx_port.upper()
+        self.tx_pin = int(tx_pin)
+        self.bit_time = int(bit_time)
+        self.addr = int(addr) & 0xff
+        # TMC2208 register file with reset defaults klippy probes
+        # during connect / DUMP_TMC. Same defaults as the simavr
+        # bridge's apply_sw_uart in simavr_bridge.c.
+        self.regs = [0] * 128
+        self.regs[0x00] = 0x00000040    # GCONF: pdn_disable=1
+        self.regs[0x01] = 0x00000001    # GSTAT: reset=1
+        self.regs[0x06] = 0x21000040    # IOIN: version=0x21
+        self.regs[0x6f] = 0xc0000000    # DRV_STATUS: stst=1
+        # Response state.
+        self.response_bits = []
+        self.response_idx = 0
+        # IDLE -> SYNC_HIGH -> SYNC_LOW -> DRIVING -> IDLE
+        self.phase = 'IDLE'
+
+
+def _drive_rx(s, value):
+    _gpio_port(s.rx_port).OnGPIO(s.rx_pin, bool(value))
+
+
+def _build_response_bits(s, reg):
+    # 8-byte TMC response: [sync=0x05, master=0xff, reg, d3..d0, crc].
+    # 80 bits total: per byte = 1 start(0) + 8 data LSB-first + 1 stop(1).
+    val = s.regs[reg & 0x7f] & 0xffffffff
+    resp = [0x05, 0xff, reg & 0x7f,
+            (val >> 24) & 0xff, (val >> 16) & 0xff,
+            (val >> 8) & 0xff, val & 0xff]
+    resp.append(_crc8_atm(resp))
+    bits = []
+    for b in resp:
+        bits.append(0)
+        for i in range(8):
+            bits.append((b >> i) & 1)
+        bits.append(1)
+    s.response_bits = bits
+    s.response_idx = 0
+    return resp
+
+
+def _on_tmcuart_send_hook(cpu, pc):
+    try:
+        _do_tmcuart_send(cpu, pc)
+    except Exception as e:
+        _log("send_hook EXCEPTION: %s", e)
+
+
+def _do_tmcuart_send(cpu, pc):
+    # Firmware just entered command_tmcuart_send(args). R0 = uint32_t*
+    # args. The argument layout for `tmcuart_send oid=%c write=%*s
+    # read=%c` is:
+    #   args[0] = oid
+    #   args[1] = write_len (the %*s prefix length)
+    #   args[2] = write_ptr (firmware-RAM addr of message bytes)
+    #   args[3] = read_count
+    # New request -> drop any stale active state. The previous
+    # response's event_hook clears active when it drives the last bit,
+    # but if a request gets cancelled mid-flight (e.g. firmware shutdown
+    # during a response) active may still be set; clearing here makes
+    # the per-request state machine idempotent.
+    _sw_uart_active[0] = None
+    try:
+        args_ptr = int(cpu.GetRegisterUnsafe(0).RawValue)
+    except Exception as e:
+        _log("send: cannot read R0: %s", e)
+        return
+    sb = _M.Machine.SystemBus
+    try:
+        write_len = sb.ReadDoubleWord(args_ptr + 4)
+        write_ptr = sb.ReadDoubleWord(args_ptr + 8)
+        read_count = sb.ReadDoubleWord(args_ptr + 12)
+    except Exception as e:
+        _log("send: cannot read args at %x: %s", args_ptr, e)
+        return
+    if write_len < 1 or write_len > 32:
+        _log("send: bad write_len=%d, ignoring", write_len)
+        return
+    msg = []
+    for i in range(int(write_len)):
+        try:
+            msg.append(int(sb.ReadByte(int(write_ptr) + i)) & 0xff)
+        except Exception as e:
+            _log("send: msg read err at offset %d: %s", i, e)
+            return
+    decoded = _strip_serial_bits(msg)
+    if decoded is None:
+        _log("send: serial-bit strip returned None (framing error)")
+        return
+    if len(decoded) < 4 or decoded[0] != 0xf5:
+        _log("send: bad header decoded=%s",
+             ' '.join('%02x' % b for b in decoded))
+        return
+    addr = decoded[1] & 0xff
+    reg_field = decoded[2] & 0xff
+    is_write = (reg_field & 0x80) != 0
+    expected = 8 if is_write else 4
+    if len(decoded) < expected:
+        _log("send: truncated decoded len=%d < %d", len(decoded), expected)
+        return
+    crc = _crc8_atm(decoded[:expected - 1])
+    if crc != (decoded[expected - 1] & 0xff):
+        _log("send: crc mismatch got=%02x want=%02x",
+             decoded[expected - 1], crc)
+        return
+    reg = reg_field & 0x7f
+    # Pick the uart state matching this request's address. Multi-chip
+    # configs (duet2 maestro: 4 TMC2208s on shared PA9/PA10 with
+    # select-pin mux) use addr=0 for all chips, so we fall back to
+    # the single registered state when there's only one.
+    target = None
+    for s in _sw_uart_states.values():
+        if s.addr == addr or len(_sw_uart_states) == 1:
+            target = s
+            break
+    if target is None:
+        _log("send: no uart state matches addr=%d", addr)
+        return
+    if is_write:
+        v = ((decoded[3] & 0xff) << 24) | ((decoded[4] & 0xff) << 16) \
+            | ((decoded[5] & 0xff) << 8) | (decoded[6] & 0xff)
+        if reg == 0x01:
+            # GSTAT: write-1-to-clear
+            target.regs[reg] = target.regs[reg] & ~v
+        else:
+            target.regs[reg] = v
+        if reg != 0x02:
+            # IFCNT auto-increments on every register write
+            target.regs[0x02] = (target.regs[0x02] + 1) & 0xff
+        return
+    # Read: build response, mark active, wait for finish_event hook.
+    _build_response_bits(target, reg)
+    target.phase = 'IDLE'
+    _sw_uart_active[0] = target
+
+
+def _on_send_finish_hook(cpu, pc):
+    s = _sw_uart_active[0]
+    if s is None:
+        return
+    try:
+        _drive_rx(s, 1)
+        s.phase = 'SYNC_HIGH'
+    except Exception as e:
+        _log("finish_hook EXCEPTION: %s", e)
+
+
+def _on_read_sync_hook(cpu, pc):
+    s = _sw_uart_active[0]
+    if s is None:
+        return
+    try:
+        if s.phase == 'SYNC_HIGH':
+            s.phase = 'SYNC_LOW'
+        elif s.phase == 'SYNC_LOW':
+            _drive_rx(s, 0)
+            s.phase = 'DRIVING'
+            s.response_idx = 0
+    except Exception as e:
+        _log("sync_hook EXCEPTION: %s", e)
+
+
+def _on_read_event_hook(cpu, pc):
+    s = _sw_uart_active[0]
+    if s is None or s.phase != 'DRIVING':
+        return
+    try:
+        if s.response_idx >= len(s.response_bits):
+            # Sentinel; we should normally clean up on the last bit
+            # drive below.
+            _drive_rx(s, 1)
+            s.phase = 'IDLE'
+            _sw_uart_active[0] = None
+            return
+        bit = s.response_bits[s.response_idx]
+        _drive_rx(s, bit)
+        s.response_idx += 1
+        if s.response_idx >= len(s.response_bits):
+            # Last bit driven. Firmware reads it and finalizes - no
+            # more event_hook fires for this request, so clean up
+            # active state inline. Otherwise it leaks to the next
+            # request's finish_hook and triggers a spurious sync drive.
+            s.phase = 'IDLE'
+            _sw_uart_active[0] = None
+    except Exception as e:
+        _log("event_hook EXCEPTION: %s", e)
+
+
+def _ensure_cpu_hooks_installed():
+    if _sw_uart_cpu_hooks_installed[0]:
+        return
+    if not _HAVE_CPU_HOOK:
+        _log("CpuAddressHook unavailable; cannot install hooks")
+        return
+    needed = ('command_tmcuart_send', 'tmcuart_send_finish_event',
+              'tmcuart_read_sync_event', 'tmcuart_read_event')
+    missing = [n for n in needed if n not in _sw_uart_symbols]
+    if missing:
+        _log("missing symbols: %s", ', '.join(missing))
+        return
+    cpu = _M.Machine['sysbus.cpu']
+    install = (
+        ('command_tmcuart_send', _on_tmcuart_send_hook),
+        ('tmcuart_send_finish_event', _on_send_finish_hook),
+        ('tmcuart_read_sync_event', _on_read_sync_hook),
+        ('tmcuart_read_event', _on_read_event_hook),
+    )
+    for name, cb in install:
+        addr = _sw_uart_symbols[name]
+        try:
+            cpu.AddHook(int(addr), CpuAddressHook(cb))
+            _log("hook installed: %s @ %x", name, int(addr))
+        except Exception as e:
+            _log("hook install FAILED for %s @ %x: %s", name, int(addr), e)
+    _sw_uart_cpu_hooks_installed[0] = True
+
+
+def apply_sw_uart_symbols(symbols):
+    if not isinstance(symbols, dict):
+        _log("apply_sw_uart_symbols: not a dict (got %r)",
+             type(symbols).__name__)
+        return
+    for k, v in symbols.items():
+        try:
+            _sw_uart_symbols[str(k)] = int(v)
+            _log("symbol %s -> %x", k, int(v))
+        except (TypeError, ValueError) as e:
+            _log("symbol %s rejected (%s): %r", k, e, v)
+
+
+# --------------------------------------------------------------------
+# Firmware-shutdown diagnostics. SchedStatus is a 12-byte struct (on
+# 32-bit Cortex-M): {timer_list[4], last_insert[4], tasks_status[1],
+# tasks_busy[1], shutdown_status[1], shutdown_reason[1]}. The byte at
+# offset 11 is the static_string_id corresponding to the shutdown
+# reason; klippy's dict maps these IDs to human-readable strings
+# (enumerations.static_string_id). When the firmware shuts down before
+# klippy has loaded the dict, the shutdown response message lands as
+# "Unknown message -17 ... while identifying" - the reason is opaque
+# until we peek the byte directly.
+
+_sched_status_addr = [None]
+_last_shutdown_reason = [0]
+
+
+def apply_sched_status_addr(addr):
+    try:
+        _sched_status_addr[0] = int(addr)
+        _log("SchedStatus @ %x", int(addr))
+    except (TypeError, ValueError) as e:
+        _log("apply_sched_status_addr: bad addr %r: %s", addr, e)
+
+
+def peek_shutdown_reason():
+    # Returns the firmware's shutdown_reason byte, or None if not
+    # configured. Called from the launcher's tick loop after each
+    # RunFor; if non-zero AND changed since last call, log it.
+    addr = _sched_status_addr[0]
+    if addr is None:
+        return None
+    try:
+        sb = _M.Machine.SystemBus
+        reason = int(sb.ReadByte(addr + 11)) & 0xff
+    except Exception as e:
+        _log("peek_shutdown_reason: ReadByte err %s", e)
+        return None
+    if reason != _last_shutdown_reason[0]:
+        _last_shutdown_reason[0] = reason
+        if reason:
+            _log("FIRMWARE SHUTDOWN reason=%d (static_string_id; see dict"
+                 " enumerations.static_string_id for human-readable)",
+                 reason)
+    return reason
+
+
+def sw_uart(rx_port, rx_pin, tx_port, tx_pin, bit_time, addr):
+    _log("register rx=%s%d tx=%s%d bt=%d addr=%d",
+         rx_port, int(rx_pin), tx_port, int(tx_pin),
+         int(bit_time), int(addr))
+    key = (rx_port.upper(), int(rx_pin), tx_port.upper(), int(tx_pin))
+    if key not in _sw_uart_states:
+        _sw_uart_states[key] = _SwUart(rx_port, rx_pin, tx_port, tx_pin,
+                                       bit_time, addr)
+    _ensure_cpu_hooks_installed()
+
+
+# --------------------------------------------------------------------
+# Synchronous serial bridge (host-link UART for tick mode).
+#
+# In real-time mode Renode's `emulation CreateUartPtyTerminal` wires
+# the firmware's host-link USART to a host pty that klippy connects
+# to via pyserial. That works because Renode runs continuously and
+# Renode's pty terminal thread drains the firmware-side bytes onto
+# the pty as they're emitted.
+#
+# In tick mode the pty path breaks down: klippy's C serialqueue
+# background thread polls the pty fd on wall-clock time, while
+# klippy's reactor advances sim_time only via tick-socket round
+# trips. The two clocks decouple and the request/response sequence
+# misses klippy's identify timeout window.
+#
+# This bridge replaces the pty terminal with a launcher-managed
+# pty pair plus a synchronous byte shuttle: the launcher reads any
+# bytes klippy wrote, hands them to the firmware UART here via
+# WriteChar, runs the emulation forward, then reads back any bytes
+# the firmware emitted (captured here via the CharReceived event).
+# Byte delivery is exactly synchronous with RunFor return, which is
+# what klippy's serialqueue thread needs to see in tick mode.
+
+_serial_uart = [None]
+_serial_rx_buf = bytearray()
+try:
+    import threading as _threading
+    _serial_rx_lock = _threading.Lock()
+except ImportError:
+    _serial_rx_lock = None
+
+
+def serial_init(uart_path):
+    # Subscribe to CharReceived on the named UART and start
+    # accumulating firmware-emitted bytes for serial_drain_hex.
+    try:
+        uart = _M.Machine[uart_path]
+    except Exception as e:
+        _log("serial_init: cannot find %s: %s", uart_path, e)
+        return
+    _serial_uart[0] = uart
+
+    def _on_char(c):
+        b = int(c) & 0xff
+        if _serial_rx_lock is not None:
+            _serial_rx_lock.acquire()
+            try:
+                _serial_rx_buf.append(b)
+            finally:
+                _serial_rx_lock.release()
+        else:
+            _serial_rx_buf.append(b)
+
+    try:
+        uart.CharReceived += _on_char
+    except Exception as e:
+        _log("serial_init: CharReceived subscribe err: %s", e)
+        return
+    _log("serial_init: bridged %s", uart_path)
+
+
+def serial_write_hex(hex_str):
+    # Inject a hex-encoded byte stream into the firmware's UART RX.
+    # Each WriteChar call delivers one byte to the model; the firmware
+    # picks them up via its serial RX interrupt during the next
+    # RunFor.
+    uart = _serial_uart[0]
+    if uart is None or not hex_str:
+        return
+    try:
+        for i in range(0, len(hex_str), 2):
+            uart.WriteChar(int(hex_str[i:i + 2], 16))
+    except Exception as e:
+        _log("serial_write_hex: err at offset %d: %s", i, e)
+
+
+def serial_drain_hex():
+    # Return accumulated firmware-output bytes as a hex string, then
+    # clear the buffer. Stdout output is what the launcher's Monitor
+    # response parser will pick up.
+    import sys
+    # Peek SchedStatus.shutdown_reason on every drain (free - the
+    # Monitor call to serial_drain_hex is already running); _log()
+    # writes to /tmp/sw_uart_trace.log whenever the value changes.
+    peek_shutdown_reason()
+    if _serial_rx_lock is not None:
+        _serial_rx_lock.acquire()
+    try:
+        if not _serial_rx_buf:
+            return
+        s = ''.join('%02x' % b for b in _serial_rx_buf)
+        del _serial_rx_buf[:]
+    finally:
+        if _serial_rx_lock is not None:
+            _serial_rx_lock.release()
+    sys.stdout.write(s)
+
+
+def serial_tick(tx_hex, delta_us):
+    # Combined "host serial shuttle one quantum" entry point used by
+    # the launcher to avoid round-tripping 3 separate Monitor commands
+    # per klippy tick (write_hex, RunFor, drain_hex). The launcher
+    # invokes this from a single `python "..."` so the wall-clock
+    # overhead for one tick advance is ~10 ms instead of ~30 ms.
+    #
+    #   tx_hex   - klippy -> firmware bytes (hex)
+    #   delta_us - microseconds of virtual time to advance
+    #
+    # Prints the firmware-emitted bytes (hex) to stdout so the launcher
+    # response parser picks them up; no return value.
+    import sys
+    from Antmicro.Renode.Time import TimeInterval
+    if tx_hex:
+        serial_write_hex(tx_hex)
+    if int(delta_us) > 0:
+        # Use the master emulation time source via the Monitor's
+        # python helper so we don't need to thread the launcher's
+        # `monitor` reference here. The shortcut name `emulation`
+        # injected by Renode at script init is not available in this
+        # module scope; reach through EmulationManager directly.
+        from Antmicro.Renode.Core import EmulationManager
+        emu = EmulationManager.Instance.CurrentEmulation
+        emu.RunFor(TimeInterval.FromMicroseconds(int(delta_us)))
+    serial_drain_hex()
