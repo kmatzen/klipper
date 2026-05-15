@@ -264,6 +264,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/samd51_smoke.test", \
      "test/klippy/sam3x_smoke.test", \
      "test/klippy/sam4s_smoke.test", \
+     "test/klippy/duet2_maestro.test", \
      "test/klippy/sam4e_smoke.test", \
      "test/klippy/same70_smoke.test", \
      "test/klippy/same70_usb_smoke.test", \

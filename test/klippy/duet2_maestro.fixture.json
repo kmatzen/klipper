@@ -1,0 +1,14 @@
+{
+    "_comment": "End-to-end fixture for duet2-maestro on SAM4S8C via renode. analog_in_default sets every ADC channel to mid-range (~25 C cold-thermistor reading); the per-channel overrides give the adc_scaled reference pins distinct values so the (PB0 - PA19) / (PA17 - PA19) ratio doesn't divide by zero, and bump the extruder thermistor (PB0 = AD4) hot enough for any extrude gcode to clear klippy's min_extrude_temp default. auto_trsync_trigger_ticks fires synthetic endstop triggers after a short step burst on each axis so G28 completes without per-axis scripting. sw_uart is auto-emitted (default sw_uart_auto=true) and routes to the renode 6-arg form because the bridge's backend is renode; renode_hooks.sw_uart attaches CPU PC hooks at tmcuart_read_event etc and bit-drives the response. prepend_gcode raises extruder/bed temp via M104/M140 so M109/M190 in the test can complete; the M105 wait gives klippy time to ingest the first thermistor sample before SET_HEATER_TEMP fires.",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_vref": {"default_value": 8000, "channel": 0},
+        "_vssa": {"default_value": 100, "channel": 2},
+        "_bed": {"default_value": 5000, "channel": 3},
+        "_hot_extruder_0": {"default_value": 1200, "channel": 4}
+    },
+    "auto_trsync_trigger_ticks": 160000,
+    "tick_mode": false
+}
