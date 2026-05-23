@@ -2734,6 +2734,14 @@ suart_drain_output(void)
 int
 main(int argc, char *argv[])
 {
+    /* Never let a write() to a peer that has closed its end (the control
+     * socket or the host-link pty) kill us: the default SIGPIPE action
+     * terminates the process. klippy closes the fixture control socket
+     * once it has pushed the fixture, so the control thread's later "OK"
+     * ack writes hit EPIPE - without this the whole bridge dies silently
+     * mid-test (no signal handler runs), the pty master closes, and
+     * klippy reads EOF. Ignore SIGPIPE so those writes just return -1. */
+    signal(SIGPIPE, SIG_IGN);
     const char *elf_path = NULL;
     const char *slave_link_path = NULL;
     const char *control_socket_path = NULL;
