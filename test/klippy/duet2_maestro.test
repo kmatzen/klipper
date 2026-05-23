@@ -18,12 +18,19 @@
 # G28 / G1 / SET_HEATER_TEMP are intentionally OMITTED: Renode's JIT
 # CPU executes the firmware at a wall-clock-bound rate that drifts
 # from the configured 120 MHz CONFIG_CLOCK_FREQ (klippy logs "MCU
-# 'mcu' configured for 120Mhz but running at 81Mhz"); under that
-# drift, klippy schedules clock-pegged stepper / digital-out commands
-# at clock values the firmware sees as in the past, raising "Timer
-# too close" shutdowns. Real-time Renode is not yet a deterministic-
-# enough timing source for the step / heater path on this chip; the
-# fixture stays at tick_mode: false until that gap is closed.
+# 'mcu' configured for ~120Mhz but running at ~80Mhz"); klippy's
+# clocksync adapts to the measured rate, but the step path is
+# sensitive to JIT-burst jitter - a homing / G1 move schedules
+# clock-pegged step + trsync commands that a burst can push into the
+# firmware's past, raising "Timer too close". Driving steppers needs
+# a deterministic timing source (a tick-mode pty shuttle), which
+# renode's Monitor-per-RunFor overhead makes too slow for ARM
+# identify today (verified: ARM tick-mode mis-frames identify); motion
+# gcode stays out of scope here. The identify / clocksync / config /
+# TMC-init / adc_scaled path this test DOES exercise has no queued
+# moves and so no timer pressure - it completes with no firmware
+# shutdown, which is why this test (unlike during development) no
+# longer needs ALLOW_SHUTDOWN.
 DICTIONARY sam4s8c.dict
 CONFIG duet2_maestro.cfg
 EMULATOR duet2_maestro.fixture.json
@@ -42,27 +49,14 @@ EMULATOR duet2_maestro.fixture.json
 #     on this config, not single-wire AVR)
 #   - local sam4s8c.repl with DWT.frequency pinned to CONFIG_CLOCK_FREQ
 #
-# ALLOW_SHUTDOWN is set because Renode's JIT executes the firmware
-# at a wall-clock-bound rate that drifts from the configured 120 MHz
-# CLOCK_FREQ (klippy logs "configured for 120Mhz but running at
-# 81Mhz"); the drift propagates into klippy's clocksync, which then
-# schedules step / digital-out commands at clock values the firmware
-# sees as in the past, raising "Timer too close" during TMC init's
-# select-pin mux toggles. Eliminating that drift needs a deterministic
-# timing source (Renode CPU rate cap, or a working tick-mode pty
-# shuttle); both are out of scope for this PR. The positive checks
-# below ensure we still observe the identify / clocksync / sw_uart
-# chain working before the eventual shutdown.
-ALLOW_SHUTDOWN
-
 # Positive checks scoped to klippy-side mcu_identify + config-build
-# state machines, which run deterministically off the dictionary load
-# and don't depend on Renode-JIT-pace timing. The downstream TMC
-# register-read assertions ("TMC 'stepper_x' reports GSTAT") were
-# tried but proved flaky - whether the read fires before "Timer too
-# close" shutdown depends on how fast Renode's JIT runs the firmware
-# on a given host, which varies enough across CI/laptop loads to be
-# noisy.
+# state machines plus the TMC virtual-enable path, all of which run
+# deterministically off the dictionary load and the converged clock
+# estimate (no queued moves => no timer pressure). The downstream TMC
+# register-read *value* assertions ("TMC 'stepper_x' reports GSTAT")
+# were tried but proved flaky - whether a given read's response framing
+# lands within klippy's retry window depends on Renode JIT pace, which
+# varies across host loads.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'stepper_x'"
@@ -80,3 +74,8 @@ EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
 # failure modes too.
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
 EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# No queued moves => no timer pressure: the identify / config / TMC /
+# adc_scaled path must complete without any firmware shutdown.
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
