@@ -73,7 +73,12 @@ PMC_SR: Python.PythonPeripheral @ sysbus 0x400E0468
 uart0: UART.SAM_USART @ sysbus 0x400E0600
     uartOnlyMode: true
     enablePdc: true
-    ->nvic@8
+    // SAM4E UART0_IRQn = 7 (lib/sam4e/include/sam4e8e.h); note this
+    // differs from SAM4S where UART0 is IRQ 8. Wiring it to nvic@8
+    // (the SAM4S value) left the RX interrupt undelivered, so the
+    // firmware never saw klippy's identify bytes ("Serial connection
+    // closed" during connect).
+    ->nvic@7
 
 eefc: Miscellaneous.SAM4S_EEFC @ sysbus 0x400E0A00
     underlyingMemory: flash
