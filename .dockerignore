@@ -1,0 +1,13 @@
+# The emulator-test image (scripts/Dockerfile.emulator-test) rebuilds
+# every firmware .dict/.elf and the simavr bridge from source, so none
+# of these need to enter the build context. Keeping them out makes the
+# `docker build` context transfer fast and stops stale host artifacts
+# from being COPYed into /klipper.
+.git
+out
+ci_build
+.claude
+.run_logs
+**/__pycache__
+*.pyc
+_test_*
