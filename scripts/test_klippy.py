@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import json, sys, os, optparse, logging, re, socket, subprocess, time
+import shutil
 
 # Python 2.7 compatibility - test_klippy.py is run under both python2 and
 # python3 in CI.
@@ -64,6 +65,7 @@ class TestCase:
         log_required = []
         log_forbidden = []
         should_fail = multi_tests = allow_shutdown = False
+        requires_emulator = False
         gcode = []
         f = open(self.fname, 'r')
         for raw_line in f:
@@ -109,6 +111,13 @@ class TestCase:
                 should_fail = True
             elif parts[0] == "ALLOW_SHUTDOWN":
                 allow_shutdown = True
+            elif parts[0] == "REQUIRES_EMULATOR":
+                # This test's assertions depend on real MCU responses
+                # (a fixture-driven sensor read, multi-MCU clock sync,
+                # etc.) that fileoutput's all-zero DummyResponse can't
+                # provide. When the emulator backend isn't built it is
+                # skipped rather than degraded to fileoutput.
+                requires_emulator = True
             else:
                 gcode.append(raw_line.strip())
         f.close()
@@ -128,10 +137,11 @@ class TestCase:
         if not multi_tests:
             self.launch_test(config_fname, dict_fnames, gcode_fname, gcode,
                              should_fail, emulator_fixture, log_required,
-                             log_forbidden, allow_shutdown)
+                             log_forbidden, allow_shutdown, requires_emulator)
     def launch_test(self, config_fname, dict_fnames, gcode_fname, gcode,
                     should_fail, emulator_fixture=None, log_required=None,
-                    log_forbidden=None, allow_shutdown=False):
+                    log_forbidden=None, allow_shutdown=False,
+                    requires_emulator=False):
         # Under --force-emulator, skip subtests whose dict file isn't
         # present in dictdir. printers.test iterates ~30 MCU configs
         # and the emulator-test Docker image only builds the AVR
@@ -193,6 +203,29 @@ class TestCase:
             raise error("config file not specified")
         if dict_fnames is None:
             raise error("data dictionary file not specified")
+        # When the emulator backend isn't built (the stock
+        # scripts/ci-build.sh compiles .dict files but no .elf / simavr
+        # bridge / renode), an EMULATOR-directive test can't run under
+        # the bridge. Rather than hard-fail that CI, degrade to
+        # fileoutput mode - the same path these tests took before they
+        # opted into EMULATOR, so coverage is preserved and the suite
+        # stays green. --force-emulator keeps the strict path (its own
+        # missing-dict / pin-conflict skips above handle partial
+        # builds); the emulator-test Docker image always has the
+        # backend, so end-to-end firmware coverage is unaffected there.
+        if (emulator_fixture is not None and not self.force_emulator
+                and not self._emulator_backend_available(dict_fnames)):
+            if requires_emulator:
+                sys.stderr.write(
+                    "    Skipping %s (%s) - REQUIRES_EMULATOR and the "
+                    "emulator backend (.elf/bridge/renode) is not built\n"
+                    % (self.fname, os.path.basename(config_fname)))
+                return
+            sys.stderr.write(
+                "    %s (%s): emulator backend not built - "
+                "running fileoutput mode\n"
+                % (self.fname, os.path.basename(config_fname)))
+            emulator_fixture = None
         sys.stderr.write("    Starting %s (%s)\n" % (
             self.fname, os.path.basename(config_fname)))
         if emulator_fixture is not None:
@@ -1504,6 +1537,34 @@ class TestCase:
             with open(os.path.join(dev_dir, 'w1_slave'), 'w') as f:
                 f.write(payload)
         return w1_root
+
+    def _emulator_backend_available(self, dict_fnames):
+        # True only if every MCU dict in this test has a runnable
+        # emulator backend present: a matching .elf plus the tool that
+        # runs it (simavr bridge / renode / the linuxprocess binary is
+        # the .elf itself). The stock scripts/ci-build.sh compiles
+        # .dict files but no .elf / bridge / renode, so this returns
+        # False there and the caller degrades to fileoutput mode.
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir))
+        bridge_path = os.path.join(repo_root, 'ci_build', 'simavr_bridge')
+        renode_launcher = os.path.join(repo_root, 'test', 'emulator',
+                                       'renode_launcher.py')
+        for df in dict_fnames or ():
+            dpath = df.split('=', 1)[1] if '=' in df else df
+            if self._find_elf_for_dict(dpath) is None:
+                return False
+            backend = self._backend_for_dict(dpath)
+            if backend == 'simavr':
+                if not (os.path.isfile(bridge_path)
+                        and os.access(bridge_path, os.X_OK)):
+                    return False
+            elif backend == 'renode':
+                if (not os.path.isfile(renode_launcher)
+                        or shutil.which('renode') is None):
+                    return False
+            # linuxprocess: the .elf checked above is the runnable.
+        return True
 
     def _find_elf_for_dict(self, dict_path):
         # The Dockerfile builds a parallel ci_build/elf/<mcu>.elf

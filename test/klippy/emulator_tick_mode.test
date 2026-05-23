@@ -10,6 +10,8 @@
 CONFIG emulator_smoke.cfg
 DICTIONARY atmega2560.dict
 EMULATOR emulator_tick_mode.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+# skipped (not degraded to fileoutput) when the emulator backend isn't built
 
 # A few harmless gcode lines so klippy gets past klippy:ready.
 M114

@@ -2,6 +2,8 @@
 DICTIONARY atmega2560.dict
 CONFIG temperature.cfg
 EMULATOR temperature.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+# skipped (not degraded to fileoutput) when the emulator backend isn't built
 
 # Set various temperatures - exercises target setpoints on the
 # extruder + bed without crashing klippy. The bridge does not model
