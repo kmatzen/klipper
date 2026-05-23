@@ -112,6 +112,18 @@ class ClockSync:
             self.clock_covariance + diff_sent_time * diff_clock * DECAY)
         # Update prediction from linear regression
         new_freq = self.clock_covariance / self.time_variance
+        if new_freq <= 0.:
+            # A non-positive regression slope is physically impossible -
+            # the MCU clock increases monotonically, so a real link only
+            # ever yields a positive frequency. It arises solely from a
+            # transient measurement glitch (observed under emulator
+            # wall-clock jitter at connect; never on real hardware).
+            # Handing it to serialqueue_set_clock_est would raise
+            # OverflowError (freq is unsigned in the C layer), so drop
+            # this sample and keep the previous estimate; the regression
+            # accumulators updated above yield a sane slope on the next
+            # clock message.
+            return
         pred_stddev = math.sqrt(self.prediction_variance)
         self.serial.set_clock_est(new_freq, self.time_avg + TRANSMIT_EXTRA,
                                   int(self.clock_avg - 3. * pred_stddev), clock)
