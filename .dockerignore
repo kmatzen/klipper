@@ -10,4 +10,9 @@ ci_build
 .run_logs
 **/__pycache__
 *.pyc
+# Built C-helper library: chelper.get_ffi() compiles it in-container. A
+# host-built copy (e.g. an arm64 .so rsynced onto an x86_64 build host)
+# would be COPYed in, look "up to date" by mtime, and make get_ffi() skip
+# the rebuild then fail to dlopen the wrong-arch binary.
+*.so
 _test_*

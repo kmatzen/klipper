@@ -723,10 +723,15 @@ def peek_shutdown_reason():
         return None
     try:
         sb = _M.Machine.SystemBus
+        status = int(sb.ReadByte(addr + 10)) & 0xff
         reason = int(sb.ReadByte(addr + 11)) & 0xff
     except Exception as e:
         _log("peek_shutdown_reason: ReadByte err %s", e)
         return None
+    if status:
+        # shutdown_status non-zero == firmware genuinely shut down;
+        # surface even if shutdown_reason byte read came back 0.
+        return reason if reason else 0xff
     if reason != _last_shutdown_reason[0]:
         _last_shutdown_reason[0] = reason
         if reason:

@@ -11,31 +11,37 @@
 # resident unconditionally and stays idle when the firmware never
 # touches it).
 #
-# KNOWN BLOCKED (the "44th" test in the PR summary). The skip-enum
-# cheat works far enough that klippy completes identify ("Loaded MCU
-# 'mcu' 132 commands"), but _send_get_config then sees is_shutdown=1
-# and raises. Diagnosis (refined this round; run with
-# RENODE_PEEK_SHUTDOWN=1 to surface it - the launcher logs "FIRMWARE
-# SHUTDOWN reason=N"):
-#   * The firmware shuts down with static_string_id 56, "Rescheduled
-#     timer in the past" (armcm_timer.c timer_dispatch_many: the next
-#     timer is >1ms behind DWT->CYCCNT).
-#   * It is USB-build specific: same70_smoke (serial) never shuts down,
-#     and a no-enumeration A/B (suppressing the SETUP injection so no
-#     klippy traffic flows) still shuts down - so the cause is the
-#     USB-build boot/main-loop, not klippy traffic or the cheat itself.
-#   * It is a CPU-rate / DWT-overshoot effect, NOT the systickFrequency
-#     mismatch the earlier hypothesis blamed: 450MHz systick vs 300MHz
-#     DWT fires the SysTick one-shot EARLY (-> harmless busy-wait), not
-#     late. Raising the Renode CPU rate (RENODE_EXP_MIPS=1000) makes
-#     the overshoot disappear - but then USB enumeration no longer
-#     completes (klippy: "Wait for identify_response" -> connection
-#     closed). So there is a real timing tension: the rate that avoids
-#     the timer overshoot breaks the USBHS enumeration timing, and vice
-#     versa. No single RENODE_EXP_MIPS / SetGlobalQuantum value tried
-#     satisfies both; closing this needs the USBHS model's enumeration
-#     made robust across CPU rates (or deterministic tick-mode on ARM,
-#     which currently mis-frames identify).
+# KNOWN BLOCKED (the one remaining EMULATOR test that does not pass
+# under --force-emulator). Diagnosis below is from clean-host runs on a
+# native-Linux x86_64 box (deterministic, not the disk-pressured macOS
+# Docker that masked these as flaky):
+#   * At the upstream SysTick rate the skip-enum cheat works end-to-end:
+#     enumeration completes, klippy reaches "Loaded MCU 'mcu'" and ~110
+#     BULK_IN transfers flow, then the firmware shuts down with
+#     static_string_id 56 "Rescheduled timer in the past" (armcm_timer.c
+#     timer_dispatch_many: a scheduled timer is >1ms behind DWT->CYCCNT).
+#   * It is NOT a SysTick-frequency mismatch: pinning the NVIC
+#     systickFrequency to the 300MHz core clock removes the shutdown but
+#     deterministically BREAKS enumeration (the firmware then never
+#     enables RXSTPES on EP0, so the SETUP cheat never injects). Tried
+#     and reverted.
+#   * It is NOT IRQ-servicing granularity: a cpu MaximumBlockSize sweep
+#     (1..1024 via RENODE_EXP_BLOCKSIZE) leaves the reason-56 shutdown
+#     unchanged.
+#   * Root cause is the wall-clock vs virtual-time drift: Renode runs the
+#     SAM CPU at a rate that diverges from CONFIG_CLOCK_FREQ, so klippy's
+#     clocksync (wall-clock paced) computes garbage and the firmware's
+#     own USB-build boot timers overshoot. Raising RENODE_EXP_MIPS hides
+#     the overshoot but then runs virtual time faster than the
+#     wall-clock-paced klippy/USB pty can follow, so enumeration breaks -
+#     a genuine two-sided tension. The same drift is why renode homing
+#     ("Communication timeout") and the migrated tick tests fail.
+#   * The real fix is deterministic tick-mode on ARM, which today
+#     livelocks: the byte shuttle is not synchronized with each RunFor
+#     (klippy's serialqueue C bg-thread polls in real time while sim time
+#     advances in jumps), so klippy re-requests the same advance target
+#     forever and identify never frames. Closing this needs a synchronous
+#     RunFor<->UART byte shuttle plus a sim-time-aware serialqueue.
 DICTIONARY same70q20b-usb.dict
 CONFIG same70_usb_smoke.cfg
 EMULATOR same70_usb_smoke.fixture.json

@@ -544,6 +544,19 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
     _exp_mips = os.environ.get('RENODE_EXP_MIPS')
     if _exp_mips:
         timing_block += 'cpu PerformanceInMips %s\n' % _exp_mips
+    # RENODE_EXP_BLOCKSIZE caps the CPU's translation-block size so the
+    # CPU services a pending IRQ (e.g. SysTick) after fewer instructions.
+    # The hypothesis was that a large block lets DWT->CYCCNT run past a
+    # due timer deadline before SysTick_Handler fires, tripping
+    # armcm_timer.c's ">1ms in the past" shutdown (reason 56). Empirically
+    # this is NOT the cause for the SAME70 USB build: a sweep from 1..1024
+    # left the reason-56 shutdown unchanged (the overshoot is not
+    # IRQ-servicing-granularity-bound; it comes from the wall-clock vs
+    # virtual-time drift that only deterministic tick-mode removes). Kept
+    # as a diagnostic knob alongside MIPS/QUANTUM. No-op when unset.
+    _exp_blocksize = os.environ.get('RENODE_EXP_BLOCKSIZE')
+    if _exp_blocksize:
+        timing_block += 'cpu MaximumBlockSize %s\n' % _exp_blocksize
     usart = _host_link_peripheral(chip)
     if tick_mode:
         # Tick mode: skip Renode's pty terminal entirely. The launcher
@@ -616,13 +629,21 @@ def _connect_monitor(host, port, deadline):
         "accept connection within deadline" % (host, port))
 
 
-_PROMPT_RE = re.compile(rb'\([\w-]+\)\s*$')
+_monitor_nonce = [0]
 
 
-def _drain_monitor_until_prompt(sock, timeout=10.0):
-    # Renode's monitor echoes commands and prints `(<context>) ` as a
-    # prompt. We treat the prompt as the response delimiter. Returns
-    # the bytes received between the last command and the prompt.
+def _drain_monitor_until_marker(sock, marker, timeout=10.0):
+    # Drain until the unique per-call `marker` appears in the stream.
+    # The marker is emitted by a sentinel `python` command appended
+    # after the real command (see _send_monitor); it is constructed at
+    # runtime from string fragments so the marker text does NOT appear
+    # in the sentinel command's own echo - only in its evaluated output.
+    # That makes it an unambiguous response delimiter, unlike matching
+    # the `(<context>)` prompt: Renode echoes each command verbatim, and
+    # an echoed command containing a parenthesised identifier (e.g.
+    # `GetAllSymbolAddresses(n)`) can satisfy a `(\w+)`-style prompt
+    # match when a recv() chunk happens to end on it, desyncing every
+    # subsequent round-trip.
     deadline = time.monotonic() + timeout
     buf = b''
     while True:
@@ -641,14 +662,23 @@ def _drain_monitor_until_prompt(sock, timeout=10.0):
         if not chunk:
             return buf
         buf += chunk
-        if _PROMPT_RE.search(buf):
+        if marker in buf:
             return buf
 
 
 def _send_monitor(sock, line, timeout=10.0):
     # Trailing \n is required; carriage return optional but harmless.
-    sock.sendall((line + '\n').encode('utf-8'))
-    return _drain_monitor_until_prompt(sock, timeout=timeout)
+    # Append a sentinel command that prints a unique marker so the
+    # response delimiter is robust against echoed-command false matches.
+    _monitor_nonce[0] += 1
+    token = 'RLDONE%dX' % _monitor_nonce[0]
+    marker = token.encode('ascii')
+    # Build the printed token from two fragments so the literal `token`
+    # never appears in the sentinel's command echo - only its output.
+    sentinel = ('python "import sys; sys.stdout.write(\'%s\'+\'%s\')"'
+                % (token[:5], token[5:]))
+    sock.sendall((line + '\n' + sentinel + '\n').encode('utf-8'))
+    return _drain_monitor_until_marker(sock, marker, timeout=timeout)
 
 
 # ---------------------------------------------------------------------
@@ -773,6 +803,9 @@ def _resolve_sched_status_addr(monitor_sock):
         if m:
             sys.stderr.write("renode_launcher: SchedStatus @ 0x%X\n"
                              % int(m.group(1)))
+        else:
+            sys.stderr.write("renode_launcher: SchedStatus resolve "
+                             "no match in resp=%r\n" % resp[-200:])
     except Exception as e:
         sys.stderr.write("renode_launcher: SchedStatus resolve err %s\n" % e)
 
@@ -1602,7 +1635,11 @@ def main():
 
         monitor_sock = _connect_monitor(
             '127.0.0.1', monitor_port, startup_deadline)
-        _drain_monitor_until_prompt(monitor_sock)
+        # Consume Renode's startup banner and confirm the monitor is
+        # live by round-tripping a no-op through the sentinel-delimited
+        # _send_monitor (an empty command line just re-prints the
+        # prompt; the appended sentinel proves the monitor executes).
+        _send_monitor(monitor_sock, '', timeout=30.0)
 
         if tick_mode:
             # Subscribe to UART CharReceived in renode_hooks so
@@ -1709,9 +1746,13 @@ def main():
                         'sys.stdout.write(\\"PEEKREASON=%s\\" % '
                         'renode_hooks.peek_shutdown_reason())"',
                         timeout=5.0)
-                    m = re.search(rb'PEEKREASON=(\d+)', resp)
+                    m = re.search(rb'PEEKREASON=(-?\d+)', resp)
                     if m:
                         reason = int(m.group(1))
+                        if os.environ.get('RENODE_PEEK_DEBUG'):
+                            sys.stderr.write(
+                                "renode_launcher: PEEK reason=%d t=%.2f\n"
+                                % (reason, time.monotonic()))
                         if reason and reason != last_reason_logged[0]:
                             last_reason_logged[0] = reason
                             sys.stderr.write(
