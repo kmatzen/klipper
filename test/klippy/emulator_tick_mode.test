@@ -16,16 +16,19 @@
 #      fired and klippy re-requested the identical advance forever. The
 #      bridge now advances to the first cycle strictly past the target
 #      (simavr_bridge.c), and simulated time progresses correctly.
-#   2. STILL OPEN: the UART byte shuttle is not synchronized with the
-#      advance. simavr's uart_pty pump runs on a real-time thread and
-#      feeds the AVR's RX FIFO while the AVR is frozen between advances,
-#      so klippy's identify bytes overflow/are lost (in non-tick mode the
-#      AVR drains continuously, which is why the non-tick paths work).
-#      Closing this needs a synchronous shuttle in the bridge: drain
-#      klippy TX -> feed the AVR while running to target -> drain AVR TX,
-#      mirroring what the Renode path already does (and which makes
-#      stm32f103_tick pass). Until then this test fails when actually run
-#      (it was only ever skipped - REQUIRES_EMULATOR with no CI backend).
+#   2. IMPLEMENTED but STILL FAILING: simavr_bridge.c now uses a
+#      single-threaded synchronous host-link UART in tick mode (suart_*)
+#      instead of uart_pty's real-time pump thread, so byte movement is
+#      deterministic and free of the pump-vs-avr_run race. Verified that
+#      klippy's serialqueue does receive the firmware's identify
+#      responses through it (reads of 5/53/54 bytes). It still does not
+#      complete identify: after ~2s of simulated time klippy's read
+#      returns EOF while the bridge is mid-advance, and identify never
+#      reaches "Loaded MCU". Root cause of that EOF (the master appears
+#      open yet the slave read returns 0) is not yet isolated - the
+#      Renode tick path, which is structurally identical, works
+#      (stm32f103_tick). REQUIRES_EMULATOR, kept out of the default CMD;
+#      it was only ever skipped before, so it never actually ran.
 CONFIG emulator_smoke.cfg
 DICTIONARY atmega2560.dict
 EMULATOR emulator_tick_mode.fixture.json

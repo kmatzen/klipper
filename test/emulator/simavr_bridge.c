@@ -114,8 +114,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <pty.h>
 
 #include <simavr/sim_avr.h>
 #include <simavr/sim_elf.h>
@@ -129,12 +131,23 @@
 #include <simavr/parts/uart_pty.h>
 
 static volatile int g_running = 1;
+static avr_t *g_crash_avr = NULL;
 
 static void
 on_signal(int sig)
 {
     (void)sig;
     g_running = 0;
+}
+
+static void
+on_crash(int sig)
+{
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "BRIDGE CRASH sig=%d cyc=%llu\n", sig,
+                     g_crash_avr ? (unsigned long long)g_crash_avr->cycle : 0);
+    if (write(2, buf, n) < 0) { /* nothing else to do */ }
+    _exit(139);
 }
 
 /* ----------------------------- Control plane -----------------------
@@ -2575,6 +2588,149 @@ write_slave_link(const char *path, const char *slave_path)
     return 0;
 }
 
+/* ------------------------------------------------------------------ *
+ * Synchronous host-link UART for tick mode.
+ *
+ * simavr's stock uart_pty runs a background pthread that select()s on
+ * the pty and calls avr_raise_irq() to feed the AVR concurrently with
+ * the main thread's avr_run(). simavr is not thread-safe, and in tick
+ * mode the main thread runs the core in tight bursts while the pty
+ * thread feeds a core that is FROZEN between `advance` commands - that
+ * both races avr_run() (intermittent crashes) and overruns/loses bytes
+ * destined for the RX FIFO. So in tick mode we do not use uart_pty:
+ * instead we own the pty and shuttle bytes synchronously inside each
+ * advance (feed host->AVR as the core runs, gated by the UART's
+ * XON/XOFF flow-control IRQs; drain AVR->host after). Single-threaded,
+ * deterministic - the same shape the Renode launcher already uses. */
+static int g_suart_master = -1;
+static avr_irq_t *g_suart_in_irq = NULL;     /* host -> AVR (RX) */
+static int g_suart_xoff = 0;                  /* 1 => AVR RX FIFO full */
+static uint8_t g_suart_tx[16384];            /* AVR -> host pending */
+static size_t g_suart_tx_len = 0;
+static uint8_t g_suart_in[4096];             /* host bytes read, unfed */
+static size_t g_suart_in_pos = 0, g_suart_in_len = 0;
+
+static void
+suart_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq; (void)param;
+    if (g_suart_tx_len < sizeof(g_suart_tx))
+        g_suart_tx[g_suart_tx_len++] = (uint8_t)value;
+}
+static void
+suart_xon_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq; (void)value; (void)param;
+    g_suart_xoff = 0;
+}
+static void
+suart_xoff_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq; (void)value; (void)param;
+    g_suart_xoff = 1;
+}
+
+/* Bring up the synchronous UART: open a pty, wire the AVR UART '0' TX /
+ * XON / XOFF IRQs to the hooks above, grab the RX-input IRQ, and return
+ * the slave device path (static buffer) for write_slave_link(). */
+static const char *
+suart_setup(avr_t *avr)
+{
+    static char slavename[256];
+    int sfd = -1;
+    if (openpty(&g_suart_master, &sfd, slavename, NULL, NULL) < 0) {
+        fprintf(stderr, "simavr_bridge: openpty: %s\n", strerror(errno));
+        return NULL;
+    }
+    /* Close our slave fd: klippy reopens the slave by path (slave_link).
+     * Holding it open ourselves is what the renode launcher avoids -
+     * keeping a second slave fd leaves the pty in a state where klippy's
+     * serialqueue read can see a spurious EOF. Set the line discipline
+     * raw via the master fd (it controls the same tty termios) so
+     * klipper's binary framing passes untouched. */
+    struct termios tio;
+    if (tcgetattr(g_suart_master, &tio) == 0) {
+        cfmakeraw(&tio);
+        tcsetattr(g_suart_master, TCSANOW, &tio);
+    }
+    close(sfd);
+    int fl = fcntl(g_suart_master, F_GETFL, 0);
+    if (fl >= 0)
+        fcntl(g_suart_master, F_SETFL, fl | O_NONBLOCK);
+    /* Disable simavr's built-in stdio echo so UART output reaches our
+     * IRQ hook rather than the bridge's stdout. */
+    uint32_t f = 0;
+    avr_ioctl(avr, AVR_IOCTL_UART_GET_FLAGS('0'), &f);
+    f &= ~AVR_UART_FLAG_STDIO;
+    avr_ioctl(avr, AVR_IOCTL_UART_SET_FLAGS('0'), &f);
+    avr_irq_t *out = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'),
+                                   UART_IRQ_OUTPUT);
+    g_suart_in_irq = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'),
+                                   UART_IRQ_INPUT);
+    avr_irq_t *xon = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'),
+                                   UART_IRQ_OUT_XON);
+    avr_irq_t *xoff = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'),
+                                    UART_IRQ_OUT_XOFF);
+    if (out)
+        avr_irq_register_notify(out, suart_out_hook, NULL);
+    if (xon)
+        avr_irq_register_notify(xon, suart_xon_hook, NULL);
+    if (xoff)
+        avr_irq_register_notify(xoff, suart_xoff_hook, NULL);
+    return slavename;
+}
+
+/* Pull any bytes klippy wrote on the pty into our staging buffer. */
+static void
+suart_refill_input(void)
+{
+    if (g_suart_in_pos < g_suart_in_len || g_suart_master < 0)
+        return;
+    ssize_t n = read(g_suart_master, g_suart_in, sizeof(g_suart_in));
+    g_suart_in_pos = 0;
+    g_suart_in_len = (n > 0) ? (size_t)n : 0;
+}
+
+/* Feed at most one queued host byte into the AVR if its RX FIFO has
+ * room (not XOFF). Called once per avr_run() step so input is paced to
+ * the firmware's consumption and never overruns the FIFO. The pty read
+ * (refill) is throttled to once every 512 cycles when the staging
+ * buffer is empty so an idle link doesn't spin on read()/EAGAIN. */
+static void
+suart_feed_one(uint64_t cycle)
+{
+    if (g_suart_xoff || g_suart_in_irq == NULL)
+        return;
+    if (g_suart_in_pos >= g_suart_in_len) {
+        if (cycle & 0x1FF)
+            return;
+        suart_refill_input();
+    }
+    if (g_suart_in_pos < g_suart_in_len)
+        avr_raise_irq(g_suart_in_irq, g_suart_in[g_suart_in_pos++]);
+}
+
+/* Flush AVR-emitted bytes to the pty after an advance. */
+static void
+suart_drain_output(void)
+{
+    if (g_suart_master < 0 || g_suart_tx_len == 0)
+        return;
+    size_t off = 0;
+    while (off < g_suart_tx_len) {
+        ssize_t n = write(g_suart_master, g_suart_tx + off,
+                          g_suart_tx_len - off);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;  /* pty buffer full; drop the rest (klippy will retx) */
+        } else {
+            break;
+        }
+    }
+    g_suart_tx_len = 0;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2663,27 +2819,40 @@ main(int argc, char *argv[])
     uart_flags &= ~AVR_UART_FLAG_STDIO;
     avr_ioctl(avr, AVR_IOCTL_UART_SET_FLAGS('0'), &uart_flags);
 
-    /* uart_pty is simavr's prebuilt UART<->pty bridge. It opens a pty
-     * pair, runs an internal pump thread that drains the master fd
-     * into simavr's UART input IRQ (respecting XON/XOFF), and forwards
-     * UART output to the master fd so the slave side reads it. We
-     * avoid having to reimplement any of that. */
+    /* Host link. In tick mode use the single-threaded synchronous UART
+     * (suart_*, above) so byte movement is deterministic and avoids the
+     * uart_pty pump thread racing avr_run(). In free-run (non-tick) mode
+     * keep uart_pty: its pump thread overlapping continuous avr_run() is
+     * fine and we get its pty + flow-control plumbing for free. */
+    int tick_mode = (tick_socket_path != NULL);
     static uart_pty_t pty;
-    uart_pty_init(avr, &pty);
-    uart_pty_connect(&pty, '0');
+    const char *host_slavename = NULL;
+    if (tick_mode) {
+        host_slavename = suart_setup(avr);
+        if (!host_slavename)
+            return 1;
+    } else {
+        /* uart_pty is simavr's prebuilt UART<->pty bridge. It opens a
+         * pty pair, runs an internal pump thread that drains the master
+         * fd into simavr's UART input IRQ (respecting XON/XOFF), and
+         * forwards UART output to the master fd so the slave reads it. */
+        uart_pty_init(avr, &pty);
+        uart_pty_connect(&pty, '0');
+        host_slavename = pty.pty.slavename;
+    }
 
     if (verbose)
         fprintf(stderr,
-            "simavr_bridge: pty slave %s mcu %s freq %u\n",
-            pty.pty.slavename, mcu_name, avr->frequency);
+            "simavr_bridge: pty slave %s mcu %s freq %u tick=%d\n",
+            host_slavename, mcu_name, avr->frequency, tick_mode);
 
     /* Make the slave node accessible to other processes in the
      * container (klippy generally runs as a different uid in real
      * deployments, but in tests both run as root - even so, openpty
      * leaves the slave at mode 0620 which is restrictive). */
-    if (chmod(pty.pty.slavename, 0666) < 0) {
+    if (chmod(host_slavename, 0666) < 0) {
         fprintf(stderr, "simavr_bridge: chmod %s 0666: %s\n",
-                pty.pty.slavename, strerror(errno));
+                host_slavename, strerror(errno));
     }
 
     /* Hook the SPI MOSI byte stream so each firmware write to SPDR
@@ -2720,7 +2889,7 @@ main(int argc, char *argv[])
                     tick_socket_path);
     }
 
-    if (write_slave_link(slave_link_path, pty.pty.slavename) < 0)
+    if (write_slave_link(slave_link_path, host_slavename) < 0)
         return 1;
 
     /* Spawn the control socket listener if asked. The thread runs
@@ -2750,6 +2919,9 @@ main(int argc, char *argv[])
 
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
+    g_crash_avr = avr;
+    signal(SIGSEGV, on_crash);
+    signal(SIGABRT, on_crash);
 
     /* Duration safety net: kills the simulator after N WALL seconds
      * so a hung firmware test doesn't run forever in CI. */
@@ -2857,10 +3029,38 @@ main(int argc, char *argv[])
              * need this: emulation RunFor takes a time, not cycles.) */
             avr_cycle_count_t target_cycle =
                 (avr_cycle_count_t)(target * (double)avr->frequency) + 1;
+            avr_cycle_count_t _stall_prev = avr->cycle;
+            uint64_t _stall_n = 0;
             while (g_running && avr->cycle < target_cycle
                    && state != cpu_Done && state != cpu_Crashed) {
+                /* Synchronous host-link shuttle (tick mode): feed one
+                 * pending klippy byte into the AVR per step (flow-control
+                 * gated) so RX bytes are delivered as the core runs,
+                 * never to a frozen core. No-op when g_suart_in_irq is
+                 * NULL (free-run mode uses uart_pty instead). */
+                suart_feed_one(avr->cycle);
                 state = avr_run(avr);
+                /* Stall guard: if the core stops advancing its cycle
+                 * counter (e.g. SLEEP with no pending cycle-timer to
+                 * fast-forward to) we would spin here forever. Bail to
+                 * the target so the advance completes and klippy's timer
+                 * still fires (the firmware will simply have no new
+                 * output this quantum). */
+                if (avr->cycle != _stall_prev) {
+                    _stall_prev = avr->cycle;
+                    _stall_n = 0;
+                } else if (++_stall_n > 200000) {
+                    if (verbose)
+                        fprintf(stderr, "TICKDIAG STALL at cyc=%llu "
+                                "target=%llu state=%d\n",
+                                (unsigned long long)avr->cycle,
+                                (unsigned long long)target_cycle, state);
+                    avr->cycle = target_cycle;
+                    break;
+                }
             }
+            /* Flush AVR-emitted bytes to the pty after the advance. */
+            suart_drain_output();
             if (sim_time_ptr)
                 *sim_time_ptr = (double)avr->cycle / (double)avr->frequency;
             /* Honor the wall-clock duration safety net even in tick
