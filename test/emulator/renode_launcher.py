@@ -532,6 +532,18 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
                           'sysbus LoadELF @{elf}\n').format(elf=elf_path)
     else:
         elf_load_block = 'sysbus LoadELF @{elf}\n'.format(elf=elf_path)
+    # EXPERIMENT knobs (env-driven so they can be toggled without a
+    # rebuild): RENODE_EXP_QUANTUM sets the emulation global sync
+    # quantum in seconds (smaller = finer host/virtual interleaving =
+    # less bursty clock, at the cost of speed); RENODE_EXP_MIPS pins
+    # the CPU's reported MIPS. Both are no-ops when unset.
+    timing_block = ''
+    _exp_quantum = os.environ.get('RENODE_EXP_QUANTUM')
+    if _exp_quantum:
+        timing_block += 'emulation SetGlobalQuantum "%s"\n' % _exp_quantum
+    _exp_mips = os.environ.get('RENODE_EXP_MIPS')
+    if _exp_mips:
+        timing_block += 'cpu PerformanceInMips %s\n' % _exp_mips
     usart = _host_link_peripheral(chip)
     if tick_mode:
         # Tick mode: skip Renode's pty terminal entirely. The launcher
@@ -549,6 +561,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
         'mach create "klipper-{chip}"\n'
         '{cs_include_block}'
         'machine LoadPlatformDescription {platform}\n'
+        '{timing_block}'
         '{rcc_block}'
         '{afec_block}'
         '{extra_block}'
@@ -575,7 +588,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
              elf_load_block=elf_load_block,
-             uart_block=uart_block,
+             uart_block=uart_block, timing_block=timing_block,
              hooks_dir=os.path.dirname(_HOOKS_PY))
 
 
@@ -748,12 +761,18 @@ def _resolve_sched_status_addr(monitor_sock):
     # the shutdown response message until the dict is loaded, so
     # firmware shutdowns during identify are otherwise opaque.
     cmd = (
-        'python "import renode_hooks; '
+        'python "import sys, renode_hooks; '
         'sb = monitor.Machine[\\"sysbus\\"]; '
         'a = list(sb.GetAllSymbolAddresses(\\"SchedStatus\\")); '
-        'renode_hooks.apply_sched_status_addr(int(a[0]) if a else 0)"')
+        'renode_hooks.apply_sched_status_addr(int(a[0]) if a else 0); '
+        'sys.stdout.write(\\"SCHEDSTATUS=%s\\" % '
+        '(int(a[0]) if a else 0))"')
     try:
-        _send_monitor(monitor_sock, cmd)
+        resp = _send_monitor(monitor_sock, cmd)
+        m = re.search(rb'SCHEDSTATUS=(\d+)', resp)
+        if m:
+            sys.stderr.write("renode_launcher: SchedStatus @ 0x%X\n"
+                             % int(m.group(1)))
     except Exception as e:
         sys.stderr.write("renode_launcher: SchedStatus resolve err %s\n" % e)
 
@@ -1651,12 +1670,57 @@ def main():
         # --duration clock now so klippy gets its full work window.
         deadline = time.monotonic() + args.duration
 
-        # Wait for Renode subprocess or duration cap.
+        # Optional firmware-shutdown surfacing (debug aid, opt-in via
+        # RENODE_PEEK_SHUTDOWN). In real-time (non-tick) mode nothing
+        # else polls the firmware's shutdown state, so a firmware
+        # shutdown during the klippy handshake is otherwise invisible in
+        # the launcher trace (klippy just sees is_shutdown=1 at
+        # get_config and can't decode the reason if it fired before the
+        # dict loaded). When enabled, peek SchedStatus.shutdown_reason
+        # periodically and log the static_string_id the first time it
+        # goes non-zero (map via the dict's enumerations.static_string_id;
+        # this is how the SAME70 USB-CDC "Rescheduled timer in the past"
+        # / id 56 blocker was diagnosed). It is OFF by default because
+        # each peek issues a Monitor `python` round-trip, and under
+        # real-time execution that can perturb the CPU / pty timing
+        # enough to glitch klippy's clocksync (negative freq estimate).
+        # Tick mode already peeks inside serial_drain_hex.
+        peek_shutdown = (tick_state is None
+                         and os.environ.get('RENODE_PEEK_SHUTDOWN'))
+        peek_interval = 0.25
+        next_peek = time.monotonic() + peek_interval
+        last_reason_logged = [0]
         while not stop_evt[0]:
             if proc.poll() is not None:
                 break
             if time.monotonic() >= deadline:
                 break
+            if peek_shutdown and time.monotonic() >= next_peek:
+                next_peek = time.monotonic() + peek_interval
+                try:
+                    # Print the reason into the Monitor response so the
+                    # launcher (whose stderr IS captured into the test's
+                    # emu log) can surface it - renode_hooks._log writes
+                    # to the embedded-IronPython sys.stderr, which goes
+                    # to the discarded Monitor response, not the emu log.
+                    resp = _send_monitor(
+                        monitor_sock,
+                        'python "import sys; '
+                        'sys.stdout.write(\\"PEEKREASON=%s\\" % '
+                        'renode_hooks.peek_shutdown_reason())"',
+                        timeout=5.0)
+                    m = re.search(rb'PEEKREASON=(\d+)', resp)
+                    if m:
+                        reason = int(m.group(1))
+                        if reason and reason != last_reason_logged[0]:
+                            last_reason_logged[0] = reason
+                            sys.stderr.write(
+                                "renode_launcher: FIRMWARE SHUTDOWN "
+                                "reason=%d (static_string_id; map via "
+                                "dict enumerations.static_string_id)\n"
+                                % reason)
+                except Exception:
+                    pass
             time.sleep(0.1)
     finally:
         stop_evt[0] = True
