@@ -2843,8 +2843,20 @@ main(int argc, char *argv[])
                 if (write(tick_client_fd, reply, rl) != rl) break;
                 continue;
             }
+            /* Advance to the first cycle STRICTLY past the requested
+             * sim-time. klippy's reactor schedules timers (incl. the
+             * greenlet wakeups behind reactor.pause()) at arbitrary float
+             * times and fires them when eventtime >= waketime. The AVR
+             * clock only lands on integer cycles, so truncating
+             * target*freq would stop the AVR a fraction of a cycle BELOW
+             * a waketime that sits between two cycles -- the timer would
+             * never fire, klippy would re-request the identical advance,
+             * and tick mode would livelock (identify never completes).
+             * The +1 guarantees sim_time = avr->cycle/freq > target, so
+             * any timer at <= target is reached. (The Renode path doesn't
+             * need this: emulation RunFor takes a time, not cycles.) */
             avr_cycle_count_t target_cycle =
-                (avr_cycle_count_t)(target * (double)avr->frequency);
+                (avr_cycle_count_t)(target * (double)avr->frequency) + 1;
             while (g_running && avr->cycle < target_cycle
                    && state != cpu_Done && state != cpu_Crashed) {
                 state = avr_run(avr);

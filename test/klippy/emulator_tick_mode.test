@@ -8,17 +8,24 @@
 # CPU-contended hosts. We reuse emulator_smoke.cfg unchanged - the
 # only difference is the fixture's `tick_mode: true` flag.
 #
-# KNOWN BLOCKED under --force-emulator (clean-host finding): tick-mode
-# lockstep livelocks during identify. The bridge's UART byte shuttle is
-# not synchronized with each RunFor - klippy writes identify bytes via
-# the serialqueue C bg-thread (real-time poll) while the reactor advances
-# sim time in jumps, so the AVR is never run *forward* over the bytes it
-# was just sent. klippy then re-requests the identical advance target
-# forever ("advance 0.395..." repeated) and the pty EOFs. Fixing this
-# needs a synchronous shuttle (drain klippy TX -> RunFor -> drain MCU TX)
-# in the simavr bridge plus a sim-time-aware serialqueue; until then this
-# test fails when actually run (it was only ever skipped, since it is
-# REQUIRES_EMULATOR and the standard CI run has no backend).
+# KNOWN BLOCKED under --force-emulator (clean-host finding). Two layers,
+# one fixed and one still open:
+#   1. FIXED: tick advance livelocked because the bridge truncated
+#      target*freq to an integer cycle, stopping the AVR a fraction of a
+#      cycle below a reactor.pause() wakeup time, so the greenlet never
+#      fired and klippy re-requested the identical advance forever. The
+#      bridge now advances to the first cycle strictly past the target
+#      (simavr_bridge.c), and simulated time progresses correctly.
+#   2. STILL OPEN: the UART byte shuttle is not synchronized with the
+#      advance. simavr's uart_pty pump runs on a real-time thread and
+#      feeds the AVR's RX FIFO while the AVR is frozen between advances,
+#      so klippy's identify bytes overflow/are lost (in non-tick mode the
+#      AVR drains continuously, which is why the non-tick paths work).
+#      Closing this needs a synchronous shuttle in the bridge: drain
+#      klippy TX -> feed the AVR while running to target -> drain AVR TX,
+#      mirroring what the Renode path already does (and which makes
+#      stm32f103_tick pass). Until then this test fails when actually run
+#      (it was only ever skipped - REQUIRES_EMULATOR with no CI backend).
 CONFIG emulator_smoke.cfg
 DICTIONARY atmega2560.dict
 EMULATOR emulator_tick_mode.fixture.json
