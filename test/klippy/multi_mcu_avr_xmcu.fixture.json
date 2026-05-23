@@ -1,5 +1,5 @@
 {
-    "_comment": "Drives test/klippy/multi_mcu_avr_xmcu.test under the EMULATOR multi-bridge fan-out with stepper_z on the second MCU. tick_mode keeps the bridges in lockstep with klippy's reactor. auto_trsync_trigger_ticks fires each stepper's endstop after 100 step edges so G28 completes; the fixture pusher routes the X/Y step_trigger commands to the main `mcu` bridge and Z's step_trigger to the `other` bridge based on each pin's MCU prefix.",
-    "tick_mode": true,
+    "_comment": "Drives test/klippy/multi_mcu_avr_xmcu.test under the EMULATOR multi-bridge fan-out with stepper_z on the second MCU (cross-MCU stepper routing). auto_trsync_trigger_ticks fires each stepper's endstop after 100 step edges so G28 completes; the fixture pusher routes the X/Y step_trigger commands to the main `mcu` bridge and Z's step_trigger to the `other` bridge based on each pin's MCU prefix. tick_mode is OFF: the simavr tick-socket lockstep does not yet shuttle UART bytes synchronously with each RunFor (see multi_mcu_avr.fixture.json), so the bridges free-run and rely on the clocksync non-positive-frequency guard to stay aligned.",
+    "tick_mode": false,
     "auto_trsync_trigger_ticks": 100
 }

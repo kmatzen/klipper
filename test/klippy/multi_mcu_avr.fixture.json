@@ -1,6 +1,6 @@
 {
-    "_comment": "Drives test/klippy/multi_mcu_avr.test under the EMULATOR multi-bridge fan-out. tick_mode is required so the three bridges advance in lockstep with klippy's reactor; otherwise their independent free-run clocks drift and klippy's clock-sync flags one of them. auto_trsync_trigger_ticks fires each tower's endstop after 100 step edges so G28 completes -- the fixture pusher knows to route the step_trigger commands to the bridge that owns each stepper's pins (X/Y on main mcu, Z on zboard). analog_in_default keeps the auxboard's thermistor ADC reads (PK5 extruder, PK6 bed) in-range so the heater_min_temp/max_temp checks don't trip during startup; the same default goes to all three bridges since the unused ADC pins on mcu/zboard don't matter.",
-    "tick_mode": true,
+    "_comment": "Drives test/klippy/multi_mcu_avr.test under the EMULATOR multi-bridge fan-out: one simavr bridge per dict ([mcu] + [mcu other]), both atmega2560. All steppers live on the main [mcu] so the fixture pusher routes step_trigger without MCU-prefix awareness; [mcu other] is along for the ride to validate the second bridge's identify + clock-sync path. tick_mode is OFF: the simavr tick-socket lockstep does not yet shuttle UART bytes synchronously with each RunFor (the uart_pty pump thread is wall-clock paced and races the advance, so identify never completes - see PR notes), and free-run + the clocksync non-positive-frequency guard keeps the two independent bridge clocks in sync well enough on a quiet host. auto_trsync_trigger_ticks fires the endstop after 100 step edges so G28 completes.",
+    "tick_mode": false,
     "auto_trsync_trigger_ticks": 100,
     "analog_in_default": {"default_value": 1500}
 }
