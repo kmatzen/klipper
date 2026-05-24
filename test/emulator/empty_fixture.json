@@ -4,19 +4,38 @@
         "default_value": 5000
     },
     "analog_in": {
-        "_hot_extruder_0": {"default_value": 1200},
-        "_hot_extruder_1": {"default_value": 1200},
-        "_hot_extruder_2": {"default_value": 1200},
-        "_hot_extruder_3": {"default_value": 1200}
+        "_hot_extruder_0": {
+            "default_value": 1200
+        },
+        "_hot_extruder_1": {
+            "default_value": 1200
+        },
+        "_hot_extruder_2": {
+            "default_value": 1200
+        },
+        "_hot_extruder_3": {
+            "default_value": 1200
+        }
     },
     "i2c_default": {
         "register_responses": {
-            "0x7e": [84, 73],
-            "0x7f": [48, 85]
+            "0x7e": [
+                84,
+                73
+            ],
+            "0x7f": [
+                48,
+                85
+            ]
         }
     },
     "auto_trsync_trigger_ticks": 160000,
     "probe_pin_after_steps": 800,
-    "prepend_gcode": ["M105", "G4 P2000", "M105"],
-    "sim_time": true
+    "prepend_gcode": [
+        "M105",
+        "G4 P2000",
+        "M105"
+    ],
+    "sim_time": true,
+    "tick_mode": true
 }

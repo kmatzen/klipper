@@ -1,6 +1,6 @@
 {
-    "_comment": "Drives test/klippy/delta.test under the simavr bridge. tick_mode is OFF: the simavr tick-socket lockstep shuttle is still WIP (see emulator_tick_mode.test), and on a quiet host free-run + the clocksync non-positive-frequency guard keeps the bridge clock aligned closely enough for delta G28 + a short move (verified 3/3). auto_trsync_trigger_ticks fires each tower's endstop on G28 after 100 step edges so homing completes; analog_in_default keeps thermistor reads in-range so the extruder/heater_bed config stays out of min/max-temp shutdown. (delta_calibrate, which runs many probe moves, still needs deterministic tick - free-run drifts into a reason-56 'Rescheduled timer in the past' - so it stays tick_mode until the simavr shuttle lands.)",
-    "tick_mode": false,
+    "_comment": "Drives test/klippy/delta.test under the simavr bridge in tick_mode. The simavr tick-socket lockstep (synchronous host-UART shuttle per RunFor) runs klippy and the bridge on one simulated clock, so delta G28 + a short move complete deterministically regardless of host CPU load (validated 15/15). auto_trsync_trigger_ticks fires each tower's endstop on G28 after 100 step edges so homing completes; analog_in_default keeps thermistor reads in-range so the extruder/heater_bed config stays out of min/max-temp shutdown.",
+    "tick_mode": true,
     "auto_trsync_trigger_ticks": 100,
     "analog_in_default": {
         "default_value": 5000

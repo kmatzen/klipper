@@ -3,7 +3,14 @@
     "analog_in": {
         "my_thermistor": {
             "default_value": 7817,
-            "values": [7817, 7817, 7205, 7205, 4699]
+            "values": [
+                7817,
+                7817,
+                7205,
+                7205,
+                4699
+            ]
         }
-    }
+    },
+    "tick_mode": true
 }

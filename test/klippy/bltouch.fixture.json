@@ -9,5 +9,6 @@
         "control_pin": "PC5",
         "sensor_pin": "PC7",
         "invert": false
-    }
+    },
+    "tick_mode": true
 }
