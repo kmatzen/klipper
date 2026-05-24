@@ -209,7 +209,9 @@ _AFEC_BASES = (
     0x400B0000,  # SAM4E AFEC0
     0x400B4000,  # SAM4E AFEC1
     0x40038000,  # SAM4S ADC (single peripheral, 16 channels)
-    0x40012400,  # STM32F1 ADC1 (stm32_adc_stub.py; magic offsets at 0x100+)
+    0x40012400,  # STM32F1/G0 ADC1 (stm32_adc_stub.py / stm32g0_adc_stub.py)
+    0x40012000,  # STM32F4 ADC1 (stm32_adc_stub.py; magic offsets at 0x100+)
+    0x40022000,  # STM32H7 ADC1 (stm32h7_adc_stub.py; magic offsets at 0x100+)
     0x4004C000,  # RP2040 ADC (rp2040_adc_stub.py; magic offsets at 0x100+)
     # NB: the LPC176x ADC (lpc176x_adc.cs at 0x40034000) is deliberately
     # NOT listed here. _afec_poke writes every base on every chip, and
@@ -221,6 +223,26 @@ _AFEC_BASES = (
 )
 _AFEC_MAGIC_DEFAULT = 0x100
 _AFEC_MAGIC_CH_BASE = 0x104
+
+# When the launcher knows the chip's actual ADC base(s) it calls
+# set_adc_bases() so _afec_poke writes ONLY those, not every candidate in
+# _AFEC_BASES. This matters where a base that is an ADC on one chip
+# aliases a DIFFERENT live peripheral on another: e.g. 0x40022000 is the
+# STM32H7 ADC1 but the STM32G0 flash controller, and 0x40034000 is the
+# LPC ADC but the RP2040 UART0. Poking a foreign live peripheral (the
+# write succeeds, so try/except does not catch it) can corrupt boot, so
+# restrict to the current chip. Falls back to the full candidate list if
+# the launcher never set it.
+_adc_bases_override = [None]
+
+
+def set_adc_bases(bases):
+    try:
+        _adc_bases_override[0] = [int(b) for b in bases]
+        _log("set_adc_bases: %s",
+             ' '.join('%x' % b for b in _adc_bases_override[0]))
+    except Exception as e:
+        _log("set_adc_bases: bad bases %r: %s", bases, e)
 
 
 def _iter_adcs():
@@ -240,7 +262,10 @@ def _afec_poke(offset, value):
         sysbus = _M.Machine.SystemBus
     except Exception:
         return
-    for base in _AFEC_BASES:
+    bases = _adc_bases_override[0]
+    if bases is None:
+        bases = _AFEC_BASES
+    for base in bases:
         try:
             sysbus.WriteDoubleWord(base + offset, int(value) & 0xFFF)
         except Exception:

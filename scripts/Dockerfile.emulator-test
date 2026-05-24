@@ -289,6 +289,8 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/sam4s_smoke.test", \
      "test/klippy/duet2_maestro.test", \
      "test/klippy/skr_mini_e3_v2.test", \
+     "test/klippy/fysetc_spider.test", \
+     "test/klippy/skr_mini_e3_v3.test", \
      "test/klippy/skr_pico.test", \
      "test/klippy/sam4e_smoke.test", \
      "test/klippy/same70_smoke.test", \
@@ -296,6 +298,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/same70_spi_tmc.test", \
      "test/klippy/duet3_6hc.test", \
      "test/klippy/duet3_6xd.test", \
+     "test/klippy/octopus_pro_h723.test", \
      "test/klippy/lpc176x_smoke.test", \
      "test/klippy/skr_v1_4.test", \
      "test/klippy/hc32f460_smoke.test", \

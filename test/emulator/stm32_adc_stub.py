@@ -1,9 +1,17 @@
-# Renode Python.PythonPeripheral script for the STM32F1 ADC. Replaces
-# the upstream Analog.STM32_ADC peripheral with a stub klippy can drive
-# via the renode_hooks.adc_default / adc_set magic-offset pokes (same
-# protocol as test/emulator/afec_stub.py and sam4s_adc_stub.py).
+# Renode Python.PythonPeripheral script for the STM32F1 / STM32F4 ADC.
+# Replaces the upstream Analog.STM32_ADC peripheral with a stub klippy
+# can drive via the renode_hooks.adc_default / adc_set magic-offset pokes
+# (same protocol as test/emulator/afec_stub.py and sam4s_adc_stub.py).
 #
-# Why a stub: klipper's STM32F1 ADC driver (src/stm32/adc.c) drives a
+# F1 and F4 share src/stm32/adc.c and the same SR/CR2/SQR3/DR register
+# slice, so a single stub covers both families. The only register-level
+# difference the stub must absorb is the ADC_CR2 software-trigger bit:
+# the F1 reference manual places SWSTART at bit 22, the F4 (RM0090) at
+# bit 30. We accept either (see ADC_CR2_SWSTART below). F4 skips the F1
+# RSTCAL/CAL self-calibration entirely, but masking those bits is inert
+# there, so no family conditional is needed.
+#
+# Why a stub: klipper's STM32 F1/F4 ADC driver (src/stm32/adc.c) drives a
 # specific software-trigger handshake -
 #   gpio_adc_sample(): read ADC_SR; if STRT clear -> write ADC_SQR3 =
 #     channel, write ADC_CR2 = SWSTART|... to start a conversion; on the
@@ -53,7 +61,11 @@ ADC_SR_EOC      = 0x02         # bit1
 ADC_SR_STRT     = 0x10         # bit4
 ADC_CR2_CAL     = 0x04         # bit2
 ADC_CR2_RSTCAL  = 0x08         # bit3
-ADC_CR2_SWSTART = 0x00400000   # bit22
+# SWSTART is bit22 on STM32F1 (RM0008) and bit30 on STM32F4 (RM0090).
+# Accept either so the one stub serves both families; no other CR2 write
+# klipper issues (ADON | EXTSEL | EXTTRIG | TSVREFE on F1, ADON on F4)
+# sets bit22 or bit30, so this never false-triggers a conversion.
+ADC_CR2_SWSTART = 0x00400000 | 0x40000000   # F1 bit22 | F4 bit30
 
 MAGIC_DEFAULT = 0x100
 MAGIC_CH_BASE = 0x104  # 0x104 + ch * 4, channels 0..15

@@ -284,10 +284,14 @@ dma2: DMA.STM32G0DMA @ sysbus 0x40020400
     numberOfChannels: 5
     [0-4] -> nvicInput11@[4-8]
 
-adc: Analog.STM32G0_ADC @ sysbus 0x40012400
-    referenceVoltage: 3.3
-    externalEventFrequency: 1000
-    -> nvic@12
+// NB: upstream stm32g0.repl declares `adc: Analog.STM32G0_ADC @ sysbus
+// 0x40012400 ... -> nvic@12` here. It is intentionally OMITTED so the
+// renode launcher can register test/emulator/stm32g0_adc_stub.py at
+// 0x40012400 (_AFEC_BASES_FOR_CHIP['stm32g0b1']). klipper polls the ADC
+// (no conversion IRQ), so dropping the nvic@12 wiring is harmless; the
+// Python stub is what completes the G0 ISR/CR/CHSELR/DR handshake and
+// returns fixture-poked thermistor values that Renode's Analog model
+// cannot. Same rationale as the omitted adc1 in stm32f103.repl.
 
 // NB: upstream declares `iwdg: Timers.STM32_IndependentWatchdog @
 // sysbus 0x40003000` here; it is intentionally omitted so the sysbus

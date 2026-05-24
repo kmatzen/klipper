@@ -1,0 +1,12 @@
+{
+    "_comment": "End-to-end fixture for the BIGTREETECH Octopus Pro v1.0 (STM32H723) in DETERMINISTIC TICK MODE. spi_tmc enables the renode_hooks TMC SPI chain responder (CPU-PC hook on spidev_transfer) for the four TMC5160s. The drivers use klipper SOFTWARE SPI (H7 has no hardware-SPI bus table in src/stm32/spi.c) on a shared sclk/mosi/miso with per-driver cs_pin; both hardware and software SPI funnel through spidev_transfer, which the responder hooks and PC-skips, so the same responder serves software SPI here as serves the SAME70 hardware-USART-SPI in duet3_6hc. tick_mode puts klippy and Renode in lockstep (one `emulation RunFor` per `advance T` with a synchronous USART1<->pty byte shuttle) so the 520 MHz clock advances at exactly CONFIG_CLOCK_FREQ instead of the wall-clock-bound JIT rate. analog_in feeds the two thermistor channels at ~0.93 of full scale (raw 7600 / 8184) so both read ~34 C - inside the extruder [0,285] / bed [0,130] ranges. PC0 = ADC1 channel 10 (extruder), PC3 = ADC1 channel 13 (bed); see src/stm32/stm32h7_adc.c adc_pins[]. Values are served by test/emulator/stm32h7_adc_stub.py at 0x40022000.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 10},
+        "_bed": {"default_value": 7600, "channel": 13}
+    },
+    "spi_tmc": true,
+    "tick_mode": true
+}

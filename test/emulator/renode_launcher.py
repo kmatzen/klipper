@@ -142,6 +142,22 @@ _STM32_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 0. This stub drives klipper's RP2040 ADC handshake (src/rp2040/adc.c).
 _RP2040_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                    'rp2040_adc_stub.py')
+# STM32G0 ADC stub. The local stm32g0b1.repl OMITS upstream's
+# `adc: Analog.STM32G0_ADC` so this stub can claim 0x40012400 and
+# complete klipper's G0 ISR/CR/CHSELR/DR handshake (src/stm32/stm32f0_adc.c)
+# with fixture-poked values - the F0/G0 ADC register layout differs from
+# the F1/F4 ADC, so it needs its own stub.
+_STM32G0_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'stm32g0_adc_stub.py')
+# STM32H7 ADC stub. The vendored stm32h723.repl OMITS upstream's
+# `adcM1S2: Analog.STM32F0_ADC @ 0x40022000` (the F0 model spins
+# klipper's H7 ADCAL loop and returns no controllable value); this stub
+# completes the H7 ISR/CR/SQR1/DR handshake (src/stm32/stm32h7_adc.c). It
+# is registered via _EXTRA_PERIPHERAL_STUBS_FOR_CHIP (not the 0x200 AFEC
+# block) because its window must be 0x400 bytes to also cover the ADC12
+# common CCR at base+0x308.
+_STM32H7_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'stm32h7_adc_stub.py')
 
 # SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
 # check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
@@ -273,9 +289,24 @@ _AFEC_BASES_FOR_CHIP = {
     # upstream `adc1: Analog.STM32_ADC` so this Python stub can claim
     # the address (klipper's F1 configs read every thermistor on ADC1).
     'stm32f103': (0x40012400,),
+    # STM32F4 ADC1 at 0x40012000. The local stm32f4.repl maps no Analog
+    # peripheral (upstream omits them too), so the stub is the only thing
+    # at 0x40012000; its 0x200 window also covers the unused ADC2
+    # (0x40012100). klipper's F4 driver reads thermistor channels 0..15
+    # on ADC1 (src/stm32/adc.c).
+    'stm32f446': (0x40012000,),
+    # STM32G0 ADC1 at 0x40012400 (same base as F1, different register
+    # layout). The local stm32g0b1.repl OMITS upstream's
+    # `adc: Analog.STM32G0_ADC` so this stub can claim the address.
+    'stm32g0b1': (0x40012400,),
     # RP2040 ADC at 0x4004C000. The local rp2040.repl models no ADC, so
     # this Python stub is the only thing mapped there.
     'rp2040': (0x4004C000,),
+    # NB: STM32H7 ADC1 (0x40022000) is NOT here - it is registered via
+    # _EXTRA_PERIPHERAL_STUBS_FOR_CHIP['stm32h723'] with a 0x400 window
+    # (the AFEC block hardcodes 0x200, too small to reach the ADC12
+    # common CCR at base+0x308). The renode_hooks _AFEC_BASES poke list
+    # still includes 0x40022000 so adc_set/adc_default reach it.
 }
 
 # Override the default afec_stub.py per chip. The SAM4S ADC uses
@@ -284,6 +315,10 @@ _AFEC_BASES_FOR_CHIP = {
 _ADC_STUB_FOR_CHIP = {
     'sam4s8c': _SAM4S_ADC_STUB_PY,
     'stm32f103': _STM32_ADC_STUB_PY,
+    # F4 shares the F1 SR/CR2/SQR3/DR stub (one register slice, one
+    # SWSTART-bit difference the stub absorbs).
+    'stm32f446': _STM32_ADC_STUB_PY,
+    'stm32g0b1': _STM32G0_ADC_STUB_PY,
     'rp2040': _RP2040_ADC_STUB_PY,
 }
 
@@ -369,6 +404,12 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
     # window matches the Tag <0x58024800, 0x58024BFF> "PWR" range.
     'stm32h723': [
         ('pwr', 0x58024800, 0x400, _STM32H7_PWR_STUB_PY),
+        # ADC1 at 0x40022000 with a 0x400 window (covers ADC1 registers,
+        # the magic-offset poke region at +0x100, and the ADC12 common
+        # CCR at +0x308). The vendored stm32h723.repl omits upstream's
+        # adcM1S2 so this stub owns the address. renode_hooks _AFEC_BASES
+        # includes 0x40022000 so adc_set/adc_default poke it.
+        ('adc1', 0x40022000, 0x400, _STM32H7_ADC_STUB_PY),
     ],
     'stm32h743': [
         ('pwr', 0x58024800, 0x400, _STM32H7_PWR_STUB_PY),
@@ -450,6 +491,24 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
     'same70q20b': _SAME70_EXTRA_STUBS,
     'same70q20b-usb': _SAME70_EXTRA_STUBS,
 }
+
+
+def _adc_poke_bases(chip):
+    # The ADC base(s) the renode_hooks adc_default / adc_set pokes should
+    # write for THIS chip. Combines the AFEC-block bases
+    # (_AFEC_BASES_FOR_CHIP) with any ADC stub registered through the
+    # extra-peripheral path (the STM32H7 ADC needs a 0x400 window the
+    # 0x200 AFEC block can't give, so it lives in
+    # _EXTRA_PERIPHERAL_STUBS_FOR_CHIP under a name containing "adc").
+    # The launcher hands this list to renode_hooks.set_adc_bases so the
+    # poke never scribbles a base that aliases a live non-ADC peripheral
+    # on a different chip (e.g. 0x40022000 = H7 ADC1 but G0 flash ctrl).
+    bases = list(_AFEC_BASES_FOR_CHIP.get(chip, ()))
+    for name, base, _size, _stub in _EXTRA_PERIPHERAL_STUBS_FOR_CHIP.get(
+            chip, ()):
+        if 'adc' in name and base not in bases:
+            bases.append(base)
+    return bases
 
 # Per-chip override controlling whether `sysbus LoadELF` uses the
 # segment's virtual address (VMA, the address the firmware code
@@ -663,12 +722,17 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
         # consistent namespace.
         'python "import sys; sys.path.append(\\"{hooks_dir}\\")"\n'
         'python "import renode_hooks; renode_hooks.set_monitor(monitor)"\n'
+        # Restrict the ADC magic-offset poke to THIS chip's real ADC
+        # base(s) so adc_set/adc_default can't scribble a base that
+        # aliases a live non-ADC peripheral on another chip.
+        'python "import renode_hooks; renode_hooks.set_adc_bases({adc_bases})"\n'
     ).format(chip=chip, platform=platform,
              log=log_path, rcc_block=rcc_block,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
              elf_load_block=elf_load_block,
              uart_block=uart_block, timing_block=timing_block,
+             adc_bases=repr(_adc_poke_bases(chip)),
              hooks_dir=os.path.dirname(_HOOKS_PY))
 
 
