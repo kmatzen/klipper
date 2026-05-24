@@ -256,24 +256,19 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # stepper, STM32+STM32 (renode+renode), and AVR+linuxprocess
 # (simavr+native pty).
 #
-# This default CMD runs only the subset that passes end-to-end under the
-# real emulator backend on a clean (native-Linux) host - verified with
-# scripts/test_klippy.py --force-emulator. Three EMULATOR tests are
-# deliberately omitted because they are known-blocked on the same
-# underlying issue - Renode runs the ARM CPU at a wall-clock-bound rate
-# that drifts from CONFIG_CLOCK_FREQ, so timing-critical exchanges fail:
-#   * same70_usb_smoke   - USB-CDC bringup; firmware shuts down with
-#                          static_string_id 56 'Rescheduled timer in the
-#                          past', or (if the rate is raised) USB
-#                          enumeration never completes.
-#   * multi_mcu_stm32_stm32, multi_mcu_avr_stm32_xmcu - homing a stepper
-#                          on a Renode-hosted MCU trips the trsync
-#                          watchdog ("Communication timeout during
-#                          homing").
-# The real fix is deterministic tick-mode on the Renode/ARM path (a
-# synchronous RunFor<->UART byte shuttle plus a sim-time-aware
-# serialqueue); see the individual test headers + PR notes. All three
-# firmwares are still built above, so each is runnable manually:
+# This default CMD runs the subset that passes end-to-end under the real
+# emulator backend on a clean (native-Linux) host - verified with
+# scripts/test_klippy.py --force-emulator. The multi-MCU homing tests that
+# used to be omitted (multi_mcu_stm32_stm32, multi_mcu_avr_stm32_xmcu) now
+# pass via deterministic tick-mode lockstep and are included.
+#
+# Only same70_usb_smoke remains omitted (the one known-blocked test): its
+# USB-CDC firmware overshoots a boot timer and shuts down with
+# static_string_id 56 'Rescheduled timer in the past' during the Renode
+# free-run boot phase, before tick-mode lockstep engages (and raising the
+# Renode CPU rate instead breaks USB enumeration). See the test header for
+# the full diagnosis. The same70q20b-usb firmware is still built above, so
+# it stays runnable manually:
 #   docker run ... test_klippy.py -d ci_build/dict --force-emulator \
 #       test/klippy/same70_usb_smoke.test
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
@@ -296,6 +291,8 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/multi_mcu_avr.test", \
      "test/klippy/multi_mcu_avr_xmcu.test", \
      "test/klippy/multi_mcu_avr_stm32.test", \
+     "test/klippy/multi_mcu_avr_stm32_xmcu.test", \
+     "test/klippy/multi_mcu_stm32_stm32.test", \
      "test/klippy/multi_mcu_linuxprocess_avr.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \

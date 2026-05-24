@@ -28,20 +28,21 @@
 #   * It is NOT IRQ-servicing granularity: a cpu MaximumBlockSize sweep
 #     (1..1024 via RENODE_EXP_BLOCKSIZE) leaves the reason-56 shutdown
 #     unchanged.
-#   * Root cause is the wall-clock vs virtual-time drift: Renode runs the
-#     SAM CPU at a rate that diverges from CONFIG_CLOCK_FREQ, so klippy's
-#     clocksync (wall-clock paced) computes garbage and the firmware's
-#     own USB-build boot timers overshoot. Raising RENODE_EXP_MIPS hides
-#     the overshoot but then runs virtual time faster than the
-#     wall-clock-paced klippy/USB pty can follow, so enumeration breaks -
-#     a genuine two-sided tension. The same drift is why renode homing
-#     ("Communication timeout") and the migrated tick tests fail.
-#   * The real fix is deterministic tick-mode on ARM, which today
-#     livelocks: the byte shuttle is not synchronized with each RunFor
-#     (klippy's serialqueue C bg-thread polls in real time while sim time
-#     advances in jumps), so klippy re-requests the same advance target
-#     forever and identify never frames. Closing this needs a synchronous
-#     RunFor<->UART byte shuttle plus a sim-time-aware serialqueue.
+#   * Root cause is the wall-clock vs virtual-time drift during the Renode
+#     FREE-RUN boot phase: Renode runs the SAM CPU at a rate that diverges
+#     from CONFIG_CLOCK_FREQ, and the USB-build's own boot timers overshoot
+#     DWT->CYCCNT by >1ms. Raising RENODE_EXP_MIPS hides the overshoot but
+#     then runs virtual time faster than the wall-clock-paced klippy/USB
+#     pty can follow, so enumeration breaks - a genuine two-sided tension.
+#   * Deterministic tick-mode (which now works on Renode - see
+#     stm32f103_tick - and fixed the renode homing timeouts) does NOT fix
+#     this: the reason-56 overshoot happens during boot, BEFORE klippy
+#     connects the tick socket and lockstep engages, so the boot still
+#     free-runs. Confirmed: same70_usb in tick mode still fails.
+#   * Remaining fix shape: make the USBHS bringup tolerant of the Renode
+#     CPU rate (or drive the boot phase itself under lockstep). This is the
+#     one EMULATOR test still blocked; everything else passes under
+#     --force-emulator on a clean host.
 DICTIONARY same70q20b-usb.dict
 CONFIG same70_usb_smoke.cfg
 EMULATOR same70_usb_smoke.fixture.json
