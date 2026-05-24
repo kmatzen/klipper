@@ -1,10 +1,11 @@
 # End-to-end EMULATOR test for the Duet2 Maestro printer config on
-# the SAM4S backend. Boots klipper firmware under Renode against the
-# duet2-maestro pin map, completes klippy identify + clocksync, reads
-# thermistors through adc_scaled (vref_scaled), and walks DUMP_TMC /
-# SET_TMC_FIELD against the renode software-UART hook
-# (renode_hooks.sw_uart). Exercises the full chain of changes this
-# config requires that smoke tests don't:
+# the SAM4S backend, in DETERMINISTIC TICK MODE. Boots klipper
+# firmware under Renode against the duet2-maestro pin map, completes
+# klippy identify + clocksync, brings up the full MCU config (4
+# TMC2208s, 2 software-PWM heaters, fan, endstops, adc_scaled), reads
+# thermistors through adc_scaled (vref_scaled), and round-trips
+# interactive gcode (M114/M105) against real firmware. Exercises the
+# full chain of changes this config requires that smoke tests don't:
 #
 #   - sw_uart driving PA9 RX from CPU PC hooks on tmcuart_read_event
 #     (firmware uses separate uart_pin/tx_pin, not single-wire AVR)
@@ -15,48 +16,56 @@
 #   - control-socket early-bind in renode_launcher so the fixture
 #     pusher hits a listening socket while Renode is still booting
 #
-# G28 / G1 / SET_HEATER_TEMP are intentionally OMITTED: Renode's JIT
-# CPU executes the firmware at a wall-clock-bound rate that drifts
-# from the configured 120 MHz CONFIG_CLOCK_FREQ (klippy logs "MCU
-# 'mcu' configured for ~120Mhz but running at ~80Mhz"); klippy's
-# clocksync adapts to the measured rate, but the step path is
-# sensitive to JIT-burst jitter - a homing / G1 move schedules
-# clock-pegged step + trsync commands that a burst can push into the
-# firmware's past, raising "Timer too close". Driving steppers needs
-# a deterministic timing source (a tick-mode pty shuttle), which
-# renode's Monitor-per-RunFor overhead makes too slow for ARM
-# identify today (verified: ARM tick-mode mis-frames identify); motion
-# gcode stays out of scope here. The identify / clocksync / config /
-# TMC-init / adc_scaled path this test DOES exercise has no queued
-# moves and so no timer pressure - it completes with no firmware
-# shutdown, which is why this test (unlike during development) no
-# longer needs ALLOW_SHUTDOWN.
+# SAM4S clock drift - RESOLVED via deterministic tick mode. Renode's
+# free-running JIT executes the SAM4S CPU at a wall-clock-bound rate
+# that drifts from the configured 120 MHz CONFIG_CLOCK_FREQ (klippy
+# logged "MCU 'mcu' configured for ~120Mhz but running at ~80Mhz");
+# klippy's clocksync adapted to that mean rate, but the drift meant the
+# firmware clock was never trustworthy, so the test had to stay
+# motion-free and (during development) needed ALLOW_SHUTDOWN.
+# tick_mode (duet2_maestro.fixture.json) removes the drift at the root:
+# klippy and Renode advance in lockstep over the tick socket (one
+# `emulation RunFor` per klippy `advance T`), so the firmware's
+# DWT->CYCCNT clock is exactly CONFIG_CLOCK_FREQ - the log now shows a
+# flat freq=120000000 with no "running at NMhz" warning. (Same
+# single-MCU renode lockstep mechanism stm32f103_tick / same70_usb_smoke
+# use.) This config's software-PWM heaters queue their first cycle only
+# ~0.2s ahead, shorter than the tick-mode per-RunFor command-delivery
+# latency, so klippy's mcu.py widens the initial PWM lead when
+# KLIPPY_TICK_SOCKET is set (PWM_START_LEAD_TICK) - without it the very
+# first heater queue_digital_out lands in the firmware's past and trips
+# "Timer too close" during config.
+#
+# Driving steppers (G28 homing) now WORKS once the drift is gone - the
+# step path is no longer pushed into the firmware's past by clock
+# drift, and homing completes against real firmware on a quiet host.
+# It is intentionally NOT in this gated test: renode-tick *motion*
+# commands are delivered by klippy's wall-clock-paced serialqueue
+# background thread, which under shared-host CPU contention can deliver
+# a tightly-scheduled stepper-enable / step command late and trip
+# "Timer too close" - the same environment-bound flake that keeps the
+# other renode-tick-homing tests (multi_mcu_stm32_stm32,
+# multi_mcu_avr_stm32_xmcu) out of the default gating CMD. That is a
+# serialqueue/sim-time issue, not the SAM4S clock drift, which this
+# test resolves. The no-motion boot/config/TMC/adc path has no such
+# tight-lead commands and is deterministically green.
 DICTIONARY sam4s8c.dict
 CONFIG duet2_maestro.cfg
 EMULATOR duet2_maestro.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode:
+# M114 (report toolhead position) and M105 (report temperatures, which
+# reads the adc_scaled-compensated thermistors end to end). Neither
+# drives a stepper, so neither schedules a tight-lead motion command.
+M114
+M105
 
 # klippy auto-runs TMC chip init (per-stepper GSTAT clear + register
-# probe) as part of mcu_identify. There's no gcode to send - the test
-# is "klippy got past identify + clocksync + first TMC register read"
-# which exercises every piece of new infrastructure this PR adds for
-# SAM4S real-firmware coverage:
-#   - control-socket early-bind in renode_launcher so the fixture
-#     pusher hits a listening socket while Renode is still booting
-#   - sam4s_adc_stub.py replacing Renode's read-only Analog.SAM4S_ADC
-#     so adc_scaled's (vref - vssa) divisor isn't 0
-#   - 6-arg sw_uart with renode_hooks CPU-PC-hook bit driver on
-#     tmcuart_read_event etc (firmware uses separate uart_pin/tx_pin
-#     on this config, not single-wire AVR)
-#   - local sam4s8c.repl with DWT.frequency pinned to CONFIG_CLOCK_FREQ
-#
-# Positive checks scoped to klippy-side mcu_identify + config-build
-# state machines plus the TMC virtual-enable path, all of which run
-# deterministically off the dictionary load and the converged clock
-# estimate (no queued moves => no timer pressure). The downstream TMC
-# register-read *value* assertions ("TMC 'stepper_x' reports GSTAT")
-# were tried but proved flaky - whether a given read's response framing
-# lands within klippy's retry window depends on Renode JIT pace, which
-# varies across host loads.
+# probe) as part of mcu_identify, before any gcode. Positive checks
+# scoped to klippy-side mcu_identify + config-build state machines plus
+# the TMC virtual-enable path, all of which run deterministically off
+# the dictionary load and the (now exact) clock estimate.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'stepper_x'"
@@ -74,8 +83,9 @@ EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
 # failure modes too.
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
 EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
-# No queued moves => no timer pressure: the identify / config / TMC /
-# adc_scaled path must complete without any firmware shutdown.
+# The point of tick mode: with the deterministic clock the config /
+# TMC / adc path no longer pushes any deadline into the firmware's
+# past, so it completes with no firmware shutdown.
 EXPECT_LOG_NOT_CONTAINS "Timer too close"
 EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

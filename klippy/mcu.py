@@ -11,6 +11,18 @@ class error(Exception):
 
 # Minimum time host needs to get scheduled events queued into mcu
 MIN_SCHEDULE_TIME = 0.100
+# How far past the config-time clock estimate the first PWM cycle is
+# queued so it can't land in the MCU's past before the command is
+# actually delivered. The 0.200s default is ample on real hardware
+# (sub-millisecond link latency). The deterministic tick-mode emulator
+# (KLIPPY_TICK_SOCKET set) instead shuttles UART bytes one
+# `emulation RunFor` round-trip at a time, so a command can take ~0.2s
+# of simulated time to reach the firmware -- longer than the default
+# lead, which trips the firmware's "Timer too close" guard on the very
+# first heater/fan software-PWM cycle. Widen the lead in tick mode only;
+# real hardware and non-tick runs use the unchanged 0.200s.
+PWM_START_LEAD = 0.200
+PWM_START_LEAD_TICK = 1.000
 # The maximum number of clock cycles an MCU is expected
 # to schedule into the future, due to the protocol and firmware.
 MAX_SCHEDULE_TICKS = (1<<31) - 1
@@ -484,7 +496,15 @@ class MCU_pwm:
         cmd_queue = self._mcu.alloc_command_queue()
         curtime = self._mcu.get_printer().get_reactor().monotonic()
         printtime = self._mcu.estimated_print_time(curtime)
-        self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
+        start_lead = PWM_START_LEAD
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            # Deterministic tick-mode emulator: command delivery costs
+            # ~0.2s of simulated time, so the default lead would land
+            # the first PWM cycle in the firmware's past. See
+            # PWM_START_LEAD_TICK.
+            start_lead = PWM_START_LEAD_TICK
+        self._last_clock = self._mcu.print_time_to_clock(printtime
+                                                         + start_lead)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         mdur_ticks = self._mcu.seconds_to_clock(self._max_duration)
         if mdur_ticks > MAX_SCHEDULE_TICKS:
