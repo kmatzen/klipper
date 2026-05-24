@@ -199,6 +199,22 @@ namespace Antmicro.Renode.Peripherals.USB
             if(IsEpRegister(offset, EPTIER_BASE, out idx))
             {
                 endpoints[idx].Imr |= value;
+                // Inject the synthetic SET_CONFIGURATION SETUP as soon as
+                // the firmware arms RXSTPES on the (already allocated) EP0
+                // - handle_end_reset() writes DEVEPTCFG[0]|ALLOC then
+                // DEVEPTIER[0]=RXSTPES back to back. Doing it here (rather
+                // than waiting for the firmware to read DEVEPTISR[0]) makes
+                // enumeration self-start: otherwise the firmware waits for
+                // the RXSTPI IRQ that the injection itself raises, a
+                // chicken-and-egg that only resolved when an unrelated
+                // (SysTick-rate-dependent) DEVEPTISR[0] poll happened to
+                // fire. With this, enumeration no longer depends on the
+                // SysTick rate, so the platform can use the correct 300MHz
+                // SysTick (= DWT = CONFIG_CLOCK_FREQ) that avoids the
+                // reason-56 "Rescheduled timer in the past" shutdown.
+                if(idx == 0 && (value & RXSTPI_BIT) != 0
+                    && endpoints[0].Allocated && !setupInjected)
+                    StageSetupPacket();
                 UpdateIRQ();
                 return;
             }

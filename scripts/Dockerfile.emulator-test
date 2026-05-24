@@ -258,28 +258,20 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 #
 # This default CMD runs the subset that passes end-to-end under the real
 # emulator backend on a clean (native-Linux) host - verified with
-# scripts/test_klippy.py --force-emulator. multi_mcu_stm32_stm32 now passes
-# via deterministic tick-mode lockstep and is included.
+# scripts/test_klippy.py --force-emulator. multi_mcu_stm32_stm32 (renode
+# tick lockstep) and same70_usb_smoke (SysTick=300 + USBHS SETUP-on-RXSTPES
+# injection - see those headers) now pass and are included.
 #
-# Two EMULATOR tests are omitted from this default run (both still built +
-# runnable manually):
+# One EMULATOR test stays omitted (still built + runnable manually):
 #   * multi_mcu_avr_stm32_xmcu - passes in isolation (3/3) but the mixed
 #     simavr+renode tick lockstep + cross-MCU homing is the most
 #     timing-sensitive case: the two backends reach slightly different
 #     actual times per `advance`, and under full-suite load on a shared
 #     host that divergence occasionally trips the trsync watchdog
 #     ("Communication timeout during homing"). Kept out of the gating run
-#     until the mixed-backend lockstep is made exact.
-#   * same70_usb_smoke - the one known-blocked test, on a two-sided
-# SysTick-vs-DWT timing tension (NOT free-run vs tick - it fails the same
-# in tick mode): the upstream 450MHz SysTick enumerates but fires early
-# enough that klipper trips reason-56 'Rescheduled timer in the past',
-# while the correct 300MHz SysTick stops that shutdown but makes the USB
-# EORST handler skip RXSTPES so enumeration never starts. See the test
-# header for the full diagnosis. The same70q20b-usb firmware is still
-# built above, so it stays runnable manually:
+#     until the mixed-backend lockstep is made exact:
 #   docker run ... test_klippy.py -d ci_build/dict --force-emulator \
-#       test/klippy/same70_usb_smoke.test
+#       test/klippy/multi_mcu_avr_stm32_xmcu.test
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \
@@ -293,6 +285,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/duet2_maestro.test", \
      "test/klippy/sam4e_smoke.test", \
      "test/klippy/same70_smoke.test", \
+     "test/klippy/same70_usb_smoke.test", \
      "test/klippy/lpc176x_smoke.test", \
      "test/klippy/hc32f460_smoke.test", \
      "test/klippy/rp2040_smoke.test", \

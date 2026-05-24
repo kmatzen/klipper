@@ -39,6 +39,18 @@
 // so checkouts at different filesystem locations both work.
 using "platforms/cpus/sam_e70.repl"
 
+// Pin SysTick to the 300 MHz core clock. klipper drives SysTick with
+// CLKSOURCE=processor (= the 300 MHz core / CONFIG_CLOCK_FREQ) and reads
+// DWT->CYCCNT (also 300 MHz, below) as its time base, so the two must
+// match. The upstream sam_e70.repl declares the NVIC at 450 MHz; at that
+// rate SysTick fires ~1.5x early, klipper's timer_dispatch_many busy-waits
+// a far deadline while other timers fall >1ms behind DWT, and the firmware
+// shuts down with static_string_id 56 "Rescheduled timer in the past".
+// (This needs the USBHS model's SETUP-on-RXSTPES-arm injection - see
+// same70_usbhs.cs - so enumeration no longer depends on the SysTick rate.)
+nvic:
+    systickFrequency: 300000000
+
 dwt: Miscellaneous.DWT @ sysbus 0xE0001000
     frequency: 300000000
 
