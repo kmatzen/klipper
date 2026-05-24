@@ -8,27 +8,22 @@
 # CPU-contended hosts. We reuse emulator_smoke.cfg unchanged - the
 # only difference is the fixture's `tick_mode: true` flag.
 #
-# KNOWN BLOCKED under --force-emulator (clean-host finding). Two layers,
-# one fixed and one still open:
-#   1. FIXED: tick advance livelocked because the bridge truncated
-#      target*freq to an integer cycle, stopping the AVR a fraction of a
-#      cycle below a reactor.pause() wakeup time, so the greenlet never
-#      fired and klippy re-requested the identical advance forever. The
-#      bridge now advances to the first cycle strictly past the target
-#      (simavr_bridge.c), and simulated time progresses correctly.
-#   2. IMPLEMENTED but STILL FAILING: simavr_bridge.c now uses a
-#      single-threaded synchronous host-link UART in tick mode (suart_*)
-#      instead of uart_pty's real-time pump thread, so byte movement is
-#      deterministic and free of the pump-vs-avr_run race. Verified that
-#      klippy's serialqueue does receive the firmware's identify
-#      responses through it (reads of 5/53/54 bytes). It still does not
-#      complete identify: after ~2s of simulated time klippy's read
-#      returns EOF while the bridge is mid-advance, and identify never
-#      reaches "Loaded MCU". Root cause of that EOF (the master appears
-#      open yet the slave read returns 0) is not yet isolated - the
-#      Renode tick path, which is structurally identical, works
-#      (stm32f103_tick). REQUIRES_EMULATOR, kept out of the default CMD;
-#      it was only ever skipped before, so it never actually ran.
+# This works end-to-end (5/5 on a clean host) after three simavr-tick
+# fixes that all had to land together:
+#   1. The bridge advances to the first cycle STRICTLY past the requested
+#      sim-time (+1) - truncating target*freq stopped the AVR a fraction
+#      of a cycle below a reactor.pause() wakeup, so the greenlet never
+#      fired and tick livelocked.
+#   2. A single-threaded synchronous host-link UART (simavr_bridge.c
+#      suart_*) replaces uart_pty's real-time pump thread in tick mode, so
+#      bytes move deterministically with each advance (no pump-vs-avr_run
+#      race / RX-FIFO loss).
+#   3. SIGPIPE is ignored - klippy closes the fixture control socket after
+#      pushing the fixture, and the control thread's later "OK" ack write
+#      hit EPIPE and SIGPIPE-killed the whole bridge mid-test, read as a
+#      spurious serial EOF on klippy's side.
+# REQUIRES_EMULATOR (assertions need real MCU responses); skipped, not
+# fileoutput-degraded, when no backend is built.
 CONFIG emulator_smoke.cfg
 DICTIONARY atmega2560.dict
 EMULATOR emulator_tick_mode.fixture.json
