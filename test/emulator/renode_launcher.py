@@ -59,7 +59,7 @@ _PLATFORM_FOR_CHIP = {
     'stm32f407': _local('stm32f4.repl'),
     'stm32f429': _local('stm32f429.repl'),
     'stm32f446': _local('stm32f4.repl'),
-    'stm32g0b1': '@platforms/cpus/stm32g0.repl',
+    'stm32g0b1': _local('stm32g0b1.repl'),
     'stm32h723': _local('stm32h723.repl'),
     'stm32h743': '@platforms/cpus/stm32h743.repl',
     'sam3x8c': _local('sam3x8e.repl'),
@@ -177,6 +177,13 @@ _SAMD21_SYSCTRL_STUB_PY = os.path.join(
 
 _LPC_SC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'lpc_sc_stub.py')
+
+# STM32H7 PWR stub. Upstream stm32h743.repl models RCC + the flash
+# controller but leaves PWR (0x58024800) as a bare Tag, so klipper's
+# clock_setup() spins on PWR->CSR1.ACTVOSRDY / PWR->D3CR.VOSRDY before
+# it reaches RCC. The stub synthesizes those two ready bits.
+_STM32H7_PWR_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'stm32h7_pwr_stub.py')
 
 # Path to the HC32F460 USART C# peripheral. Loaded into the running
 # Renode runtime via `i @<path>` (Roslyn-compiled into the live
@@ -326,6 +333,17 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
     ],
     'lpc176x': [
         ('lpc_sc', 0x400FC000, 0x200, _LPC_SC_STUB_PY),
+    ],
+    # STM32H7: PWR power-control block. Upstream stm32h743.repl leaves
+    # this address as a logging Tag; the stub serves CSR1.ACTVOSRDY and
+    # D3CR.VOSRDY so clock_setup()'s pre-RCC busy-waits complete. Both
+    # h723 (local repl) and h743 (upstream repl) need it. The 0x400-byte
+    # window matches the Tag <0x58024800, 0x58024BFF> "PWR" range.
+    'stm32h723': [
+        ('pwr', 0x58024800, 0x400, _STM32H7_PWR_STUB_PY),
+    ],
+    'stm32h743': [
+        ('pwr', 0x58024800, 0x400, _STM32H7_PWR_STUB_PY),
     ],
     # HC32F460: every region the firmware writes during init except
     # USART1 (which has a real model in the .repl). None of these

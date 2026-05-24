@@ -8,3 +8,33 @@
 // stm32h7.repl - everything is in stm32h743.repl directly. So we
 // inherit from h743, not from h7.
 using "platforms/cpus/stm32h743.repl"
+
+// DWT frequency MUST match klipper's CONFIG_CLOCK_FREQ (520 MHz on the
+// STM32H723 build). The Cortex-M7 firmware reads DWT->CYCCNT as its
+// monotonic clock (src/generic/armcm_timer.c); upstream stm32h743.repl
+// ships no DWT model, so 0xE0001000/0xE0001004 read as a non-existing
+// peripheral (always 0). With CYCCNT frozen at 0, timer_read_time()
+// never advances, generic/armcm_timer's scheduling math degenerates and
+// the boot crashes before identify. A standalone Miscellaneous.DWT
+// advances CYCCNT off virtual-time * frequency - the same fix
+// stm32f103.repl / sam4s8c.repl / same70q20b.repl already use for their
+// Cortex-M3/M4/M7 cores. (The PWR power-control block, also unmodeled by
+// upstream, is supplied by test/emulator/stm32h7_pwr_stub.py via the
+// renode launcher's _EXTRA_PERIPHERAL_STUBS_FOR_CHIP map.)
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 520000000
+
+// Pin SysTick to the 520 MHz core clock too. klipper's armcm_timer.c
+// drives SysTick (SysTick->LOAD = cycles-until-next-event) as its
+// periodic interrupt source while using DWT->CYCCNT (520 MHz, above) as
+// its time base, so the two clocks MUST run at the same rate. Upstream
+// stm32h743.repl declares the NVIC SysTick at 96 MHz; at that rate a
+// SysTick->LOAD of N cycles takes N/96MHz seconds to fire instead of
+// N/520MHz, so by the time the IRQ arrives the DWT has advanced ~5.4x
+// further than the firmware expected - every freshly-scheduled timer is
+// already "in the past" and the firmware shuts down (reason 51,
+// "Rescheduled timer in the past") during config. Matching SysTick to
+// the DWT/CLOCK_FREQ rate removes the mismatch (same fix
+// same70q20b.repl uses for its Cortex-M7).
+nvic:
+    systickFrequency: 520000000

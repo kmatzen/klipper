@@ -281,6 +281,9 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/samd21_smoke.test", \
      "test/klippy/stm32f103_smoke.test", \
      "test/klippy/stm32f103_tick.test", \
+     "test/klippy/stm32f4_smoke.test", \
+     "test/klippy/stm32g0_smoke.test", \
+     "test/klippy/stm32h7_smoke.test", \
      "test/klippy/samd51_smoke.test", \
      "test/klippy/sam3x_smoke.test", \
      "test/klippy/sam4s_smoke.test", \
