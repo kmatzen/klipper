@@ -137,6 +137,11 @@ _SAM4S_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # heater reads temp=0.0. This stub models that register slice.
 _STM32_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'stm32_adc_stub.py')
+# RP2040 ADC stub. The local rp2040.repl models no ADC at all (the
+# 0x4004C000 region is unmapped), so klipper's thermistor reads return
+# 0. This stub drives klipper's RP2040 ADC handshake (src/rp2040/adc.c).
+_RP2040_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'rp2040_adc_stub.py')
 
 # SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
 # check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
@@ -249,6 +254,9 @@ _AFEC_BASES_FOR_CHIP = {
     # upstream `adc1: Analog.STM32_ADC` so this Python stub can claim
     # the address (klipper's F1 configs read every thermistor on ADC1).
     'stm32f103': (0x40012400,),
+    # RP2040 ADC at 0x4004C000. The local rp2040.repl models no ADC, so
+    # this Python stub is the only thing mapped there.
+    'rp2040': (0x4004C000,),
 }
 
 # Override the default afec_stub.py per chip. The SAM4S ADC uses
@@ -257,6 +265,7 @@ _AFEC_BASES_FOR_CHIP = {
 _ADC_STUB_FOR_CHIP = {
     'sam4s8c': _SAM4S_ADC_STUB_PY,
     'stm32f103': _STM32_ADC_STUB_PY,
+    'rp2040': _RP2040_ADC_STUB_PY,
 }
 
 # Per-chip extra Python.PythonPeripheral stubs to inject after the

@@ -210,6 +210,7 @@ _AFEC_BASES = (
     0x400B4000,  # SAM4E AFEC1
     0x40038000,  # SAM4S ADC (single peripheral, 16 channels)
     0x40012400,  # STM32F1 ADC1 (stm32_adc_stub.py; magic offsets at 0x100+)
+    0x4004C000,  # RP2040 ADC (rp2040_adc_stub.py; magic offsets at 0x100+)
 )
 _AFEC_MAGIC_DEFAULT = 0x100
 _AFEC_MAGIC_CH_BASE = 0x104
@@ -480,7 +481,25 @@ class _SwUart(object):
         self.phase = 'IDLE'
 
 
+# RP2040 SIO GPIO_IN register. The local rp2040.repl models the
+# single-cycle-IO region as plain storeback memory (not an
+# IGPIOReceiver), so klipper's gpio_in_read (src/rp2040/gpio.c) just
+# reads back sio_hw->gpio_in at SIO base 0xD0000000 + 0x004. To drive a
+# firmware-side input bit we read-modify-write that word rather than
+# calling OnGPIO on a GPIO peripheral that doesn't exist.
+_RP2040_SIO_GPIO_IN = 0xD0000004
+
+
 def _drive_rx(s, value):
+    if s.rx_port == 'RP':
+        sb = _M.Machine.SystemBus
+        cur = int(sb.ReadDoubleWord(_RP2040_SIO_GPIO_IN))
+        if value:
+            cur |= (1 << s.rx_pin)
+        else:
+            cur &= ~(1 << s.rx_pin)
+        sb.WriteDoubleWord(_RP2040_SIO_GPIO_IN, cur & 0xFFFFFFFF)
+        return
     _gpio_port(s.rx_port).OnGPIO(s.rx_pin, bool(value))
 
 

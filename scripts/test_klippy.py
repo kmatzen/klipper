@@ -676,10 +676,13 @@ class TestCase:
         r'(?:#.*)?$')
     _TMC_UART_SECTION_RE = re.compile(
         r'^\[(tmc220[89])\s+\S+\]\s*$')
+    # Pin names are STM32/SAM/SAMD "PXn" (P + port letter + number) or
+    # RP2040 "gpioN" (single bank). _sw_uart_port_pin() maps both to the
+    # sw_uart command's (port, pin) form.
     _TMC_UART_PIN_RE = re.compile(
-        r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+        r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+)\s*(?:#.*)?$')
     _TMC_UART_TX_PIN_RE = re.compile(
-        r'^\s*tx_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
+        r'^\s*tx_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+)\s*(?:#.*)?$')
     _TMC2660_SECTION_RE = re.compile(
         r'^\[tmc2660\s+\S+\]\s*$')
     _TMC2660_CS_PIN_RE = re.compile(
@@ -694,6 +697,31 @@ class TestCase:
         r'^\s*data_ready_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*(?:#.*)?$')
     _ADS1220_SAMPLE_RATE_RE = re.compile(
         r'^\s*sample_rate\s*:\s*(\d+)\s*(?:#.*)?$')
+
+    @staticmethod
+    def _sw_uart_port_pin(pin_name):
+        # Translate a klipper TMC uart pin name into the (port, pin) form
+        # the sw_uart fixture command uses. Two pin-name styles appear:
+        #   "PC11"  (STM32 / Atmel SAM / SAMD) -> ('C', 11): a port
+        #            letter renode_hooks._gpio_port resolves to a GPIO
+        #            peripheral it drives via OnGPIO.
+        #   "gpio9" (RP2040) -> ('RP', 9): the RP2040 has a single GPIO
+        #            bank modelled (in test/emulator/repl/rp2040.repl) as
+        #            a plain storeback SIO region, not an IGPIOReceiver,
+        #            so renode_hooks.sw_uart drives RX by writing the SIO
+        #            GPIO_IN register for that pin. The 'RP' sentinel
+        #            selects that path.
+        # Returns None for any other style (the caller skips it).
+        if pin_name is None:
+            return None
+        if len(pin_name) >= 3 and pin_name[0] == 'P' and pin_name[1].isalpha():
+            try:
+                return (pin_name[1], int(pin_name[2:]))
+            except ValueError:
+                return None
+        if pin_name.startswith('gpio') and pin_name[4:].isdigit():
+            return ('RP', int(pin_name[4:]))
+        return None
 
     @classmethod
     def _parse_tmc_uart_pins(cls, config_fname):
@@ -1226,20 +1254,18 @@ class TestCase:
             bit_time = int(raw.get('sw_uart_bit_time_cycles', 1778))
             for entry in self._parse_tmc_uart_pins(config_fname):
                 upin, tpin = entry
-                if not (len(upin) >= 3 and upin[0] == 'P'
-                        and upin[1].isalpha()):
+                up = self._sw_uart_port_pin(upin)
+                if up is None:
                     continue
                 if backend == 'renode':
-                    if not (len(tpin) >= 3 and tpin[0] == 'P'
-                            and tpin[1].isalpha()):
+                    tp = self._sw_uart_port_pin(tpin)
+                    if tp is None:
                         continue
                     lines.append("sw_uart %s %d %s %d %d 0" % (
-                        upin[1], int(upin[2:]),
-                        tpin[1], int(tpin[2:]),
-                        bit_time))
+                        up[0], up[1], tp[0], tp[1], bit_time))
                 else:
                     lines.append("sw_uart %s %d %d 0" % (
-                        upin[1], int(upin[2:]), bit_time))
+                        up[0], up[1], bit_time))
         # gpio: list of [port_letter, pin, value] triples. Drives the
         # named GPIO pin to the given level via the bridge's gpio
         # control command. Useful for tests where a sensor's data-
