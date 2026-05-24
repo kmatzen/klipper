@@ -131,6 +131,12 @@ _AFEC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # This stub mimics the AFEC stub but with the ADC register map.
 _SAM4S_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'sam4s_adc_stub.py')
+# STM32F1 ADC stub. Upstream Renode's Analog.STM32_ADC doesn't complete
+# klipper's SWSTART -> STRT/EOC -> SQR3/DR software-trigger handshake
+# (src/stm32/adc.c), so no analog_in samples reach klippy and every
+# heater reads temp=0.0. This stub models that register slice.
+_STM32_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'stm32_adc_stub.py')
 
 # SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
 # check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
@@ -239,6 +245,10 @@ _AFEC_BASES_FOR_CHIP = {
     # OMITS the upstream `adc: Analog.SAM4S_ADC` so this Python stub
     # can claim the address.
     'sam4s8c': (0x40038000,),
+    # STM32F1 ADC1 at 0x40012400. Local stm32f103.repl OMITS the
+    # upstream `adc1: Analog.STM32_ADC` so this Python stub can claim
+    # the address (klipper's F1 configs read every thermistor on ADC1).
+    'stm32f103': (0x40012400,),
 }
 
 # Override the default afec_stub.py per chip. The SAM4S ADC uses
@@ -246,6 +256,7 @@ _AFEC_BASES_FOR_CHIP = {
 # (AFE_CR/CHSR/LCDR/ISR/CSELR/CDR), so it needs its own stub.
 _ADC_STUB_FOR_CHIP = {
     'sam4s8c': _SAM4S_ADC_STUB_PY,
+    'stm32f103': _STM32_ADC_STUB_PY,
 }
 
 # Per-chip extra Python.PythonPeripheral stubs to inject after the

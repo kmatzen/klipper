@@ -12,7 +12,36 @@
 // Addresses match RM0008 (STM32F1xx reference manual).
 using "platforms/cpus/stm32f103.repl"
 
-adc1: Analog.STM32_ADC @ sysbus 0x40012400
+// DWT frequency MUST match klipper's CONFIG_CLOCK_FREQ (72 MHz on the
+// STM32F103). The Cortex-M3 firmware reads DWT->CYCCNT as its monotonic
+// clock (src/generic/armcm_timer.c). Upstream stm32f103.repl ships no
+// DWT model, so CYCCNT comes from the CortexM core's internal cycle
+// counter, which only advances with *executed instructions* - it stalls
+// whenever the firmware idles in WFI. Under deterministic tick mode each
+// `emulation RunFor` advances virtual time by the requested interval, but
+// the core-internal CYCCNT skips the idle portion, so the firmware clock
+// lags simulated time by an IRREGULAR (idle-dependent) amount. klippy's
+// clocksync can adapt to a constant-rate skew but not to a jittery one:
+// it resets its prediction variance on every sample and never converges,
+// stalling config send (boot/identify still succeed, but "Configured MCU"
+// never logs). A heavier config (heaters + steppers + 4 TMC2209s) idles
+// more between tasks than the minimal smoke config, so this only bites
+// once a real printer config is driven - the smoke/tick boot tests never
+// exposed it. A standalone Miscellaneous.DWT advances CYCCNT off virtual
+// time * frequency instead of executed cycles, so it tracks simulated
+// time exactly regardless of WFI - the same fix sam4s8c.repl /
+// same70q20b.repl already use for their Cortex-M4/M7 cores.
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 72000000
+
+// ADC1 is intentionally NOT declared here: upstream Analog.STM32_ADC
+// does not complete klipper's F1 SWSTART -> STRT/EOC -> SQR3/DR
+// software-trigger handshake (src/stm32/adc.c), so no analog_in samples
+// ever reach klippy and every heater reads temp=0.0. The renode launcher
+// registers test/emulator/stm32_adc_stub.py at 0x40012400 instead (see
+// _ADC_STUB_FOR_CHIP / _AFEC_BASES_FOR_CHIP), driven by the
+// renode_hooks adc_default / adc_set magic-offset pokes. ADC2 keeps the
+// upstream model (no current F1 config samples a channel on ADC2).
 adc2: Analog.STM32_ADC @ sysbus 0x40012800
 
 spi1: SPI.STM32SPI @ sysbus 0x40013000

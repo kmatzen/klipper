@@ -209,6 +209,7 @@ _AFEC_BASES = (
     0x400B0000,  # SAM4E AFEC0
     0x400B4000,  # SAM4E AFEC1
     0x40038000,  # SAM4S ADC (single peripheral, 16 channels)
+    0x40012400,  # STM32F1 ADC1 (stm32_adc_stub.py; magic offsets at 0x100+)
 )
 _AFEC_MAGIC_DEFAULT = 0x100
 _AFEC_MAGIC_CH_BASE = 0x104
