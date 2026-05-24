@@ -15,34 +15,31 @@
 # under --force-emulator). Diagnosis below is from clean-host runs on a
 # native-Linux x86_64 box (deterministic, not the disk-pressured macOS
 # Docker that masked these as flaky):
-#   * At the upstream SysTick rate the skip-enum cheat works end-to-end:
-#     enumeration completes, klippy reaches "Loaded MCU 'mcu'" and ~110
-#     BULK_IN transfers flow, then the firmware shuts down with
-#     static_string_id 56 "Rescheduled timer in the past" (armcm_timer.c
-#     timer_dispatch_many: a scheduled timer is >1ms behind DWT->CYCCNT).
-#   * It is NOT a SysTick-frequency mismatch: pinning the NVIC
-#     systickFrequency to the 300MHz core clock removes the shutdown but
-#     deterministically BREAKS enumeration (the firmware then never
-#     enables RXSTPES on EP0, so the SETUP cheat never injects). Tried
-#     and reverted.
-#   * It is NOT IRQ-servicing granularity: a cpu MaximumBlockSize sweep
-#     (1..1024 via RENODE_EXP_BLOCKSIZE) leaves the reason-56 shutdown
-#     unchanged.
-#   * Root cause is the wall-clock vs virtual-time drift during the Renode
-#     FREE-RUN boot phase: Renode runs the SAM CPU at a rate that diverges
-#     from CONFIG_CLOCK_FREQ, and the USB-build's own boot timers overshoot
-#     DWT->CYCCNT by >1ms. Raising RENODE_EXP_MIPS hides the overshoot but
-#     then runs virtual time faster than the wall-clock-paced klippy/USB
-#     pty can follow, so enumeration breaks - a genuine two-sided tension.
-#   * Deterministic tick-mode (which now works on Renode - see
-#     stm32f103_tick - and fixed the renode homing timeouts) does NOT fix
-#     this: the reason-56 overshoot happens during boot, BEFORE klippy
-#     connects the tick socket and lockstep engages, so the boot still
-#     free-runs. Confirmed: same70_usb in tick mode still fails.
-#   * Remaining fix shape: make the USBHS bringup tolerant of the Renode
-#     CPU rate (or drive the boot phase itself under lockstep). This is the
-#     one EMULATOR test still blocked; everything else passes under
-#     --force-emulator on a clean host.
+# Root cause is a two-sided SysTick-vs-DWT timing tension in the SAME70
+# model - it is NOT about Renode free-run vs deterministic execution
+# (confirmed: it fails identically in tick mode, which does not free-run):
+#   * SysTick=450MHz (upstream platforms/cpus/sam_e70.repl) vs DWT=300MHz
+#     (the 300MHz core clock / CONFIG_CLOCK_FREQ that klipper's SysTick
+#     CLKSOURCE=processor and DWT->CYCCNT both use): the skip-enum cheat
+#     works end-to-end - enumeration completes, klippy reaches "Loaded MCU
+#     'mcu'" with ~110 BULK_IN transfers - but the SysTick fires ~1.5x
+#     early, so klipper's timer_dispatch_many busy-waits for a far deadline
+#     while OTHER scheduled timers fall >1ms behind DWT, tripping
+#     static_string_id 56 "Rescheduled timer in the past" (armcm_timer.c).
+#     klippy then sees is_shutdown at config-send.
+#   * SysTick=300MHz (matching DWT/CLOCK_FREQ - the "correct" value):
+#     removes the reason-56 shutdown, but the firmware's USB EORST handler
+#     then never enables RXSTPES on EP0, so the skip-enum SETUP never
+#     injects and identify never starts. (A USBHS-model / firmware-USB
+#     timing dependency on the SysTick rate.)
+#   * Tried + ruled out: cpu MaximumBlockSize sweep 1..1024
+#     (RENODE_EXP_BLOCKSIZE), small SetGlobalQuantum (RENODE_EXP_QUANTUM),
+#     RENODE_EXP_MIPS (hides reason-56 but breaks enumeration), and tick
+#     mode with both SysTick rates - none satisfy both sides.
+#   * Remaining fix shape: make the USBHS EORST/SETUP bringup work at the
+#     correct 300MHz SysTick (so reason-56 stays gone AND enumeration
+#     completes). This is the one EMULATOR test still blocked; everything
+#     else passes under --force-emulator on a clean host.
 DICTIONARY same70q20b-usb.dict
 CONFIG same70_usb_smoke.cfg
 EMULATOR same70_usb_smoke.fixture.json

@@ -270,13 +270,14 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 #     host that divergence occasionally trips the trsync watchdog
 #     ("Communication timeout during homing"). Kept out of the gating run
 #     until the mixed-backend lockstep is made exact.
-#   * same70_usb_smoke - the one known-blocked test: its
-# USB-CDC firmware overshoots a boot timer and shuts down with
-# static_string_id 56 'Rescheduled timer in the past' during the Renode
-# free-run boot phase, before tick-mode lockstep engages (and raising the
-# Renode CPU rate instead breaks USB enumeration). See the test header for
-# the full diagnosis. The same70q20b-usb firmware is still built above, so
-# it stays runnable manually:
+#   * same70_usb_smoke - the one known-blocked test, on a two-sided
+# SysTick-vs-DWT timing tension (NOT free-run vs tick - it fails the same
+# in tick mode): the upstream 450MHz SysTick enumerates but fires early
+# enough that klipper trips reason-56 'Rescheduled timer in the past',
+# while the correct 300MHz SysTick stops that shutdown but makes the USB
+# EORST handler skip RXSTPES so enumeration never starts. See the test
+# header for the full diagnosis. The same70q20b-usb firmware is still
+# built above, so it stays runnable manually:
 #   docker run ... test_klippy.py -d ci_build/dict --force-emulator \
 #       test/klippy/same70_usb_smoke.test
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
