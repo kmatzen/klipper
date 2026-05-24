@@ -385,6 +385,13 @@ try:
 except ImportError:
     _HAVE_CPU_HOOK = False
 
+try:
+    # Used by the TMC SPI chain responder to set PC=LR (skip the real
+    # hardware transfer). SetRegisterUnsafe wants a RegisterValue.
+    from Antmicro.Renode.Peripherals.CPU import RegisterValue
+except ImportError:
+    RegisterValue = None
+
 
 _sw_uart_states = {}      # (rx_port, rx_pin, tx_port, tx_pin) -> _SwUart
 _sw_uart_active = [None]  # uart currently driving a response (or None)
@@ -770,6 +777,159 @@ def sw_uart(rx_port, rx_pin, tx_port, tx_pin, bit_time, addr):
         _sw_uart_states[key] = _SwUart(rx_port, rx_pin, tx_port, tx_pin,
                                        bit_time, addr)
     _ensure_cpu_hooks_installed()
+
+
+# --------------------------------------------------------------------
+# TMC SPI daisy-chain responder (TMC2130 / TMC5160 / TMC2240).
+#
+# Renode models no USART-in-SPI-mode peripheral and no SPI device for
+# the firmware to exchange bytes with, so a real spidev_transfer reads
+# back garbage. Instead of modelling the peripheral we intercept the
+# firmware's `spidev_transfer(spi, receive_data, len, data)` with a CPU
+# PC hook (same mechanism as sw_uart): read the MOSI bytes out of the
+# `data` buffer, synthesise the chain's MISO response in place, then
+# return early (set PC=LR) so the real hardware exchange - which would
+# overwrite our bytes with garbage - never runs. command_spi_transfer
+# then `sendf`s our response back to klippy.
+#
+# Chain semantics (klippy MCU_TMC_SPI_chain, extras/tmc2130.py): a
+# transaction is chain_len*5 bytes = n_slots 5-byte datagrams. klippy
+# places a driver's command at slot (chain_len - chain_pos) and reads
+# its response from the same slot, but the TMC reply carries the data
+# addressed by the PREVIOUS datagram for that position (reg_read sends
+# the read command twice; reg_write sends write_cmd then a dummy_read).
+# So the correct model is a ONE-TRANSACTION delay per slot: response[s]
+# = regfile[reg addressed at slot s in the previous transaction]. Both
+# spi_send (command_spi_send) and spi_transfer (command_spi_transfer)
+# route through spidev_transfer, so the single hook sees every datagram
+# in order. The register file is shared across the chain - klippy
+# initialises drivers sequentially, so one file suffices (matches the
+# simavr bridge's tmc_regs).
+_spi_tmc_symbol = [None]            # firmware addr of spidev_transfer
+_spi_tmc_enabled = [False]
+_spi_tmc_hook_installed = [False]
+_spi_tmc_regs = {}                  # reg (0..0x7f) -> 32-bit value
+_spi_tmc_prev_addr = {}            # slot index -> reg addressed last txn
+_spi_tmc_dbg = [0]                  # limit per-call trace volume
+
+
+def _spi_tmc_reset():
+    _spi_tmc_regs.clear()
+    _spi_tmc_prev_addr.clear()
+    # DRV_STATUS default for tmc2130 / tmc5160 / tmc2240: stst=1 +
+    # cs_actual=5 (any non-zero scaler klippy decodes as healthy), so
+    # the periodic DRV_STATUS check doesn't read cs_actual=0 and shut
+    # down. Matches simavr_bridge.c's spi_tmc default.
+    _spi_tmc_regs[0x6f] = 0xc0050000
+    # IOIN VERSION (bits 24..31) = 0x30 (TMC5160 / TMC5160A); DUMP_TMC's
+    # IOIN read then reports version=0x30, a positive proof the chain
+    # read path round-tripped. Other registers default to 0.
+    _spi_tmc_regs[0x04] = 0x30000000
+
+
+def spi_tmc():
+    _log("spi_tmc: enable TMC SPI chain responder")
+    _spi_tmc_enabled[0] = True
+    _spi_tmc_reset()
+    _ensure_spi_tmc_hook_installed()
+
+
+def apply_spi_tmc_symbol(addr):
+    try:
+        _spi_tmc_symbol[0] = int(addr)
+        _log("spi_tmc symbol spidev_transfer -> %x", int(addr))
+    except (TypeError, ValueError) as e:
+        _log("apply_spi_tmc_symbol: bad addr %r: %s", addr, e)
+        return
+    _ensure_spi_tmc_hook_installed()
+
+
+def _ensure_spi_tmc_hook_installed():
+    if _spi_tmc_hook_installed[0]:
+        return
+    if not _spi_tmc_enabled[0]:
+        return
+    if not _HAVE_CPU_HOOK:
+        _log("spi_tmc: CpuAddressHook unavailable")
+        return
+    addr = _spi_tmc_symbol[0]
+    if addr is None:
+        _log("spi_tmc: spidev_transfer symbol not resolved yet")
+        return
+    cpu = _M.Machine['sysbus.cpu']
+    try:
+        cpu.AddHook(int(addr), CpuAddressHook(_on_spidev_transfer_hook))
+        _spi_tmc_hook_installed[0] = True
+        _log("spi_tmc hook installed: spidev_transfer @ %x", int(addr))
+    except Exception as e:
+        _log("spi_tmc hook install FAILED @ %x: %s", int(addr), e)
+
+
+def _on_spidev_transfer_hook(cpu, pc):
+    try:
+        _do_spidev_transfer(cpu, pc)
+    except Exception as e:
+        _log("spi_tmc hook EXCEPTION: %s", e)
+
+
+def _do_spidev_transfer(cpu, pc):
+    # spidev_transfer(struct spidev_s *spi, uint8_t receive_data,
+    #                 uint8_t data_len, uint8_t *data)
+    #   R0 = spi, R1 = receive_data, R2 = data_len, R3 = data ptr
+    data_len = int(cpu.GetRegisterUnsafe(2).RawValue) & 0xff
+    data_ptr = int(cpu.GetRegisterUnsafe(3).RawValue)
+    if data_len == 0 or (data_len % 5) != 0:
+        # Not a 5-byte-datagram TMC transaction; let the real transfer
+        # run (don't skip). No TMC config in scope hits this, but stay
+        # safe for any non-TMC SPI device on the bus.
+        return
+    sb = _M.Machine.SystemBus
+    mosi = []
+    for i in range(data_len):
+        mosi.append(int(sb.ReadByte(data_ptr + i)) & 0xff)
+    n_slots = data_len // 5
+    resp = [0] * data_len
+    for s in range(n_slots):
+        off = s * 5
+        prev = _spi_tmc_prev_addr.get(s, 0)
+        val = _spi_tmc_regs.get(prev, 0) & 0xffffffff
+        resp[off] = 0                       # SPI status = OK
+        resp[off + 1] = (val >> 24) & 0xff
+        resp[off + 2] = (val >> 16) & 0xff
+        resp[off + 3] = (val >> 8) & 0xff
+        resp[off + 4] = val & 0xff
+        addr = mosi[off]
+        reg = addr & 0x7f
+        if addr & 0x80:                     # write
+            data = ((mosi[off + 1] << 24) | (mosi[off + 2] << 16)
+                    | (mosi[off + 3] << 8) | mosi[off + 4])
+            if reg == 0x01:                 # GSTAT: write-1-to-clear
+                _spi_tmc_regs[reg] = _spi_tmc_regs.get(reg, 0) & ~data
+            else:
+                _spi_tmc_regs[reg] = data
+        _spi_tmc_prev_addr[s] = reg
+    for i in range(data_len):
+        sb.WriteByte(data_ptr + i, resp[i])
+    # Skip the real (garbage-returning) hardware transfer: return to the
+    # caller immediately by pointing PC at the link register. Clear the
+    # thumb bit (LR bit0=1 on Cortex-M) - a PC with bit0 set faults.
+    # SetRegisterUnsafe / the PC setter want a RegisterValue, not a raw
+    # int, so build one (fall back to LR's own RegisterValue object).
+    lr_rv = cpu.GetRegisterUnsafe(14)
+    lr = int(lr_rv.RawValue) & 0xfffffffe
+    if _spi_tmc_dbg[0] < 6:
+        _spi_tmc_dbg[0] += 1
+        _log("spi_tmc xfer len=%d ptr=%x reg0=%02x lr=%x",
+             data_len, data_ptr, mosi[0], lr)
+    try:
+        cpu.SetRegisterUnsafe(15, RegisterValue.Create(lr, 32))
+    except Exception as e1:
+        try:
+            cpu.SetRegisterUnsafe(15, lr_rv)
+            _log("spi_tmc PC-skip via raw LR RegisterValue (Create err: %s)",
+                 e1)
+        except Exception as e2:
+            _log("spi_tmc PC-skip FAILED: %s / %s", e1, e2)
 
 
 # --------------------------------------------------------------------

@@ -852,6 +852,25 @@ def _resolve_sw_uart_symbols(monitor_sock):
                          "send err %s\n" % e)
 
 
+def _resolve_spi_tmc_symbol(monitor_sock):
+    # Resolve the firmware `spidev_transfer` symbol and push it to
+    # renode_hooks.apply_spi_tmc_symbol so the TMC SPI chain hook can
+    # attach. Configs without an SPI device (or built without spicmds.o)
+    # come back empty and the hook stays uninstalled. Harmless to call
+    # for every chip; renode_hooks.spi_tmc() (from the fixture) is what
+    # actually enables the responder.
+    cmd = (
+        'python "import renode_hooks; '
+        'sb = monitor.Machine[\\"sysbus\\"]; '
+        'a = list(sb.GetAllSymbolAddresses(\\"spidev_transfer\\")); '
+        'renode_hooks.apply_spi_tmc_symbol(int(a[0])) if a else None"')
+    try:
+        _send_monitor(monitor_sock, cmd)
+    except Exception as e:
+        sys.stderr.write("renode_launcher: spi_tmc symbol resolve "
+                         "send err %s\n" % e)
+
+
 # Default I2C addresses to register the empty fixture's
 # i2c_default.register_responses against. Covers the LDC1612 default
 # (0x2a) and its alternate (0x29) - the only I2C device klippy probes
@@ -1682,6 +1701,7 @@ def main():
         # link tmcuart.o report no addresses and the hook installer
         # no-ops cleanly.
         _resolve_sw_uart_symbols(monitor_sock)
+        _resolve_spi_tmc_symbol(monitor_sock)
         _resolve_sched_status_addr(monitor_sock)
 
         # Apply the fixture-resident hooks (ADC defaults, I2C ID

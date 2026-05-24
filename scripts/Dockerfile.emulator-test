@@ -290,6 +290,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/sam4e_smoke.test", \
      "test/klippy/same70_smoke.test", \
      "test/klippy/same70_usb_smoke.test", \
+     "test/klippy/same70_spi_tmc.test", \
      "test/klippy/lpc176x_smoke.test", \
      "test/klippy/hc32f460_smoke.test", \
      "test/klippy/rp2040_smoke.test", \
