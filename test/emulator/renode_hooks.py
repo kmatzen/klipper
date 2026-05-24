@@ -211,6 +211,13 @@ _AFEC_BASES = (
     0x40038000,  # SAM4S ADC (single peripheral, 16 channels)
     0x40012400,  # STM32F1 ADC1 (stm32_adc_stub.py; magic offsets at 0x100+)
     0x4004C000,  # RP2040 ADC (rp2040_adc_stub.py; magic offsets at 0x100+)
+    # NB: the LPC176x ADC (lpc176x_adc.cs at 0x40034000) is deliberately
+    # NOT listed here. _afec_poke writes every base on every chip, and
+    # 0x40034000 is the RP2040's host-link UART0 - poking it during
+    # skr_pico would scribble on a live peripheral. The LPC ADC is a real
+    # C# peripheral, so it takes fixture values through the idiomatic
+    # FeedSample / SetDefaultValue methods via _iter_adcs() instead (it is
+    # named `adc`, resolved as sysbus.adc only on the LPC platform).
 )
 _AFEC_MAGIC_DEFAULT = 0x100
 _AFEC_MAGIC_CH_BASE = 0x104
@@ -496,8 +503,21 @@ class _SwUart(object):
 # calling OnGPIO on a GPIO peripheral that doesn't exist.
 _RP2040_SIO_GPIO_IN = 0xD0000004
 
+# LPC176x fast GPIO (LPC_GPIO_BASE). Five 0x20-spaced port blocks; the
+# input register FIOPIN sits at +0x14. renode_launcher maps a plain
+# storeback region here (_EXTRA_PERIPHERAL_STUBS_FOR_CHIP['lpc176x']),
+# so - exactly like the RP2040 SIO region - we drive a firmware-side
+# input bit by read-modify-writing FIOPIN, which klipper's gpio_in_read
+# (src/lpc176x/gpio.c: FIOPIN & bit) reads back. The 'LPCn' rx_port
+# sentinel (emitted by test_klippy._sw_uart_port_pin for "Pn.m" pin
+# names) selects this path and carries the port number.
+_LPC_GPIO_BASE = 0x2009C000
+_LPC_GPIO_PORT_STRIDE = 0x20
+_LPC_GPIO_FIOPIN = 0x14
 
-def _drive_rx(s, value):
+
+def _drive_rx_one(s, value):
+    # Drive a single firmware-side RX pin for sw_uart state `s`.
     if s.rx_port == 'RP':
         sb = _M.Machine.SystemBus
         cur = int(sb.ReadDoubleWord(_RP2040_SIO_GPIO_IN))
@@ -507,7 +527,42 @@ def _drive_rx(s, value):
             cur &= ~(1 << s.rx_pin)
         sb.WriteDoubleWord(_RP2040_SIO_GPIO_IN, cur & 0xFFFFFFFF)
         return
+    if s.rx_port.startswith('LPC'):
+        port = int(s.rx_port[3:])
+        addr = (_LPC_GPIO_BASE + port * _LPC_GPIO_PORT_STRIDE
+                + _LPC_GPIO_FIOPIN)
+        sb = _M.Machine.SystemBus
+        cur = int(sb.ReadDoubleWord(addr))
+        if value:
+            cur |= (1 << s.rx_pin)
+        else:
+            cur &= ~(1 << s.rx_pin)
+        sb.WriteDoubleWord(addr, cur & 0xFFFFFFFF)
+        return
     _gpio_port(s.rx_port).OnGPIO(s.rx_pin, bool(value))
+
+
+def _drive_rx(s, value):
+    # Drive the firmware-side RX bit for the active TMC UART response.
+    #
+    # Multi-drop shared-bus configs (skr_pico / skr_mini_e3_v2: four
+    # TMC2209s on one rx/tx pair, distinguished by datagram address)
+    # register a SINGLE sw_uart state, so this drives just that pin.
+    #
+    # Single-wire-per-driver configs (BTT SKR v1.4: four TMC2208s, each
+    # with its own dedicated uart_pin, all datagram-address 0) register
+    # one state PER pin. The responder can't tell from the bit-banged
+    # request which oid/pin it targets (TMC2208 has no address field), so
+    # broadcast the same framed reply onto every registered RX pin: klippy
+    # initialises and reads the drivers strictly sequentially, the shared
+    # register file (see _do_tmcuart_send target selection) makes the
+    # reply content correct for whichever driver is live, and the other
+    # pins simply aren't being sampled at that instant.
+    if _sw_uart_states:
+        for t in _sw_uart_states.values():
+            _drive_rx_one(t, value)
+    else:
+        _drive_rx_one(s, value)
 
 
 def _build_response_bits(s, reg):

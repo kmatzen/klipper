@@ -676,13 +676,16 @@ class TestCase:
         r'(?:#.*)?$')
     _TMC_UART_SECTION_RE = re.compile(
         r'^\[(tmc220[89])\s+\S+\]\s*$')
-    # Pin names are STM32/SAM/SAMD "PXn" (P + port letter + number) or
-    # RP2040 "gpioN" (single bank). _sw_uart_port_pin() maps both to the
-    # sw_uart command's (port, pin) form.
+    # Pin names are STM32/SAM/SAMD "PXn" (P + port letter + number),
+    # RP2040 "gpioN" (single bank), or LPC176x "Pn.m" (P + port digit +
+    # dot + pin). _sw_uart_port_pin() maps all three to the sw_uart
+    # command's (port, pin) form.
     _TMC_UART_PIN_RE = re.compile(
-        r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+)\s*(?:#.*)?$')
+        r'^\s*uart_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+|P\d+\.\d+)'
+        r'\s*(?:#.*)?$')
     _TMC_UART_TX_PIN_RE = re.compile(
-        r'^\s*tx_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+)\s*(?:#.*)?$')
+        r'^\s*tx_pin\s*:\s*([!^~]*)(P[A-L]\d+|gpio\d+|P\d+\.\d+)'
+        r'\s*(?:#.*)?$')
     _TMC2660_SECTION_RE = re.compile(
         r'^\[tmc2660\s+\S+\]\s*$')
     _TMC2660_CS_PIN_RE = re.compile(
@@ -711,6 +714,10 @@ class TestCase:
         #            so renode_hooks.sw_uart drives RX by writing the SIO
         #            GPIO_IN register for that pin. The 'RP' sentinel
         #            selects that path.
+        #   "P1.10" (LPC176x) -> ('LPC1', 10): LPC fast-GPIO is a plain
+        #            storeback region too, so renode_hooks.sw_uart drives
+        #            RX by writing FIOPIN for the named port. The 'LPCn'
+        #            sentinel carries the fast-GPIO port number.
         # Returns None for any other style (the caller skips it).
         if pin_name is None:
             return None
@@ -721,6 +728,10 @@ class TestCase:
                 return None
         if pin_name.startswith('gpio') and pin_name[4:].isdigit():
             return ('RP', int(pin_name[4:]))
+        if pin_name[0] == 'P' and '.' in pin_name:
+            bank, _, pin = pin_name[1:].partition('.')
+            if bank.isdigit() and pin.isdigit():
+                return ('LPC' + bank, int(pin))
         return None
 
     @classmethod

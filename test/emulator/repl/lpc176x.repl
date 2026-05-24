@@ -38,18 +38,33 @@
 //     LCR, FCR, IER, IIR, LSR); NS16550 with wideRegisters=true
 //     handles the 32-bit-spaced layout.
 //
+//   - adc (Analog.LPC176x_ADC @ 0x40034000) -> nvic@22. klipper's LPC
+//     ADC driver (src/lpc176x/adc.c) is INTERRUPT-driven: it arms a
+//     burst conversion and only makes progress once ADC_IRQHandler has
+//     run five times. No upstream Renode model exists, and a polled
+//     register-storeback stub can't drive it (nothing raises the IRQ),
+//     so this is a local C# model that raises the ADC line. ADC_IRQn is
+//     22 on the LPC1768 vector table. The type is Roslyn-compiled into
+//     the runtime via `i @lpc176x_adc.cs` (emitted by renode_launcher's
+//     _CSHARP_INCLUDES_FOR_CHIP['lpc176x']) before this .repl parses,
+//     same path as rp2040_timer.cs / hc32f460_uart.cs. Idle for the
+//     boot smoke test, which configures no thermistors.
+//
 // Klipper LPC uses generic/armcm_timer.c (DWT + SysTick), so no
 // chip-specific timer modeling is needed. Watchdog (LPC_WDT @
-// 0x40000000), GPIO (LPC_GPIO @ 0x2009C000), and other peripheral
-// writes go to unmapped addresses and produce harmless log
-// warnings; the firmware doesn't read them back to gate progress
-// in the printers.test scope.
+// 0x40000000) and other peripheral writes go to unmapped addresses
+// and produce harmless log warnings; the firmware doesn't read them
+// back to gate progress in the printers.test scope.
 //
-// LPC_SC stub is runtime-injected by the launcher
+// The LPC_SC clock-controller stub and the fast-GPIO storeback region
+// (LPC_GPIO @ 0x2009C000, modelled so renode_hooks.sw_uart can drive
+// the firmware-side FIOPIN RX bit for TMC2208/2209 single-wire UART)
+// are runtime-injected by the launcher
 // (_EXTRA_PERIPHERAL_STUBS_FOR_CHIP['lpc176x']) rather than declared
 // here, mirroring the AFEC and SAMD clock-stub paths - keeps the
 // stub script path checkout-relative instead of baked into the
-// .repl.
+// .repl. The ADC is declared here (not launcher-injected) because it
+// needs the static `IRQ -> nvic@22` wiring a .repl line provides.
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m3"
@@ -71,3 +86,6 @@ sram: Memory.MappedMemory @ sysbus 0x10000000
 uart0: UART.NS16550 @ sysbus 0x4000C000
     wideRegisters: true
     ->nvic@5
+
+adc: Analog.LPC176x_ADC @ sysbus 0x40034000
+    IRQ -> nvic@22

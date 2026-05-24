@@ -297,6 +297,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/duet3_6hc.test", \
      "test/klippy/duet3_6xd.test", \
      "test/klippy/lpc176x_smoke.test", \
+     "test/klippy/skr_v1_4.test", \
      "test/klippy/hc32f460_smoke.test", \
      "test/klippy/rp2040_smoke.test", \
      "test/klippy/linuxpru.test", \

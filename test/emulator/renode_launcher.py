@@ -210,6 +210,18 @@ _RP2040_TIMER_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _SAME70_USBHS_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'repl', 'same70_usbhs.cs')
 
+# Path to the LPC176x ADC C# peripheral. klipper's LPC ADC driver
+# (src/lpc176x/adc.c) is interrupt-driven - gpio_adc_sample() arms a
+# burst conversion and only completes once ADC_IRQHandler has run five
+# times - so a polled register-storeback Python stub (like the AFEC /
+# SAM4S / STM32 / RP2040 ADC stubs) can't drive it: nothing raises the
+# ADC IRQ, the ISR never runs, and thermistors read temp=0.0. This C#
+# model raises the ADC line (GPIO IRQ -> nvic@22). Loaded via `i @<path>`
+# before the .repl parses (the .repl references Analog.LPC176x_ADC), same
+# path as rp2040_timer.cs.
+_LPC_ADC_CS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'repl', 'lpc176x_adc.cs')
+
 # Per-stub-region paths for the RP2040 clock-controller surface. Each
 # script implements one clock peripheral's busy-wait status synthesis
 # (RESET_DONE = ~RESET, XOSC.STATUS.STABLE from CTRL.ENABLE, PLL.CS.LOCK
@@ -331,8 +343,24 @@ _EXTRA_PERIPHERAL_STUBS_FOR_CHIP = {
         ('mclk', 0x40000800, 0x40, _SAMD_STOREBACK_PY),
         ('cmcc', 0x41006000, 0x40, _SAMD_STOREBACK_PY),
     ],
+    # LPC176x: the LPC_SC clock-controller stub (SystemInit busy-wait
+    # synthesis) plus the fast-GPIO block as plain storeback. klipper's
+    # LPC GPIO (src/lpc176x/gpio.c) lives at LPC_GPIO_BASE 0x2009C000 with
+    # five 0x20-spaced port blocks (FIODIR 0x00, FIOMASK 0x10, FIOPIN
+    # 0x14, FIOSET 0x18, FIOCLR 0x1C). Without a mapped region the
+    # firmware's GPIO writes hit unmapped space (harmless for the boot
+    # smoke test) but gpio_in_read (FIOPIN & bit) can't be driven, which
+    # the TMC2208/2209 single-wire UART responder needs: renode_hooks
+    # _drive_rx writes the FIOPIN bit for the firmware-side RX pin (same
+    # idea as the RP2040 SIO GPIO_IN write, but at the LPC FIOPIN offset).
+    # Plain dict storeback suffices - the firmware never reads a GPIO
+    # register back to gate boot progress, and FIOSET/FIOCLR don't need
+    # to mirror into FIOPIN because the only readback we care about (the
+    # RX pin) is driven directly by _drive_rx. 0xA0 covers all five
+    # ports.
     'lpc176x': [
         ('lpc_sc', 0x400FC000, 0x200, _LPC_SC_STUB_PY),
+        ('gpio', 0x2009C000, 0xA0, _SAMD_STOREBACK_PY),
     ],
     # STM32H7: PWR power-control block. Upstream stm32h743.repl leaves
     # this address as a logging Tag; the stub serves CSR1.ACTVOSRDY and
@@ -461,6 +489,7 @@ _USE_VIRTUAL_ELF_LOAD = {
 _CSHARP_INCLUDES_FOR_CHIP = {
     'hc32f460': [_HC32F460_UART_CS],
     'rp2040': [_RP2040_TIMER_CS],
+    'lpc176x': [_LPC_ADC_CS],
     # Both same70q20b chip keys load the USBHS .cs even though only
     # the USB-mode firmware exercises the peripheral - the .repl
     # references USB.SAM_USBHS unconditionally so the type must
