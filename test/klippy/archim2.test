@@ -1,0 +1,79 @@
+# End-to-end EMULATOR test for the UltiMachine Archim2 (Atmel SAM3X8E)
+# in DETERMINISTIC TICK MODE. Boots klipper firmware under Renode
+# against the archim2 pin map, completes klippy identify + clocksync,
+# brings up the full MCU config (4 TMC2130s on software SPI, 2
+# software-PWM heaters, a fan, endstops, 2 thermistors), reads the
+# thermistors through the SAM3X ADC, round-trips the TMC2130 register
+# files over the software SPI chain, and exercises interactive gcode
+# (M114/M105) against real firmware.
+#
+# This is the SAM3X per-printer test, the counterpart to sam3x_smoke
+# (boot only). It reuses two existing pieces of infrastructure intact:
+#
+#   - The TMC SPI chain responder (renode_hooks spi_tmc). The four
+#     TMC2130s use SOFTWARE SPI, but software SPI still routes every
+#     datagram through the firmware's spidev_transfer (src/spicmds.c) -
+#     the single hw+sw SPI chokepoint - so the same PC-skip responder
+#     duet3-6hc (TMC5160) and octopus-pro (TMC5160 sw SPI) use serves
+#     these reads with no change. DUMP_TMC below reads the live register
+#     file for stepper_x and the extruder; the IOIN read returning
+#     version=0x30 is the positive proof the SPI read path round-tripped.
+#
+#   - The SAM4S ADC stub (test/emulator/sam4s_adc_stub.py). src/atsam/
+#     adc.c is shared between SAM3X and SAM4S and the ADC register map is
+#     identical, so the same stub serves the SAM3X ADC verbatim at the
+#     SAM3X base 0x400C0000. The hotend reads through ADC channel index
+#     12 (PB19, ATC Semitec 104GT-2) and the bed through index 13 (PB20,
+#     EPCOS 100K). With a broken ADC both heaters sit at temp=0.0 with no
+#     shutdown, so the "temp=3" assertion below (both read ~36 C) is the
+#     positive proof the ADC delivered samples.
+#
+# The real Archim2 host link is USB; the firmware here is the generic
+# serial-mode sam3x8e build (host link on PA8/PA9) and the test
+# exercises the pin map, which is independent of the host link. The
+# gated path is motion-free.
+DICTIONARY sam3x8e.dict
+CONFIG archim2.cfg
+EMULATOR archim2.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode.
+M114
+M105
+# Read back the live TMC register file over the software SPI chain for
+# the first and last drivers. DUMP_TMC reads every register (incl.
+# IOIN) live, so it only produces a full dump if the firmware
+# round-tripped the read datagrams through spidev_transfer.
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# klippy connected, loaded the dictionary, and built the full config
+# against real firmware.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+# DUMP_TMC dumped the first and last drivers; the IOIN read returning
+# the responder's version byte (0x30) proves the software SPI chain read
+# path round-tripped.
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x30"
+# Positive proof the SAM3X ADC delivered samples: both thermistors read
+# ~36 C, so a periodic Stats line carries "temp=3x". A broken ADC leaves
+# them at temp=0.0 with no shutdown, which this catches where the
+# no-error assertions below cannot.
+EXPECT_LOG_CONTAINS "temp=3"
+# A broken SPI round-trip surfaces as a TMC init failure or a direct
+# read error; the deterministic tick clock must produce neither.
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+# A renode-side crash (wrong sysbus peripheral, hook callback error)
+# kills serial; klippy then gets EOF and identify / TMC init time out.
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# With the deterministic clock the config / TMC / ADC path pushes no
+# deadline into the firmware's past, so nothing shuts down.
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

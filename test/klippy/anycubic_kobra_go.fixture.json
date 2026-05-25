@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the Anycubic Kobra Go (HDSC HC32F460) via renode in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous usart1<->pty byte shuttle through the HC32F460_USART C# model's UARTBase CharReceived/WriteChar), so the HC32 DWT->CYCCNT clock advances at exactly CONFIG_CLOCK_FREQ (168 MHz, pinned in hc32f460.repl) instead of the wall-clock-bound JIT rate that drifts in free-run - and the thermistor reads land in a stats line every tick rather than flakily. The two 100K-class thermistors read through the HC32 ADC (M4_ADC1 @ 0x40040000), served by test/emulator/hc32f460_adc_stub.py: analog_in pins each channel to raw 7600 / 8184 (~0.93 of full scale) so the hotend (ATC Semitec 104GT-2) and bed (EPCOS 100K) both read ~36 C - inside the hotend [0,250] and bed [0,120] ranges. HC32 ADC channels (src/hc32f460/adc.c adc_gpio[]): PC3 = channel 13 (hotend), PC1 = channel 11 (bed). Values reach the stub through renode_hooks adc_default / adc_set, which poke magic offsets 0x100 (default) and 0x104+ch*4 (per channel) - the same protocol afec_stub.py / sam4s_adc_stub.py use. The Kobra Go has no Trinamic drivers, so no sw_uart / SPI responder is involved.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_hotend": {"default_value": 7600, "channel": 13},
+        "_bed": {"default_value": 7600, "channel": 11}
+    },
+    "tick_mode": true
+}

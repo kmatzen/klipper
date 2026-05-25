@@ -1,0 +1,84 @@
+# End-to-end EMULATOR test for the Duet3 Mini 5+ (Microchip SAME54P20,
+# run on the pin-/register-compatible samd51p20 build) in DETERMINISTIC
+# TICK MODE. Boots klipper firmware under Renode against the duet3-mini
+# pin map, completes klippy identify + clocksync, brings up the full MCU
+# config (4 TMC2209s on multi-drop UART, 2 software-PWM heaters, a
+# heater_fan, endstops, adc_scaled thermistors), reads the thermistors
+# through the SAMX5 ADC, round-trips the four TMC2209 register files over
+# their shared software UART, and exercises interactive gcode.
+#
+# This is the SAMD51/SAME54 per-printer test, the counterpart to
+# samd51_smoke (boot only). What it adds over the smoke test:
+#
+#   - TMC2209 MULTI-DROP UART. All four drivers share uart_pin PA1 /
+#     tx_pin PA0 / select_pins PD0 with uart_address 0..3, reusing the
+#     renode_hooks sw_uart responder. _drive_rx drives the firmware-side
+#     RX bit through the SAMD51 PORT model (gpio_a.OnGPIO) - the
+#     samd51p20.repl now declares gpio_a..gpio_d (GPIOPort.SAMD21_GPIO,
+#     which serves the layout-identical SAMX5 PortGroup registers). A
+#     single shared sw_uart state + register file serves all four
+#     addresses because klippy initialises drivers sequentially - the
+#     same multidrop path skr_pico / skr_mini_e3_v3 exercise. DUMP_TMC
+#     below reads the live register file for stepper_x and the extruder;
+#     the IOIN read returning version=0x21 proves the multidrop UART read
+#     path round-tripped.
+#
+#   - adc_scaled thermistors through the new test/emulator/
+#     samd51_adc_stub.py. The SAMX5 ADC register layout differs from
+#     SAMD21's (INPUTCTRL@0x04, SWTRIG@0x14, INTFLAG@0x2E, SYNCBUSY@0x30,
+#     RESULT@0x40), so it needs its own stub; the stub also returns
+#     SYNCBUSY=0 so adc_init's busy-waits fall through. All four channels
+#     land on ADC1 (vref=7, vssa=6, extruder PC1=11, bed PC0=10). vref
+#     and vssa carry distinct values so adc_scaled's (vref - vssa)
+#     divisor is non-zero (a zero divisor raises ZeroDivisionError in
+#     extras/adc_scaled.py); both sensors read ~36 C.
+#
+# The real Duet3 Mini host link is USB-CDC; the firmware here is the
+# generic serial-mode samd51p20 build (host link on PA10/PA11) and the
+# test exercises the pin map, which is independent of the host link. The
+# gated path is motion-free.
+DICTIONARY samd51p20.dict
+CONFIG duet3_mini.cfg
+EMULATOR duet3_mini.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode.
+M114
+M105
+# Read back the live TMC register file over the multi-drop UART for the
+# first and last drivers (uart_address 0 and 3).
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# klippy connected, loaded the dictionary, and built the full config
+# against real firmware.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+# DUMP_TMC dumped the first and last drivers; the IOIN read returning the
+# TMC version byte (0x21) proves the multi-drop UART read path returned
+# framed, CRC-valid responses for both addresses.
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+# Positive proof the SAMX5 ADC delivered samples through adc_scaled: both
+# thermistors read ~36 C, so a periodic Stats line carries "temp=3x". A
+# broken ADC leaves them at temp=0.0 with no shutdown.
+EXPECT_LOG_CONTAINS "temp=3"
+# adc_scaled requires (vref - vssa) != 0; without distinct vref/vssa
+# values klippy raises ZeroDivisionError in adc_scaled.handle_callback.
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+# A broken UART round-trip surfaces as a TMC init failure or a read error.
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+# A renode-side crash (wrong sysbus peripheral, hook callback error)
+# kills serial; klippy then gets EOF and identify / TMC init time out.
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# With the deterministic clock the config / TMC / ADC path pushes no
+# deadline into the firmware's past, so nothing shuts down.
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

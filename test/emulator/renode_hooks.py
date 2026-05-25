@@ -93,6 +93,29 @@ def _pin(port, idx):
     return _gpio_port(port).Connections[int(idx)]
 
 
+# CPU peripheral name varies by platform .repl: most name it `cpu`
+# (STM32 / SAM / LPC / HC32 / RP2040), but the SAMD repls name it `cpu0`
+# (samd21g18.repl / samd51p20.repl, mirroring the upstream atsamd
+# platforms). The TMC sw_uart and SPI responders attach CPU PC hooks via
+# this object, so resolve either name; without this the hook install on
+# SAMD silently raises at the lookup and no TMC datagram is ever served.
+_CPU_CACHE = [None]
+
+
+def _cpu():
+    if _CPU_CACHE[0] is not None:
+        return _CPU_CACHE[0]
+    for name in ('sysbus.cpu', 'sysbus.cpu0'):
+        try:
+            c = _M.Machine[name]
+        except Exception:
+            continue
+        _CPU_CACHE[0] = c
+        return c
+    raise RuntimeError("no cpu peripheral found (tried sysbus.cpu, "
+                       "sysbus.cpu0)")
+
+
 def gpio_set(port, pin, value):
     # Drive an input pin into the firmware's view. Renode's GPIOPort
     # is an IGPIOReceiver; OnGPIO(pin, bool) is the canonical input
@@ -768,7 +791,7 @@ def _ensure_cpu_hooks_installed():
     if missing:
         _log("missing symbols: %s", ', '.join(missing))
         return
-    cpu = _M.Machine['sysbus.cpu']
+    cpu = _cpu()
     install = (
         ('command_tmcuart_send', _on_tmcuart_send_hook),
         ('tmcuart_send_finish_event', _on_send_finish_hook),
@@ -892,6 +915,19 @@ _spi_tmc_regs = {}                  # reg (0..0x7f) -> 32-bit value
 _spi_tmc_prev_addr = {}            # slot index -> reg addressed last txn
 _spi_tmc_dbg = [0]                  # limit per-call trace volume
 
+# TMC2660 sub-mode. Unlike tmc2130/5160/2240 (5-byte/40-bit datagrams),
+# the TMC2660 uses 3-byte/20-bit datagrams with NO read/write bit and NO
+# chain-position addressing - every transaction returns the chip's
+# READRSP register selected by the RDSEL field of the most recent DRVCONF
+# write. The renode spidev_transfer hook sees the whole 3-byte datagram
+# in one call, so unlike the simavr bridge it needs no CS-pin tracking: a
+# single shared rdsel suffices because klippy initialises drivers
+# sequentially. Enabled by the fixture's `spi_tmc_chip <port> <pin>
+# tmc2660` (auto-emitted for every [tmc2660 ...] section); the 5-byte
+# path keeps serving any 40-bit chips on the same bus.
+_spi_tmc2660_enabled = [False]
+_spi_tmc2660_rdsel = [0]
+
 
 def _spi_tmc_reset():
     _spi_tmc_regs.clear()
@@ -914,6 +950,20 @@ def spi_tmc():
     _ensure_spi_tmc_hook_installed()
 
 
+def spi_tmc_chip(cs_port, cs_pin, kind):
+    # Fixture: `spi_tmc_chip <cs_port> <cs_pin> tmc2660`. Switches the
+    # spidev_transfer responder into the TMC2660 3-byte sub-mode for the
+    # shared bus. cs_port/cs_pin are accepted for protocol parity with
+    # the simavr bridge but unused here - the renode hook sees the full
+    # datagram in one call, so a single shared register file/RDSEL works
+    # (klippy initialises drivers sequentially). Re-issuing is harmless.
+    if str(kind) == 'tmc2660':
+        _spi_tmc2660_enabled[0] = True
+        _spi_tmc2660_rdsel[0] = 0
+        _log("spi_tmc_chip: tmc2660 mode (cs=%s%s)", cs_port, cs_pin)
+        _ensure_spi_tmc_hook_installed()
+
+
 def apply_spi_tmc_symbol(addr):
     try:
         _spi_tmc_symbol[0] = int(addr)
@@ -927,7 +977,7 @@ def apply_spi_tmc_symbol(addr):
 def _ensure_spi_tmc_hook_installed():
     if _spi_tmc_hook_installed[0]:
         return
-    if not _spi_tmc_enabled[0]:
+    if not (_spi_tmc_enabled[0] or _spi_tmc2660_enabled[0]):
         return
     if not _HAVE_CPU_HOOK:
         _log("spi_tmc: CpuAddressHook unavailable")
@@ -936,7 +986,7 @@ def _ensure_spi_tmc_hook_installed():
     if addr is None:
         _log("spi_tmc: spidev_transfer symbol not resolved yet")
         return
-    cpu = _M.Machine['sysbus.cpu']
+    cpu = _cpu()
     try:
         cpu.AddHook(int(addr), CpuAddressHook(_on_spidev_transfer_hook))
         _spi_tmc_hook_installed[0] = True
@@ -952,12 +1002,70 @@ def _on_spidev_transfer_hook(cpu, pc):
         _log("spi_tmc hook EXCEPTION: %s", e)
 
 
+def _spi_pc_skip(cpu):
+    # Skip the real (garbage-returning) hardware transfer: return to the
+    # caller immediately by pointing PC at the link register. Clear the
+    # thumb bit (LR bit0=1 on Cortex-M) - a PC with bit0 set faults.
+    # SetRegisterUnsafe / the PC setter want a RegisterValue, not a raw
+    # int, so build one (fall back to LR's own RegisterValue object).
+    lr_rv = cpu.GetRegisterUnsafe(14)
+    lr = int(lr_rv.RawValue) & 0xfffffffe
+    try:
+        cpu.SetRegisterUnsafe(15, RegisterValue.Create(lr, 32))
+    except Exception as e1:
+        try:
+            cpu.SetRegisterUnsafe(15, lr_rv)
+            _log("spi_tmc PC-skip via raw LR RegisterValue (Create err: %s)",
+                 e1)
+        except Exception as e2:
+            _log("spi_tmc PC-skip FAILED: %s / %s", e1, e2)
+
+
+def _do_tmc2660_transfer(cpu, data_ptr):
+    # TMC2660: a 3-byte (20-bit) datagram. The 24-bit SPI stream carries
+    # the 20-bit datagram in its low 20 bits (top 4 bits zero):
+    #   byte0 = [0,0,0,0, d19,d18,d17,d16]  -> reg-id = (byte0>>1)&0x7,
+    #                                          val bit16 = byte0&1
+    #   byte1 = d15..d8,  byte2 = d7..d0
+    # The MISO response is the chip's READRSP@RDSEL register, packed left
+    # by 4 to occupy bits 23..4. klippy sets RDSEL via DRVCONF (reg-id 7,
+    # field at val[5..4]) "first", then its periodic check reads the "se"
+    # (current-scaler) field at RDSEL2 - a zero there decodes as
+    # "0(Reset?)" and shuts down once motion starts, so serve se=5 (the
+    # field lands at response_value bit 10 after klippy's 20-bit decode).
+    sb = _M.Machine.SystemBus
+    mosi = [int(sb.ReadByte(data_ptr + i)) & 0xff for i in range(3)]
+    # Response reflects the RDSEL set by a PRIOR datagram (real silicon
+    # latches DRVCONF.RDSEL and serves it on the next transaction).
+    rdsel = _spi_tmc2660_rdsel[0]
+    response_value = (5 << 10) if rdsel == 2 else 0
+    packed = (response_value << 4) & 0xFFFFF
+    resp = [(packed >> 16) & 0xff, (packed >> 8) & 0xff, packed & 0xff]
+    for i in range(3):
+        sb.WriteByte(data_ptr + i, resp[i])
+    # Now latch this datagram's RDSEL if it is a DRVCONF write.
+    b0 = mosi[0]
+    reg_id = (b0 >> 1) & 0x7
+    val = ((b0 & 1) << 16) | (mosi[1] << 8) | mosi[2]
+    if reg_id == 7:
+        _spi_tmc2660_rdsel[0] = (val >> 4) & 0x3
+    if _spi_tmc_dbg[0] < 6:
+        _spi_tmc_dbg[0] += 1
+        _log("tmc2660 xfer reg=%d val=%05x rdsel=%d -> resp=%02x%02x%02x",
+             reg_id, val, _spi_tmc2660_rdsel[0], resp[0], resp[1], resp[2])
+    _spi_pc_skip(cpu)
+
+
 def _do_spidev_transfer(cpu, pc):
     # spidev_transfer(struct spidev_s *spi, uint8_t receive_data,
     #                 uint8_t data_len, uint8_t *data)
     #   R0 = spi, R1 = receive_data, R2 = data_len, R3 = data ptr
     data_len = int(cpu.GetRegisterUnsafe(2).RawValue) & 0xff
     data_ptr = int(cpu.GetRegisterUnsafe(3).RawValue)
+    if _spi_tmc2660_enabled[0] and data_len == 3:
+        # TMC2660 3-byte datagram path (separate from the 5-byte chain).
+        _do_tmc2660_transfer(cpu, data_ptr)
+        return
     if data_len == 0 or (data_len % 5) != 0:
         # Not a 5-byte-datagram TMC transaction; let the real transfer
         # run (don't skip). No TMC config in scope hits this, but stay
@@ -990,26 +1098,11 @@ def _do_spidev_transfer(cpu, pc):
         _spi_tmc_prev_addr[s] = reg
     for i in range(data_len):
         sb.WriteByte(data_ptr + i, resp[i])
-    # Skip the real (garbage-returning) hardware transfer: return to the
-    # caller immediately by pointing PC at the link register. Clear the
-    # thumb bit (LR bit0=1 on Cortex-M) - a PC with bit0 set faults.
-    # SetRegisterUnsafe / the PC setter want a RegisterValue, not a raw
-    # int, so build one (fall back to LR's own RegisterValue object).
-    lr_rv = cpu.GetRegisterUnsafe(14)
-    lr = int(lr_rv.RawValue) & 0xfffffffe
     if _spi_tmc_dbg[0] < 6:
         _spi_tmc_dbg[0] += 1
-        _log("spi_tmc xfer len=%d ptr=%x reg0=%02x lr=%x",
-             data_len, data_ptr, mosi[0], lr)
-    try:
-        cpu.SetRegisterUnsafe(15, RegisterValue.Create(lr, 32))
-    except Exception as e1:
-        try:
-            cpu.SetRegisterUnsafe(15, lr_rv)
-            _log("spi_tmc PC-skip via raw LR RegisterValue (Create err: %s)",
-                 e1)
-        except Exception as e2:
-            _log("spi_tmc PC-skip FAILED: %s / %s", e1, e2)
+        _log("spi_tmc xfer len=%d ptr=%x reg0=%02x",
+             data_len, data_ptr, mosi[0])
+    _spi_pc_skip(cpu)
 
 
 # --------------------------------------------------------------------

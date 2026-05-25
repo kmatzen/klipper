@@ -31,6 +31,14 @@ cpu0: CPU.CortexM @ sysbus
 
 nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     -> cpu0@0
+    // klipper SAMX5 uses generic/armcm_timer.c, whose timer dispatch is
+    // driven by SysTick. Renode must count SysTick at CONFIG_CLOCK_FREQ
+    // (120 MHz) or the handler fires at the wrong rate. Free-run boot
+    // tolerated the default, but deterministic tick-mode lockstep does
+    // not: without this the firmware's timer deadlines drift past and it
+    // shuts down right after identify (the same class of issue the
+    // STM32H7 repl fixes with systickFrequency: 520000000).
+    systickFrequency: 120000000
 
 flash0: Memory.MappedMemory @ sysbus 0x0
     size: 0x100000
@@ -43,3 +51,21 @@ dwt: Miscellaneous.DWT @ sysbus 0xE0001000
 
 sercom0: UART.SAMD5_UART @ sysbus 0x40003000
     ->nvic@46
+
+// PORT (gpio). SAMD51 PORT @ 0x41008000, four 0x80-spaced port groups
+// (PA/PB/PC/PD). klipper writes per-pin DIRSET/OUTSET/PMUX/PINCFG during
+// gpio_out_setup / gpio_peripheral; the SAMD21_GPIO model serves the
+// SAMX5 PortGroup register set unchanged (DIR/OUT/IN/CTRL/WRCONFIG/PMUX/
+// PINCFG are layout-identical between SAMD21 and SAMX5). The boot smoke
+// test needs none of these (PORT writes used to fall on unmapped sysbus
+// as harmless warnings), but the per-printer test's TMC2209 software
+// UART does: renode_hooks._drive_rx drives the firmware-side RX bit via
+// gpio_a.OnGPIO(pin, ...), which klipper's gpio_in_read reads back from
+// PortGroup.IN (src/atsamd/gpio.c: pg->IN.reg & g.bit).
+gpio_a: GPIOPort.SAMD21_GPIO @ sysbus 0x41008000
+
+gpio_b: GPIOPort.SAMD21_GPIO @ sysbus 0x41008080
+
+gpio_c: GPIOPort.SAMD21_GPIO @ sysbus 0x41008100
+
+gpio_d: GPIOPort.SAMD21_GPIO @ sysbus 0x41008180

@@ -158,6 +158,26 @@ _STM32G0_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # common CCR at base+0x308.
 _STM32H7_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     'stm32h7_adc_stub.py')
+# HC32F460 ADC stub. The hc32f460.repl maps no ADC peripheral, so this
+# Python stub is the only thing at M4_ADC1's base 0x40040000. It completes
+# klipper's HC32 STR/ISR/DR handshake (src/hc32f460/adc.c) with fixture-
+# poked values; the HDSC ADC register layout matches no upstream model.
+_HC32F460_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'hc32f460_adc_stub.py')
+# SAMD51 / SAME54 ADC stub. The samd51p20.repl maps no ADC, so this stub
+# claims both ADC0 (0x43001C00) and ADC1 (0x43002000). It completes
+# klipper's SAMX5 INPUTCTRL/SWTRIG/INTFLAG/RESULT handshake
+# (src/atsamd/adc.c) and returns SYNCBUSY=0 so adc_init's busy-waits
+# fall through. The SAMX5 ADC register layout differs from SAMD21's, so
+# it needs its own stub.
+_SAMD51_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'samd51_adc_stub.py')
+# SAMD21 ADC stub. The samd21g18.repl maps no ADC, so this stub claims
+# the single ADC @ 0x42004000. The SAMD21 ADC register layout differs
+# from the SAMX5 one (SWTRIG@0x0C, INPUTCTRL@0x10, INTFLAG@0x18,
+# RESULT@0x1A, and no SYNCBUSY), so it needs its own stub.
+_SAMD21_ADC_STUB_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'samd21_adc_stub.py')
 
 # SAME70 EFC stub. klipper same70_sysinit.c reads EFC->EEFC_FRR to
 # check GPNVM TCM bits 7+8; Renode's SVD-tagged EFC returns 0, so
@@ -285,6 +305,12 @@ _AFEC_BASES_FOR_CHIP = {
     # OMITS the upstream `adc: Analog.SAM4S_ADC` so this Python stub
     # can claim the address.
     'sam4s8c': (0x40038000,),
+    # SAM3X ADC at 0x400C0000. src/atsam/adc.c is shared SAM3X/SAM4S
+    # and the register layout is identical (CR/CHER/CHDR/CHSR/LCDR/ISR),
+    # so the SAM4S ADC stub serves SAM3X verbatim at the SAM3X base. The
+    # sam3x8e.repl maps no ADC there, so the stub owns the address.
+    'sam3x8e': (0x400C0000,),
+    'sam3x8c': (0x400C0000,),
     # STM32F1 ADC1 at 0x40012400. Local stm32f103.repl OMITS the
     # upstream `adc1: Analog.STM32_ADC` so this Python stub can claim
     # the address (klipper's F1 configs read every thermistor on ADC1).
@@ -302,6 +328,17 @@ _AFEC_BASES_FOR_CHIP = {
     # RP2040 ADC at 0x4004C000. The local rp2040.repl models no ADC, so
     # this Python stub is the only thing mapped there.
     'rp2040': (0x4004C000,),
+    # HC32F460 M4_ADC1 at 0x40040000. The hc32f460.repl maps no ADC, so
+    # this stub claims the address (0x200 window covers DR0..DR16 at
+    # 0x50..0x72 plus the magic-offset poke region at 0x100+).
+    'hc32f460': (0x40040000,),
+    # SAMD51 / SAME54 ADC0 + ADC1. The samd51p20.repl maps no ADC; the
+    # stub claims both (0x200 windows don't overlap: ADC0 ends at
+    # 0x43001DFF, ADC1 starts at 0x43002000). Each base gets its own
+    # stub instance; klipper routes chan<16 -> ADC0, chan>=16 -> ADC1.
+    'samd51p20': (0x43001C00, 0x43002000),
+    # SAMD21 single ADC at 0x42004000. The samd21g18.repl maps no ADC.
+    'samd21g18': (0x42004000,),
     # NB: STM32H7 ADC1 (0x40022000) is NOT here - it is registered via
     # _EXTRA_PERIPHERAL_STUBS_FOR_CHIP['stm32h723'] with a 0x400 window
     # (the AFEC block hardcodes 0x200, too small to reach the ADC12
@@ -314,12 +351,19 @@ _AFEC_BASES_FOR_CHIP = {
 # (AFE_CR/CHSR/LCDR/ISR/CSELR/CDR), so it needs its own stub.
 _ADC_STUB_FOR_CHIP = {
     'sam4s8c': _SAM4S_ADC_STUB_PY,
+    # SAM3X shares src/atsam/adc.c with SAM4S - same register map, so the
+    # same stub (at the SAM3X base 0x400C0000 above).
+    'sam3x8e': _SAM4S_ADC_STUB_PY,
+    'sam3x8c': _SAM4S_ADC_STUB_PY,
     'stm32f103': _STM32_ADC_STUB_PY,
     # F4 shares the F1 SR/CR2/SQR3/DR stub (one register slice, one
     # SWSTART-bit difference the stub absorbs).
     'stm32f446': _STM32_ADC_STUB_PY,
     'stm32g0b1': _STM32G0_ADC_STUB_PY,
     'rp2040': _RP2040_ADC_STUB_PY,
+    'hc32f460': _HC32F460_ADC_STUB_PY,
+    'samd51p20': _SAMD51_ADC_STUB_PY,
+    'samd21g18': _SAMD21_ADC_STUB_PY,
 }
 
 # Per-chip extra Python.PythonPeripheral stubs to inject after the

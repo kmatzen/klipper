@@ -1,0 +1,67 @@
+# End-to-end EMULATOR test for the Duet2 WiFi/Ethernet (Atmel SAM4E8E)
+# in DETERMINISTIC TICK MODE. Boots klipper firmware under Renode
+# against the duet2 pin map, completes klippy identify + clocksync,
+# brings up the full MCU config (4 TMC2660s on USART-SPI, 2
+# software-PWM heaters, a fan, endstops, 2 thermistors), reads the
+# thermistors through the SAM4E AFEC, round-trips the TMC2660 register
+# files over the SPI bus, and exercises interactive gcode (M114/M105).
+#
+# This is the SAM4E per-printer test, the SAM4E sibling of duet2_maestro
+# (SAM4S) and the counterpart to sam4e_smoke (boot only). It exercises:
+#
+#   - The TMC2660 SPI sub-mode of the renode_hooks spidev_transfer
+#     responder. TMC2660 uses 3-byte (20-bit) datagrams instead of the
+#     5-byte/40-bit datagrams of tmc2130/5160/2240, so spi_tmc_chip
+#     (auto-emitted per [tmc2660 ...] section) switches the responder
+#     into a 3-byte path. DUMP_TMC below reads the live response register
+#     for stepper_x and the extruder; a broken SPI round-trip would trip
+#     "failed to init" or a read error.
+#   - The SAM4E AFEC ADC, reusing test/emulator/afec_stub.py (the same
+#     stub SAME70 uses - src/atsam/sam4e_afec.c is shared). The extruder
+#     reads through AFEC0 channel index 7 (PC15) and the bed through
+#     index 6 (PC13), both EPCOS 100K. With a broken AFEC both heaters
+#     sit at temp=0.0 with no shutdown, so the "temp=3" assertion (both
+#     read ~36 C) is the positive proof the AFEC delivered samples.
+#
+# The real Duet2 host link is USB; the firmware here is the generic
+# serial-mode sam4e8e build (host link on PA9/PA10) and the test
+# exercises the pin map, which is independent of the host link. The
+# gated path is motion-free.
+DICTIONARY sam4e8e.dict
+CONFIG duet2_wifi.cfg
+EMULATOR duet2_wifi.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode.
+M114
+M105
+# Read back the live TMC2660 response register over the SPI bus for the
+# first and last drivers.
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# klippy connected, loaded the dictionary, and built the full config
+# against real firmware.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+# DUMP_TMC dumped the first and last TMC2660s - it only completes if the
+# firmware round-tripped the 3-byte datagram reads through spidev_transfer.
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+# Positive proof the SAM4E AFEC delivered samples: both thermistors read
+# ~36 C, so a periodic Stats line carries "temp=3x". A broken AFEC leaves
+# them at temp=0.0 with no shutdown.
+EXPECT_LOG_CONTAINS "temp=3"
+# A broken SPI round-trip surfaces as a TMC init failure.
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+# A renode-side crash (wrong sysbus peripheral, hook callback error)
+# kills serial; klippy then gets EOF and identify / TMC init time out.
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# With the deterministic clock the config / TMC / AFEC path pushes no
+# deadline into the firmware's past, so nothing shuts down.
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
