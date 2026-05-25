@@ -111,32 +111,6 @@ struct serialqueue {
 #define MIN_BACKGROUND_DELTA 0.005
 #define IDLE_QUERY_TIME 1.0
 
-// Test-only override of the command pre-transmit lead. The serialqueue
-// transmits a queued command only MIN_REQTIME_DELTA (100ms) before its
-// req_clock - tuned for a real ~1ms serial link. Under the deterministic
-// tick-mode emulator the host<->mcu byte shuttle delivers commands with a
-// much coarser latency in *simulated* time (~one reactor advance quantum)
-// that jitters with host CPU load, so the 100ms lead is too small and the
-// mcu step queue underruns mid-homing -> the firmware rejects the next
-// step with "Timer too close". KLIPPY_MIN_REQTIME_DELTA (seconds) widens
-// just that lead so the coarse delivery latency fits; it is never set on
-// real hardware, where behaviour is unchanged. Read once and cached.
-static double
-get_min_reqtime_delta(void)
-{
-    static double cached = -1.;
-    if (cached < 0.) {
-        cached = MIN_REQTIME_DELTA;
-        const char *s = getenv("KLIPPY_MIN_REQTIME_DELTA");
-        if (s && *s) {
-            double v = atof(s);
-            if (v > 0.)
-                cached = v;
-        }
-    }
-    return cached;
-}
-
 #define DEBUG_QUEUE_SENT 100
 #define DEBUG_QUEUE_RECEIVE 100
 
@@ -494,10 +468,13 @@ retransmit_event(struct serialqueue *sq, double eventtime)
     return waketime;
 }
 
-// Construct a block of data to be sent to the serial port
+// Construct a block of data to be sent to the serial port. sendtime is
+// the actual (current) time the block is written to the wire; it stamps
+// the stored message's sent_time/receive_time and so must never be a
+// look-ahead horizon, or the clock-sync rtt estimate is corrupted.
 static int
 build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
-                       , double eventtime)
+                       , double sendtime)
 {
     int len = MESSAGE_HEADER_SIZE;
     while (sq->ready_bytes) {
@@ -542,12 +519,12 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
     buf[len - MESSAGE_TRAILER_SYNC] = MESSAGE_SYNC;
 
     // Store message block
-    double idletime = eventtime > sq->idle_time ? eventtime : sq->idle_time;
+    double idletime = sendtime > sq->idle_time ? sendtime : sq->idle_time;
     idletime += calculate_bittime(sq, pending + len);
     struct queue_message *out = message_alloc();
     memcpy(out->msg, buf, len);
     out->len = len;
-    out->sent_time = eventtime;
+    out->sent_time = sendtime;
     out->receive_time = idletime;
     if (list_empty(&sq->sent_queue))
         pollreactor_update_timer(sq->pr, SQPT_RETRANSMIT, idletime + sq->rto);
@@ -653,7 +630,6 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
     }
 
     // Check if it is still needed to send messages from the ready_queues
-    double min_reqtime_delta = get_min_reqtime_delta();
     uint64_t min_ready_clock = MAX_CLOCK;
     struct command_queue *cq;
     list_for_each_entry(cq, &sq->ready_queues, ready.node) {
@@ -662,13 +638,13 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
             &cq->ready.msg_queue, struct queue_message, node);
         uint64_t req_clock = qm->req_clock;
         double bgtime = pending ? idletime : sq->idle_time;
-        double bgoffset = min_reqtime_delta + MIN_BACKGROUND_DELTA;
+        double bgoffset = MIN_REQTIME_DELTA + MIN_BACKGROUND_DELTA;
         if (req_clock == BACKGROUND_PRIORITY_CLOCK)
             req_clock = clock_from_time(&sq->ce, bgtime + bgoffset);
         if (req_clock < min_ready_clock)
             min_ready_clock = req_clock;
     }
-    uint64_t reqclock_delta = min_reqtime_delta * sq->ce.est_freq;
+    uint64_t reqclock_delta = MIN_REQTIME_DELTA * sq->ce.est_freq;
     if (min_ready_clock <= ack_clock + reqclock_delta)
         return PR_NOW;
 
@@ -686,19 +662,25 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
     return idletime + (wantclock - ack_clock) / sq->ce.est_freq;
 }
 
-// Callback timer to send data to the serial port
+// Transmit all commands ready to send. `horizon` is the time used to
+// decide which queued commands are ready (their req_clock minus the
+// pre-transmit lead); `sendtime` is the actual current time stamped on
+// the sent messages. They are equal for the normal background-thread
+// path (command_event); the tick-mode flush passes a future horizon
+// (the next advance target) with the real current sendtime so commands
+// get their pre-transmit lead without corrupting clock-sync timestamps.
 static double
-command_event(struct serialqueue *sq, double eventtime)
+do_command_event(struct serialqueue *sq, double horizon, double sendtime)
 {
     pthread_mutex_lock(&sq->lock);
     uint8_t buf[MESSAGE_MAX * MAX_PENDING_BLOCKS];
     int buflen = 0;
     double waketime;
     for (;;) {
-        waketime = check_send_command(sq, buflen, eventtime);
+        waketime = check_send_command(sq, buflen, horizon);
         if (waketime != PR_NOW)
             break;
-        buflen += build_and_send_command(sq, &buf[buflen], buflen, eventtime);
+        buflen += build_and_send_command(sq, &buf[buflen], buflen, sendtime);
         if (buflen + MESSAGE_MAX > sizeof(buf))
             break;
     }
@@ -706,12 +688,40 @@ command_event(struct serialqueue *sq, double eventtime)
         // Write message blocks
         do_write(sq, buf, buflen);
         sq->bytes_write += buflen;
-        double idletime = eventtime > sq->idle_time ? eventtime : sq->idle_time;
+        double idletime = sendtime > sq->idle_time ? sendtime : sq->idle_time;
         sq->idle_time = idletime + calculate_bittime(sq, buflen);
         waketime = PR_NOW;
     }
     pthread_mutex_unlock(&sq->lock);
     return waketime;
+}
+
+// Callback timer to send data to the serial port
+static double
+command_event(struct serialqueue *sq, double eventtime)
+{
+    return do_command_event(sq, eventtime, eventtime);
+}
+
+// Synchronously transmit any commands ready to send by simulated time
+// `horizon`, stamping them sent at `sendtime`. The deterministic
+// tick-mode emulator (see klippy/reactor.py tick lockstep) calls this
+// just before asking the emulator to run the mcu forward: sendtime is
+// the current simulated time and horizon is the next advance target. A
+// command whose req_clock is only the normal MIN_REQTIME_DELTA ahead is
+// thus written to the wire before the mcu reaches that clock - the same
+// pre-transmit lead a real serial link provides. The background thread
+// alone cannot do this: it observes simulated time advance only in whole
+// quanta, so it would not transmit until after the mcu had already run
+// past the command's clock, starving the step queue ("Timer too close").
+// Passing the real sendtime (not horizon) keeps the stored sent_time
+// honest so clock sync is unaffected. do_command_event() takes sq->lock,
+// so this is safe to call concurrently with the background thread; it is
+// never invoked on real hardware (no reactor tick mode there).
+void __visible
+serialqueue_flush_ready(struct serialqueue *sq, double sendtime, double horizon)
+{
+    do_command_event(sq, horizon, sendtime);
 }
 
 // Main background thread for reading/writing to serial port

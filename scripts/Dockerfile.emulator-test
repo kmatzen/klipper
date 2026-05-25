@@ -271,15 +271,20 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # exchange rides a cross-thread byte shuttle whose latency in
 # *simulated* time is coarse and jitters with host CPU load, far above
 # the ~1ms real serial link klippy's homing timing is tuned for.
-# test_klippy.py widens two klippy margins for tick-mode runs (real
-# hardware never sets either var, so behavior there is unchanged):
-#   - KLIPPY_TRSYNC_TIMEOUT (klippy/mcu.py): the 25ms multi-mcu trsync
-#     homing watchdog, so cross-mcu homing doesn't false-time-out.
-#   - KLIPPY_MIN_REQTIME_DELTA (klippy/chelper/serialqueue.c): the 100ms
-#     command pre-transmit lead, so the renode-hosted stepper queue
-#     doesn't underrun ("Timer too close").
-# A mis-routed endstop still fails the test (homing just stops later),
-# so no homing bug is masked. Both tests now gate.
+# The serialqueue command pre-transmit lead (the homing "Timer too close"
+# underrun) is fixed at the source: the reactor's tick lockstep flushes
+# ready serial commands at each advance target before the mcu runs forward
+# (serialqueue.c serialqueue_flush_ready), so commands arrive with their
+# normal real-hardware lead and no serialqueue margin is widened. The two
+# margins that can't be flushed away - the multi-mcu trsync homing
+# watchdog (a closed keep-alive loop on the serialqueue background thread)
+# and the first software-PWM cycle lead (queued against the still-
+# converging connect-time clock estimate) - are relocated out of
+# production source: klippy/mcu.py keeps its real-hardware defaults as
+# plain constants (TRSYNC_TIMEOUT, PWM_START_LEAD) and a test shim
+# (test/emulator/klippy_test_shim) overwrites them from KLIPPY_* env vars
+# that real hardware never sets. A mis-routed endstop still fails the test
+# (homing just stops later), so no homing bug is masked. Both tests gate.
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \

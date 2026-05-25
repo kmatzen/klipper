@@ -30,25 +30,21 @@
 # flat freq=120000000 with no "running at NMhz" warning. (Same
 # single-MCU renode lockstep mechanism stm32f103_tick / same70_usb_smoke
 # use.) This config's software-PWM heaters queue their first cycle only
-# ~0.2s ahead, shorter than the tick-mode per-RunFor command-delivery
-# latency, so klippy's mcu.py widens the initial PWM lead when
-# KLIPPY_TICK_SOCKET is set (PWM_START_LEAD_TICK) - without it the very
-# first heater queue_digital_out lands in the firmware's past and trips
-# "Timer too close" during config.
+# ~0.2s ahead. At connect the tick-mode clock estimate is still
+# converging, so that 0.2s lead can map the first heater queue_digital_out
+# into the firmware's past and trip "Timer too close" during config. The
+# fix is a wider PWM start lead (mcu.PWM_START_LEAD), applied for tick
+# runs by the test shim (test/emulator/klippy_test_shim) so klippy/mcu.py
+# keeps its 0.200s real-hardware default and never reads an env var.
 #
-# Driving steppers (G28 homing) now WORKS once the drift is gone - the
-# step path is no longer pushed into the firmware's past by clock
-# drift, and homing completes against real firmware on a quiet host.
-# It is intentionally NOT in this gated test: renode-tick *motion*
-# commands are delivered by klippy's wall-clock-paced serialqueue
-# background thread, which under shared-host CPU contention can deliver
-# a tightly-scheduled stepper-enable / step command late and trip
-# "Timer too close" - the same environment-bound flake that keeps the
-# other renode-tick-homing tests (multi_mcu_stm32_stm32,
-# multi_mcu_avr_stm32_xmcu) out of the default gating CMD. That is a
-# serialqueue/sim-time issue, not the SAM4S clock drift, which this
-# test resolves. The no-motion boot/config/TMC/adc path has no such
-# tight-lead commands and is deterministically green.
+# Separately, the reactor's tick lockstep now flushes ready serial
+# commands at each advance target before the mcu runs forward
+# (serialqueue_flush_ready), which fixes the renode-tick *motion*
+# underrun: a tightly-scheduled stepper command is no longer delivered a
+# whole advance quantum late, so the multi-mcu renode-tick homing tests
+# (multi_mcu_stm32_stm32, multi_mcu_avr_stm32_xmcu) now gate. This
+# single-MCU test still intentionally exercises only the no-motion
+# boot/config/TMC/adc path, which is deterministically green.
 DICTIONARY sam4s8c.dict
 CONFIG duet2_maestro.cfg
 EMULATOR duet2_maestro.fixture.json

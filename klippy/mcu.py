@@ -11,18 +11,10 @@ class error(Exception):
 
 # Minimum time host needs to get scheduled events queued into mcu
 MIN_SCHEDULE_TIME = 0.100
-# How far past the config-time clock estimate the first PWM cycle is
-# queued so it can't land in the MCU's past before the command is
-# actually delivered. The 0.200s default is ample on real hardware
-# (sub-millisecond link latency). The deterministic tick-mode emulator
-# (KLIPPY_TICK_SOCKET set) instead shuttles UART bytes one
-# `emulation RunFor` round-trip at a time, so a command can take ~0.2s
-# of simulated time to reach the firmware -- longer than the default
-# lead, which trips the firmware's "Timer too close" guard on the very
-# first heater/fan software-PWM cycle. Widen the lead in tick mode only;
-# real hardware and non-tick runs use the unchanged 0.200s.
+# How far past the config-time clock estimate the first software-PWM
+# cycle is queued so it can't land in the MCU's past before the command
+# is delivered. 0.200s is ample on real hardware.
 PWM_START_LEAD = 0.200
-PWM_START_LEAD_TICK = 1.000
 # The maximum number of clock cycles an MCU is expected
 # to schedule into the future, due to the protocol and firmware.
 MAX_SCHEDULE_TICKS = (1<<31) - 1
@@ -290,24 +282,6 @@ class MCU_trsync:
 
 TRSYNC_TIMEOUT = 0.025
 TRSYNC_SINGLE_MCU_TIMEOUT = 0.250
-# Test-only override of the multi-mcu homing watchdog window. On real
-# hardware the 25ms multi-mcu trsync timeout is tuned for ~1ms serial
-# round-trips and a wall-clock reactor. Under the deterministic
-# tick-mode emulator the host<->mcu exchange happens over a
-# cross-thread/cross-process byte shuttle whose latency in *simulated*
-# time is far coarser and jitters with host CPU load, so the 25ms
-# window is too tight and intermittently trips "Communication timeout
-# during homing". Setting KLIPPY_TRSYNC_TIMEOUT (seconds) widens just
-# that multi-mcu window so the emulator's coarse timing fits; the env
-# var is never set on real hardware, where behavior is byte-for-byte
-# unchanged. It does not mask homing bugs: a mis-routed endstop still
-# fails the test (homing just times out later, or the deadline hits).
-_trsync_timeout_override = os.environ.get('KLIPPY_TRSYNC_TIMEOUT')
-if _trsync_timeout_override:
-    try:
-        TRSYNC_TIMEOUT = float(_trsync_timeout_override)
-    except ValueError:
-        pass
 
 class TriggerDispatch:
     def __init__(self, mcu):
@@ -514,15 +488,8 @@ class MCU_pwm:
         cmd_queue = self._mcu.alloc_command_queue()
         curtime = self._mcu.get_printer().get_reactor().monotonic()
         printtime = self._mcu.estimated_print_time(curtime)
-        start_lead = PWM_START_LEAD
-        if os.environ.get('KLIPPY_TICK_SOCKET'):
-            # Deterministic tick-mode emulator: command delivery costs
-            # ~0.2s of simulated time, so the default lead would land
-            # the first PWM cycle in the firmware's past. See
-            # PWM_START_LEAD_TICK.
-            start_lead = PWM_START_LEAD_TICK
         self._last_clock = self._mcu.print_time_to_clock(printtime
-                                                         + start_lead)
+                                                         + PWM_START_LEAD)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         mdur_ticks = self._mcu.seconds_to_clock(self._max_duration)
         if mdur_ticks > MAX_SCHEDULE_TICKS:

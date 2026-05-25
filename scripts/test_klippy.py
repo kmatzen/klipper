@@ -573,31 +573,47 @@ class TestCase:
                     # bridge and broadcast advance/done in lockstep.
                     klippy_env['KLIPPY_TICK_SOCKET'] = ':'.join(
                         tick_socket_paths)
+                    # Put the test shim (sitecustomize.py) first on
+                    # PYTHONPATH so the klippy subprocess auto-loads it at
+                    # interpreter startup. It relocates the klippy/mcu.py
+                    # timing constants the tick-mode emulator needs widened
+                    # (see KLIPPY_* below) out of production source - mcu.py
+                    # keeps its real-hardware defaults and never reads an
+                    # env var. The serialqueue command pre-transmit lead is
+                    # NOT relocated: the reactor's tick lockstep flushes
+                    # ready serial commands at each advance target before
+                    # the mcu runs forward (serialqueue_flush_ready), so
+                    # they arrive with their normal real-hardware lead.
+                    shim_dir = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        '..', 'test', 'emulator', 'klippy_test_shim')
+                    shim_dir = os.path.normpath(shim_dir)
+                    existing_pp = klippy_env.get('PYTHONPATH', '')
+                    klippy_env['PYTHONPATH'] = (
+                        shim_dir + os.pathsep + existing_pp
+                        if existing_pp else shim_dir)
+                    # First software-PWM cycle lead (mcu.PWM_START_LEAD).
+                    # Needed for every tick run with heaters/fans (incl.
+                    # single-MCU): at connect the clock estimate is still
+                    # converging, so the 0.200s default can map a queued
+                    # first PWM cycle into the firmware's past ("Timer too
+                    # close" during config). Applied via the shim.
+                    klippy_env.setdefault('KLIPPY_PWM_START_LEAD', '1.0')
                 # The multi-mcu *homing* tests (multi_mcu_*, all with >1
                 # bridge) drive a stepper on an emulated mcu under
-                # tick-mode lockstep. Host->mcu commands then ride the
-                # cross-thread/cross-process byte shuttle, whose latency
-                # in *simulated* time is coarse and load-jittery (~one
-                # reactor advance quantum) versus the ~1ms of a real
-                # serial link. Two klippy timing margins tuned for that
-                # ~1ms link are then too tight under full-suite contention
-                # - the step queue underruns ("Timer too close") and the
-                # cross-mcu trsync watchdog trips ("Communication timeout
-                # during homing"). Widen both for these runs only (env
-                # vars real hardware never sets, so on-device behaviour is
-                # unchanged); this covers the renode AND the pure-simavr
-                # multi-mcu homing tests, which hit the same underrun.
-                # Scoped to >1 bridge so the single-bridge tick tests
-                # (per-printer boot/config, no homing) keep stock timing.
+                # tick-mode lockstep. The host<->mcu trsync homing
+                # keep-alive rides a closed loop on the serialqueue
+                # background thread whose latency in *simulated* time is a
+                # whole advance quantum - coarser than the 25ms multi-mcu
+                # trsync watchdog tuned for a ~1ms link - so it
+                # intermittently trips "Communication timeout during
+                # homing". Widen just that watchdog for these runs (via the
+                # test shim, so mcu.py stays pristine; the env var is never
+                # set on real hardware). Scoped to >1 bridge so the
+                # single-bridge tick tests (per-printer boot/config, no
+                # homing) keep stock timing.
                 if len(tick_socket_paths) > 1:
-                    # 25ms multi-mcu trsync homing watchdog (mcu.py) ->
-                    # otherwise "Communication timeout during homing".
                     klippy_env.setdefault('KLIPPY_TRSYNC_TIMEOUT', '2.0')
-                    # 100ms serialqueue command pre-transmit lead
-                    # (serialqueue.c) -> otherwise the renode-hosted step
-                    # queue underruns and the mcu rejects the next step
-                    # with "Timer too close".
-                    klippy_env.setdefault('KLIPPY_MIN_REQTIME_DELTA', '0.5')
             res = self._run_klippy_with_deadline(klippy_args, env=klippy_env)
         finally:
             for p in emu_procs:

@@ -150,6 +150,12 @@ class SelectReactor:
         self._tick_socket_paths = [p for p in tick_env.split(':') if p]
         self._tick_sockets = []
         self._tick_recv_bufs = []
+        # Callbacks invoked with the next advance target (simulated time)
+        # just before the reactor asks the bridge(s) to run forward. A
+        # serial transport registers one here so it can transmit commands
+        # due by that time with their normal pre-transmit lead intact (see
+        # serialqueue_flush_ready). Empty (and never invoked) off tick mode.
+        self._tick_flush_callbacks = []
     # Python garbage collection
     def get_gc_stats(self):
         return tuple(self._last_gc_times)
@@ -366,6 +372,15 @@ class SelectReactor:
                 pass
         self._tick_sockets = []
         self._tick_recv_bufs = []
+    def register_tick_flush(self, callback):
+        # See _tick_flush_callbacks. callback(target) is invoked with the
+        # next advance target (simulated seconds) before each bridge advance.
+        self._tick_flush_callbacks.append(callback)
+    def unregister_tick_flush(self, callback):
+        try:
+            self._tick_flush_callbacks.remove(callback)
+        except ValueError:
+            pass
     def _tick_request_advance(self):
         # Ask all bridges to advance simulated time, in lockstep.
         # Returns the minimum reported actual (so klippy never thinks
@@ -377,6 +392,13 @@ class SelectReactor:
             target = cap
         if target < eventtime:
             target = eventtime
+        # Transmit any serial commands that are ready to send by `target`
+        # before the mcu runs forward, so they reach the firmware with the
+        # normal pre-transmit lead rather than a whole quantum late. Pass
+        # the current eventtime as the send timestamp (target is only the
+        # look-ahead horizon) so clock-sync timing stays honest.
+        for flush in self._tick_flush_callbacks:
+            flush(eventtime, target)
         msg = ('advance %.9f\n' % target).encode('ascii')
         try:
             for s in self._tick_sockets:

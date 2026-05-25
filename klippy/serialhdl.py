@@ -31,6 +31,8 @@ class SerialReader:
         # Threading
         self.lock = threading.Lock()
         self.background_thread = None
+        # Deterministic tick-mode lockstep transmit flush (see _start_session)
+        self._tick_flush_cb = None
         # Message handlers
         self.handlers = {}
         self.register_response(self._handle_unknown_init, '#unknown')
@@ -92,6 +94,18 @@ class SerialReader:
             self.ffi_lib.serialqueue_free)
         self.background_thread = threading.Thread(target=self._bg_thread)
         self.background_thread.start()
+        # Deterministic tick-mode lockstep (KLIPPY_TICK_SOCKET set): the
+        # background thread sees simulated time advance only in whole
+        # quanta, so register a flush the reactor invokes with each advance
+        # target to transmit ready commands before the mcu runs that far -
+        # preserving the normal pre-transmit lead. No-op on real hardware.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            sq = self.serialqueue
+            ffi_lib = self.ffi_lib
+            self._tick_flush_cb = (
+                lambda sendtime, horizon, sq=sq:
+                    ffi_lib.serialqueue_flush_ready(sq, sendtime, horizon))
+            self.reactor.register_tick_flush(self._tick_flush_cb)
         # Obtain and load the data dictionary from the firmware.
         # In tick-mode lockstep (KLIPPY_TICK_SOCKET set) the reactor's
         # monotonic advances only via the tick-socket round trip, and
@@ -233,6 +247,11 @@ class SerialReader:
         self.ffi_lib.serialqueue_set_clock_est(
             self.serialqueue, freq, conv_time, conv_clock, last_clock)
     def disconnect(self):
+        if self._tick_flush_cb is not None:
+            # Drop the reactor's reference before the serialqueue is freed
+            # so a late advance can't flush into freed memory.
+            self.reactor.unregister_tick_flush(self._tick_flush_cb)
+            self._tick_flush_cb = None
         if self.serialqueue is not None:
             self.ffi_lib.serialqueue_exit(self.serialqueue)
             if self.background_thread is not None:
