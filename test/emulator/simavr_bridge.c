@@ -133,6 +133,13 @@
 static volatile int g_running = 1;
 static avr_t *g_crash_avr = NULL;
 
+/* Set by the control thread when the fixture-setup `barrier` completes
+ * (the test runner's last interaction before it launches klippy). The
+ * main loop sees this and restarts its wall-clock --duration baseline so
+ * the duration window covers klippy's work time only, not the startup
+ * gap. See the start_ts handling in main() for the full rationale. */
+static volatile int g_restart_deadline = 0;
+
 static void
 on_signal(int sig)
 {
@@ -2476,6 +2483,18 @@ control_socket_thread(void *arg)
                     const char *ok = "OK\n";
                     ssize_t w = write(cli, ok, 3);
                     (void)w;
+                    /* The runner sends this barrier as the last step of
+                     * fixture setup, right before it launches klippy. Ask
+                     * the main loop to restart the --duration baseline
+                     * here so the wall-clock safety net is measured from
+                     * ~klippy-start rather than from bridge start (which
+                     * predates the whole setup gap). Without this, on a
+                     * loaded host the multi-bridge startup gap can eat the
+                     * 5 s --duration slack, the bridge exits mid-run, and
+                     * klippy reports "Got EOF when reading from device".
+                     * In tick mode the main loop also restarts at
+                     * tick-client connect, which is tighter still. */
+                    g_restart_deadline = 1;
                 } else {
                     apply_control_line(ctx, start);
                 }
@@ -2932,7 +2951,25 @@ main(int argc, char *argv[])
     signal(SIGABRT, on_crash);
 
     /* Duration safety net: kills the simulator after N WALL seconds
-     * so a hung firmware test doesn't run forever in CI. */
+     * so a hung firmware test doesn't run forever in CI.
+     *
+     * The baseline (start_ts) is captured here, before klippy has even
+     * started - so it includes the whole startup gap (the runner waits
+     * for the slave link, pushes the fixture, runs a setup `barrier`,
+     * and for multi-MCU configs does all of that for every bridge before
+     * launching klippy). The runner sizes --duration as klippy's work
+     * window (EMULATOR_KLIPPY_DEADLINE) plus a small slack, so if the
+     * startup gap exceeds that slack the deadline fires WHILE klippy is
+     * still running: the bridge _exit()s, its pty master closes, and
+     * klippy reads a spurious EOF ("Got EOF when reading from device").
+     * That made the pure-simavr multi_mcu_avr* tests (largest startup
+     * gap: two bridges) flaky under host load. The renode launcher
+     * already avoids this by (re)starting its duration clock only once
+     * startup is done; we mirror that here by restarting start_ts when
+     * the fixture-setup barrier completes (g_restart_deadline) and, in
+     * tick mode, again when klippy connects on the tick socket. Both
+     * land the baseline at ~klippy-start so the slack covers exactly the
+     * work window, the same as on real hardware's wall-clock-free run. */
     struct timespec start_ts;
     clock_gettime(CLOCK_MONOTONIC, &start_ts);
     uint64_t deadline_wall_ns = duration_s > 0
@@ -2979,6 +3016,15 @@ main(int argc, char *argv[])
     char tick_buf[256];
     size_t tick_fill = 0;
     while (g_running && state != cpu_Done && state != cpu_Crashed) {
+        /* Restart the wall-clock --duration baseline once the runner has
+         * finished pushing the fixture (its setup `barrier` set this from
+         * the control thread). This drops the startup gap out of the
+         * duration window so the safety net is measured from ~klippy
+         * start. See the start_ts capture above for why. */
+        if (g_restart_deadline) {
+            g_restart_deadline = 0;
+            clock_gettime(CLOCK_MONOTONIC, &start_ts);
+        }
         /* Once klippy connects on the tick socket we leave free-run
          * mode and only advance simavr in response to "advance" lines.
          * Until then (during fixture-setup `barrier`s on the control
@@ -2988,6 +3034,12 @@ main(int argc, char *argv[])
             if (fd >= 0) {
                 tick_client_fd = fd;
                 tick_fill = 0;
+                /* klippy is now live and about to drive the test - this
+                 * is the tightest possible duration baseline (the renode
+                 * launcher's equivalent of "link up, start the clock").
+                 * Reset here so a slow/loaded startup can never make the
+                 * bridge time out before klippy's own deadline. */
+                clock_gettime(CLOCK_MONOTONIC, &start_ts);
                 if (verbose)
                     fprintf(stderr,
                         "simavr_bridge: tick client connected at cycle %llu\n",
