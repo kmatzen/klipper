@@ -142,13 +142,16 @@ class TestCase:
                     should_fail, emulator_fixture=None, log_required=None,
                     log_forbidden=None, allow_shutdown=False,
                     requires_emulator=False):
-        # Under --force-emulator, skip subtests whose dict file isn't
-        # present in dictdir. printers.test iterates ~30 MCU configs
-        # and the emulator-test Docker image only builds the AVR
-        # variants - without this skip the first missing dict aborts
-        # the whole test case. Regular CI runs build every dict, so
-        # this only affects the emulator-only sweep.
-        if self.force_emulator and dict_fnames:
+        # Skip subtests whose dict file isn't present in dictdir.
+        # printers.test iterates ~80 MCU configs and the emulator-test
+        # Docker image only builds a subset (no pru.dict for the
+        # BeagleBone CRAMPS config, etc.) - without this skip the first
+        # missing dict aborts the whole test case. Runs under
+        # --force-emulator and under the default Docker CMD (emulator
+        # tooling present); the stock scripts/ci-build.sh builds every
+        # dict and ships no tooling, so it is unaffected.
+        if ((self.force_emulator or self._emulator_tooling_present())
+                and dict_fnames):
             for df in dict_fnames:
                 path = df.split('=', 1)[1] if '=' in df else df
                 if not os.path.exists(path):
@@ -163,13 +166,19 @@ class TestCase:
         # builds a -serial.config firmware for those chips because
         # Renode does not model USB-CDC well enough for klippy's CDC
         # stack, but the resulting firmware reserves the host-link UART
-        # pins (e.g. PD25/PD26 for SAME70 UART2) - which collide with
-        # stepper / endstop assignments in the USB-only printer
-        # configs. Detect the collision by parsing the dict's
-        # `RESERVE_PINS_serial` constant and scanning the printer
-        # config for any of those pin names; skip cleanly rather than
-        # fail the whole printers.test pass.
-        if self.force_emulator and dict_fnames and config_fname is not None:
+        # pins (e.g. PD25/PD26 for SAME70 UART2, PA8/PA9 for SAM3X
+        # UART0) - which collide with stepper / endstop / sensor
+        # assignments in printer configs that drive those pins (e.g.
+        # generic-alligator-r3 puts a thermistor on PA8). Detect the
+        # collision by parsing the dict's `RESERVE_PINS_serial` constant
+        # and scanning the printer config for any of those pin names;
+        # skip cleanly rather than fail the whole printers.test pass.
+        # This runs whenever the emulator tooling is in play (the
+        # default Docker CMD loads the real per-MCU dicts with their
+        # pin reservations, not just the explicit --force-emulator
+        # sweep); stock ci-build.sh ships no tooling so it is unaffected.
+        if ((self.force_emulator or self._emulator_tooling_present())
+                and dict_fnames and config_fname is not None):
             primary_dict = (dict_fnames[0].split('=', 1)[1]
                             if '=' in dict_fnames[0] else dict_fnames[0])
             reserved = self._parse_reserved_serial_pins(primary_dict)
@@ -1574,6 +1583,24 @@ class TestCase:
             with open(os.path.join(dev_dir, 'w1_slave'), 'w') as f:
                 f.write(payload)
         return w1_root
+
+    def _emulator_tooling_present(self):
+        # True when the emulator-test backend tooling is installed (the
+        # scripts/Dockerfile.emulator-test image carries the simavr
+        # bridge and/or renode), independent of any specific MCU dict.
+        # printers.test's missing-dict and reserved-serial-pin skips key
+        # off this so they also fire under the default Docker CMD - which
+        # runs the suite against the real per-MCU dicts WITHOUT
+        # --force-emulator - while the stock dict-only scripts/
+        # ci-build.sh path, which ships neither tool, is left untouched.
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir))
+        bridge = os.path.join(repo_root, 'ci_build', 'simavr_bridge')
+        launcher = os.path.join(repo_root, 'test', 'emulator',
+                                'renode_launcher.py')
+        return bool(
+            (os.path.isfile(bridge) and os.access(bridge, os.X_OK))
+            or (os.path.isfile(launcher) and shutil.which('renode')))
 
     def _emulator_backend_available(self, dict_fnames):
         # True only if every MCU dict in this test has a runnable
