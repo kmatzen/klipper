@@ -111,6 +111,32 @@ struct serialqueue {
 #define MIN_BACKGROUND_DELTA 0.005
 #define IDLE_QUERY_TIME 1.0
 
+// Test-only override of the command pre-transmit lead. The serialqueue
+// transmits a queued command only MIN_REQTIME_DELTA (100ms) before its
+// req_clock - tuned for a real ~1ms serial link. Under the deterministic
+// tick-mode emulator the host<->mcu byte shuttle delivers commands with a
+// much coarser latency in *simulated* time (~one reactor advance quantum)
+// that jitters with host CPU load, so the 100ms lead is too small and the
+// mcu step queue underruns mid-homing -> the firmware rejects the next
+// step with "Timer too close". KLIPPY_MIN_REQTIME_DELTA (seconds) widens
+// just that lead so the coarse delivery latency fits; it is never set on
+// real hardware, where behaviour is unchanged. Read once and cached.
+static double
+get_min_reqtime_delta(void)
+{
+    static double cached = -1.;
+    if (cached < 0.) {
+        cached = MIN_REQTIME_DELTA;
+        const char *s = getenv("KLIPPY_MIN_REQTIME_DELTA");
+        if (s && *s) {
+            double v = atof(s);
+            if (v > 0.)
+                cached = v;
+        }
+    }
+    return cached;
+}
+
 #define DEBUG_QUEUE_SENT 100
 #define DEBUG_QUEUE_RECEIVE 100
 
@@ -627,6 +653,7 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
     }
 
     // Check if it is still needed to send messages from the ready_queues
+    double min_reqtime_delta = get_min_reqtime_delta();
     uint64_t min_ready_clock = MAX_CLOCK;
     struct command_queue *cq;
     list_for_each_entry(cq, &sq->ready_queues, ready.node) {
@@ -635,13 +662,13 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
             &cq->ready.msg_queue, struct queue_message, node);
         uint64_t req_clock = qm->req_clock;
         double bgtime = pending ? idletime : sq->idle_time;
-        double bgoffset = MIN_REQTIME_DELTA + MIN_BACKGROUND_DELTA;
+        double bgoffset = min_reqtime_delta + MIN_BACKGROUND_DELTA;
         if (req_clock == BACKGROUND_PRIORITY_CLOCK)
             req_clock = clock_from_time(&sq->ce, bgtime + bgoffset);
         if (req_clock < min_ready_clock)
             min_ready_clock = req_clock;
     }
-    uint64_t reqclock_delta = MIN_REQTIME_DELTA * sq->ce.est_freq;
+    uint64_t reqclock_delta = min_reqtime_delta * sq->ce.est_freq;
     if (min_ready_clock <= ack_clock + reqclock_delta)
         return PR_NOW;
 

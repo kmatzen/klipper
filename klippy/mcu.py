@@ -290,6 +290,24 @@ class MCU_trsync:
 
 TRSYNC_TIMEOUT = 0.025
 TRSYNC_SINGLE_MCU_TIMEOUT = 0.250
+# Test-only override of the multi-mcu homing watchdog window. On real
+# hardware the 25ms multi-mcu trsync timeout is tuned for ~1ms serial
+# round-trips and a wall-clock reactor. Under the deterministic
+# tick-mode emulator the host<->mcu exchange happens over a
+# cross-thread/cross-process byte shuttle whose latency in *simulated*
+# time is far coarser and jitters with host CPU load, so the 25ms
+# window is too tight and intermittently trips "Communication timeout
+# during homing". Setting KLIPPY_TRSYNC_TIMEOUT (seconds) widens just
+# that multi-mcu window so the emulator's coarse timing fits; the env
+# var is never set on real hardware, where behavior is byte-for-byte
+# unchanged. It does not mask homing bugs: a mis-routed endstop still
+# fails the test (homing just times out later, or the deadline hits).
+_trsync_timeout_override = os.environ.get('KLIPPY_TRSYNC_TIMEOUT')
+if _trsync_timeout_override:
+    try:
+        TRSYNC_TIMEOUT = float(_trsync_timeout_override)
+    except ValueError:
+        pass
 
 class TriggerDispatch:
     def __init__(self, mcu):

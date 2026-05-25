@@ -262,18 +262,24 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # known-blocked test) now passes and is included (SysTick=300 + USBHS
 # SETUP-on-RXSTPES injection - see its header).
 #
-# Omitted from this gating run: the two tests that home a stepper on a
-# RENODE-hosted MCU under deterministic tick lockstep -
-# multi_mcu_stm32_stm32 and multi_mcu_avr_stm32_xmcu. Both pass standalone
-# (4/4 and 3/3) and on an unloaded host, but the renode trsync homing is
-# timing-sensitive: under full-suite load on a SHARED host the
-# host<->MCU report cadence drifts enough to trip the watchdog
-# ("Communication timeout during homing"). The non-tick simavr homing
-# (multi_mcu_avr / _xmcu) and the no-motion renode tick path
-# (stm32f103_tick, same70_usb_smoke) are not affected and stay in. Both
-# omitted tests are still built + runnable manually:
-#   docker run ... test_klippy.py -d ci_build/dict --force-emulator \
-#       test/klippy/multi_mcu_stm32_stm32.test
+# The two tests that home a stepper on a RENODE-hosted MCU under
+# deterministic tick lockstep - multi_mcu_stm32_stm32 and
+# multi_mcu_avr_stm32_xmcu - used to be held out of this gate: under
+# full-suite contention on a shared host their renode-hosted homing
+# intermittently failed ("Communication timeout during homing" or
+# "Timer too close"). Root cause: the tick-mode emulator's host<->mcu
+# exchange rides a cross-thread byte shuttle whose latency in
+# *simulated* time is coarse and jitters with host CPU load, far above
+# the ~1ms real serial link klippy's homing timing is tuned for.
+# test_klippy.py widens two klippy margins for tick-mode runs (real
+# hardware never sets either var, so behavior there is unchanged):
+#   - KLIPPY_TRSYNC_TIMEOUT (klippy/mcu.py): the 25ms multi-mcu trsync
+#     homing watchdog, so cross-mcu homing doesn't false-time-out.
+#   - KLIPPY_MIN_REQTIME_DELTA (klippy/chelper/serialqueue.c): the 100ms
+#     command pre-transmit lead, so the renode-hosted stepper queue
+#     doesn't underrun ("Timer too close").
+# A mis-routed endstop still fails the test (homing just stops later),
+# so no homing bug is masked. Both tests now gate.
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \
@@ -312,6 +318,8 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/multi_mcu_avr.test", \
      "test/klippy/multi_mcu_avr_xmcu.test", \
      "test/klippy/multi_mcu_avr_stm32.test", \
+     "test/klippy/multi_mcu_avr_stm32_xmcu.test", \
+     "test/klippy/multi_mcu_stm32_stm32.test", \
      "test/klippy/multi_mcu_linuxprocess_avr.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
