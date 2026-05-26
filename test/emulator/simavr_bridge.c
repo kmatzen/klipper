@@ -62,12 +62,18 @@
  *       sees "triggered" then settles back to "not triggered" for
  *       the subsequent probe move. invert=1 mirrors klippy's `^!`
  *       flag on the sensor pin in [bltouch].
- *   spi_tmc_chip <cs_port> <cs_pin> tmc2660
- *       Register a TMC2660 chip on the shared TMC SPI bus. The
- *       bridge hooks the chip's CS pin and routes MOSI bytes through
- *       a 3-byte (20-bit) datagram decoder while CS is asserted.
- *       Other TMC SPI variants on the same bus continue using the
- *       default 5-byte path. Up to TMC_CHIP_MAX chips supported.
+ *   spi_tmc_chip <cs_port> <cs_pin> <tmc2130|tmc5160|tmc2240|tmc2660>
+ *       Register a TMC SPI chip on the shared bus. The bridge hooks
+ *       the chip's CS pin to track which chip is selected; the active
+ *       chip's per-chip register file backs the 5-byte register-access
+ *       protocol so two chips on the same bus see independent writes
+ *       (`SET_TMC_FIELD` on chip A no longer poisons chip B's reads).
+ *       For `tmc2660`, MOSI bytes also switch to the 3-byte (20-bit)
+ *       datagram decoder while CS is asserted; the other variants stay
+ *       on the 5-byte path. Without a registration, 5-byte transfers
+ *       share a single fallback register file - the legacy behaviour
+ *       for tests that only init one chip on the bus. Up to
+ *       TMC_CHIP_MAX chips supported.
  *   spi_ads1220_chip <cs_port> <cs_pin> <drdy_port> <drdy_pin> <rate_hz>
  *       Register an ADS1220 chip's CS + DRDY pins so the bridge can
  *       pulse DRDY active-low at the chip's configured sample rate
@@ -195,9 +201,15 @@ struct spi_response_state {
     uint8_t tmc_in_pos;        /* 0..4 */
     uint8_t tmc_out_buf[5];    /* MISO bytes the firmware will see */
     uint8_t tmc_out_pos;       /* 0..4 */
-    uint32_t tmc_regs[256];    /* register file shared by all TMC chips
-                                * on the bus - klippy writes-then-reads
-                                * each chip sequentially, no contention */
+    uint32_t tmc_regs[256];    /* default 5-byte TMC register file used
+                                * when no spi_tmc_chip registration is
+                                * active for the chip currently selected
+                                * on the bus. Tests that register every
+                                * chip see per-chip register state via
+                                * the tmc_chip[].regs tables; tests that
+                                * register none (or whose CS pin the
+                                * fixture never declared) fall through
+                                * to this shared table. */
     /* ADS1220 mode: byte 0 is a command. Top nibble selects:
      *   0x4n WREG: write bytes to register n>>2, count = (n & 3) + 1
      *   0x2n RREG: read bytes from register n>>2, count = (n & 3) + 1
@@ -226,34 +238,53 @@ static struct spi_response_state spi_state = {
     .pos = 0,
 };
 
-/* TMC2660 SPI variant. Unlike TMC2130/5160/2240 (5-byte/40-bit
- * datagrams), TMC2660 uses 3-byte/20-bit datagrams: the upper 4 bits
- * of the wire are dummy, then bits 19..17 are a 3-bit register
- * address (0/4/5/6/7) and bits 16..0 are the register value. The
- * MISO response is the chip's READRSP@RDSEL<n> register, packed the
- * same way (response<<4 in 24 bits) so klippy's
- * MCU_TMC2660_SPI.get_register_raw decodes it via
- *   data = (pr[0] << 16) | (pr[1] << 8) | pr[2]
- * which leaves the 20-bit response shifted up by 4 (matching the
- * field offsets in tmc2660.py: stallguard at bit 4, mstep at 14..23).
+/* Per-chip state for TMC SPI bus members. Two protocols share the
+ * bus and are selected at registration time:
  *
- * On a shared SPI bus with mixed-protocol chips (e.g. tmc2130 +
- * tmc2660 in the tmc_spi.test config), the bridge needs CS-pin
- * awareness to know which protocol to apply per transaction - the
- * 5-byte byte counter alone would walk off-alignment after each
- * 3-byte tmc2660 transaction. We register a CS-pin output hook for
- * each tmc2660 chip listed in the fixture; on falling edge we mark
- * "active = this chip" and pre-load its 3-byte response, on rising
- * edge we decode the accumulated MOSI bytes and stash any rdsel
- * change for the next response. While a tmc2660 CS is low the
- * spi_out_hook routes through the per-chip 3-byte path and bypasses
- * the global 5-byte accumulator (so its byte counter stays aligned
- * for the other TMC chips on the bus). */
+ *   TMC_PROTO_5BYTE - tmc2130 / tmc5160 / tmc2240: 5-byte/40-bit
+ *     datagrams (address byte with read/write flag + 4 data bytes).
+ *     The chip's register file lives in `regs[]` here; the 5-byte
+ *     accumulator (tmc_in_buf / tmc_out_buf) stays in spi_state
+ *     because only one chip can be CS-active at a time and the byte
+ *     counter must stay continuous across the transaction. Writes
+ *     during this transaction land in the active chip's `regs[]`;
+ *     reads return that chip's value. A test that does NOT register
+ *     a chip falls back to the legacy shared `spi_state.tmc_regs`
+ *     table (the simpler one-chip-per-bus case).
+ *
+ *   TMC_PROTO_TMC2660 - 3-byte/20-bit datagrams: upper 4 bits dummy,
+ *     bits 19..17 = 3-bit register id (0/4/5/6/7), bits 16..0 = data.
+ *     MISO is the chip's READRSP@RDSEL<n> register packed the same
+ *     way (response<<4 in 24 bits) so klippy's
+ *     MCU_TMC2660_SPI.get_register_raw decodes it via
+ *       data = (pr[0] << 16) | (pr[1] << 8) | pr[2]
+ *     which leaves the 20-bit response shifted up by 4 (matching the
+ *     field offsets in tmc2660.py: stallguard at bit 4, mstep at
+ *     14..23). MOSI/MISO bytes accumulate in this struct's in_buf /
+ *     out_buf; the 5-byte accumulator is bypassed entirely while a
+ *     tmc2660 CS is low (so its byte counter stays aligned for the
+ *     other 5-byte chips on the same bus).
+ *
+ * On every CS falling edge we set tmc_active_chip = this slot so the
+ * spi_out_hook routes the transaction's bytes through this chip's
+ * state. CS rising clears it. The CS hook also performs the
+ * proto-specific finalize: 5-byte does nothing on rising edge
+ * (spi_out_hook decodes at byte-4); tmc2660 decodes the 3
+ * accumulated MOSI bytes and stashes any DRVCONF.RDSEL change for
+ * the next response. */
 #define TMC_CHIP_MAX 8
+enum tmc_proto {
+    TMC_PROTO_5BYTE = 0,
+    TMC_PROTO_TMC2660 = 1,
+};
 struct tmc_chip {
     char cs_port;             /* 'A'..'L' */
     int cs_pin;               /* 0..7 */
     int cs_active;            /* 1 while CS is low */
+    enum tmc_proto proto;     /* TMC_PROTO_5BYTE or TMC_PROTO_TMC2660 */
+    /* 5-byte protocol: per-chip register file. */
+    uint32_t regs[256];
+    /* tmc2660 (3-byte) per-transaction buffers; unused for 5-byte. */
     uint8_t in_buf[3];        /* MOSI bytes accumulated this datagram */
     uint8_t in_pos;           /* 0..3 */
     uint8_t out_buf[3];       /* MISO bytes the firmware will see */
@@ -1764,14 +1795,15 @@ apply_sw_uart(struct control_ctx *ctx,
                 (char)port_ord, pin, u->bit_time, u->addr);
 }
 
-/* spi_tmc_chip <port> <pin> tmc2660: register a TMC2660 chip on the
- * shared TMC SPI bus. The bridge hooks the CS pin so MOSI bytes get
- * routed through a 3-byte (20-bit) datagram decoder while CS is low
- * for this chip - the default 5-byte path keeps serving the other
- * TMC variants on the same bus. Re-issuing for the same pin is a
- * no-op (we keep the first registration). */
+/* spi_tmc_chip <port> <pin> <proto>: register a TMC SPI chip on the
+ * shared bus. The bridge hooks the CS pin so the active chip's
+ * per-chip state (5-byte register file or 3-byte transaction buffer)
+ * backs the bus while CS is low for this chip. Re-issuing for the
+ * same pin updates the proto in place (idempotent for fixtures that
+ * re-push their setup). */
 static void
-apply_spi_tmc_chip(struct control_ctx *ctx, int port_ord, int pin)
+apply_spi_tmc_chip(struct control_ctx *ctx, int port_ord, int pin,
+                   enum tmc_proto proto)
 {
     if (port_ord < 'A' || port_ord > 'L')
         return;
@@ -1797,7 +1829,17 @@ apply_spi_tmc_chip(struct control_ctx *ctx, int port_ord, int pin)
         memset(tmc_chips[slot].in_buf, 0, sizeof(tmc_chips[slot].in_buf));
         memset(tmc_chips[slot].out_buf, 0, sizeof(tmc_chips[slot].out_buf));
         tmc_chips[slot].rdsel = 0;
+        memset(tmc_chips[slot].regs, 0, sizeof(tmc_chips[slot].regs));
+        /* Seed the per-chip 5-byte register defaults that spi_tmc
+         * sets on the shared table - so a chip registered AFTER
+         * spi_tmc init reads the same DRV_STATUS / MSCNT contract.
+         * Harmless for tmc2660 (its decode uses different reg ids
+         * and never indexes into this table). */
+        tmc_chips[slot].regs[0x6f] = 0xc0050000;
+        tmc_chips[slot].regs[0x6a] = 0;
     }
+    if (slot >= 0)
+        tmc_chips[slot].proto = proto;
     pthread_mutex_unlock(&spi_state.lock);
     if (slot < 0)
         return;
@@ -1809,18 +1851,20 @@ apply_spi_tmc_chip(struct control_ctx *ctx, int port_ord, int pin)
                 cs_irq, tmc_cs_hook, (void *)(intptr_t)slot);
         }
     }
-    if (ctx->verbose)
+    if (ctx->verbose) {
+        const char *pname = (proto == TMC_PROTO_TMC2660) ? "tmc2660"
+                                                         : "tmc5byte";
         fprintf(stderr,
-                "simavr_bridge: spi_tmc_chip %c%d tmc2660 (slot %d)\n",
-                port, pin, slot);
+                "simavr_bridge: spi_tmc_chip %c%d %s (slot %d)\n",
+                port, pin, pname, slot);
+    }
 }
 
-/* CS-pin hook for a registered TMC2660 chip. CS is active-low: when
- * the firmware drops it the chip is selected, when it rises the
- * datagram is complete. The bridge tracks the active chip globally
- * so spi_out_hook can route MOSI bytes through the chip's per-
- * transaction buffer without disturbing the existing 5-byte tmc_mode
- * accumulator (which keeps serving 5-byte chips on the same bus). */
+/* CS-pin hook for a registered TMC SPI chip. CS is active-low: on
+ * the falling edge we set tmc_active_chip so spi_out_hook routes the
+ * transaction through this chip's per-chip state; on the rising
+ * edge we clear it (5-byte) or decode the accumulated 3-byte
+ * datagram (tmc2660). */
 static void
 tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
 {
@@ -1834,43 +1878,63 @@ tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     int now_active = (value == 0);
     c->cs_active = now_active;
     if (now_active && !was_active) {
-        /* CS just went low: start of a 3-byte datagram. Reset the
-         * MOSI buffer and pre-load the response (READRSP@RDSEL<rdsel>
-         * value).  When rdsel=2 (READRSP@RDSEL2 in tmc2660.py) klippy's
-         * periodic _do_periodic_check uses the "se" field as the
+        /* CS just went low: this chip's state backs the bus until
+         * CS rises. For 5-byte chips that means writes/reads decode
+         * into c->regs; the 5-byte accumulator in spi_state stays
+         * authoritative for byte counting (the transaction is
+         * always exactly 5 bytes long, started and ended by this
+         * CS, so the accumulator cleanly resets when in_pos rolls
+         * over at byte 4). For tmc2660 we additionally reset the
+         * per-transaction MOSI buffer and pre-load the MISO
+         * response (READRSP@RDSEL<rdsel>). When rdsel=2
+         * (READRSP@RDSEL2 in tmc2660.py) klippy's periodic
+         * _do_periodic_check uses the "se" field as the
          * cs_actual / current-scaler healthiness gate - if it reads
-         * zero, klippy decodes it as "0(Reset?)" and shuts down once
-         * motion starts.  klippy's tmc2660 init sets RDSEL=2 first
-         * (see tmc2660.py "Must set RDSEL value first") so by the time
-         * the periodic check runs we're already serving RDSEL2.  Pack
-         * a non-zero se: the field sits at data bits 14..18 (after
-         * klippy's data = pr[0]<<16 | pr[1]<<8 | pr[2] decode shifts
-         * the 20-bit response up by 4), so 5 << 10 in response_value
-         * lands as se=5 in the field-decoded value.  Other fields
-         * (stallguard / ot / sg_result / etc.) stay zero - good enough
-         * for pretty_format and for init not to flag anything. */
-        c->in_pos = 0;
-        c->out_pos = 0;
-        memset(c->in_buf, 0, sizeof(c->in_buf));
-        uint32_t response_value = (c->rdsel == 2) ? (5U << 10) : 0;
-        uint32_t packed = response_value << 4;
-        c->out_buf[0] = (uint8_t)((packed >> 16) & 0xff);
-        c->out_buf[1] = (uint8_t)((packed >> 8) & 0xff);
-        c->out_buf[2] = (uint8_t)(packed & 0xff);
+         * zero, klippy decodes it as "0(Reset?)" and shuts down
+         * once motion starts. klippy's tmc2660 init sets RDSEL=2
+         * first (see tmc2660.py "Must set RDSEL value first") so by
+         * the time the periodic check runs we're already serving
+         * RDSEL2. Pack a non-zero se: the field sits at data bits
+         * 14..18 (after klippy's data = pr[0]<<16 | pr[1]<<8 | pr[2]
+         * decode shifts the 20-bit response up by 4), so 5 << 10
+         * in response_value lands as se=5 in the field-decoded
+         * value. Other fields (stallguard / ot / sg_result / etc.)
+         * stay zero - good enough for pretty_format and for init
+         * not to flag anything. */
         tmc_active_chip = idx;
+        if (c->proto == TMC_PROTO_TMC2660) {
+            c->in_pos = 0;
+            c->out_pos = 0;
+            memset(c->in_buf, 0, sizeof(c->in_buf));
+            uint32_t response_value = (c->rdsel == 2) ? (5U << 10) : 0;
+            uint32_t packed = response_value << 4;
+            c->out_buf[0] = (uint8_t)((packed >> 16) & 0xff);
+            c->out_buf[1] = (uint8_t)((packed >> 8) & 0xff);
+            c->out_buf[2] = (uint8_t)(packed & 0xff);
+        } else {
+            /* TMC_PROTO_5BYTE: clear the bus-level 5-byte
+             * accumulator so a half-finished transaction from an
+             * unregistered chip on the bus can't bleed into ours.
+             * (In practice klippy CS-frames every transaction
+             * cleanly, but staying defensive keeps the per-chip
+             * state guarantee.) */
+            spi_state.tmc_in_pos = 0;
+            spi_state.tmc_out_pos = 0;
+        }
     } else if (!now_active && was_active) {
-        /* CS just went high: decode whatever we accumulated. The
-         * 20-bit datagram occupies the low 20 bits of the 24-bit
-         * stream (upper 4 bits are dummy/zero):
-         *   bits 19..17 = 3-bit register address
-         *   bit  16     = LSB of (val>>16) -- always 0 except for
-         *                 the optional bit-16 fields klippy carries
-         *                 in DRVCONF/SGCSCONF/CHOPCONF
-         *   bits 15..0  = val[15..0]
-         * We only act on DRVCONF (reg-id=7) writes here, latching
-         * the rdsel field for the next response. Other writes are
-         * accepted but not stored - the test never reads them back. */
-        if (c->in_pos == 3) {
+        if (c->proto == TMC_PROTO_TMC2660 && c->in_pos == 3) {
+            /* CS just went high on tmc2660: decode the 3 accumulated
+             * MOSI bytes. The 20-bit datagram occupies the low 20
+             * bits of the 24-bit stream (upper 4 bits dummy/zero):
+             *   bits 19..17 = 3-bit register address
+             *   bit  16     = LSB of (val>>16) -- always 0 except
+             *                 for the optional bit-16 fields klippy
+             *                 carries in DRVCONF/SGCSCONF/CHOPCONF
+             *   bits 15..0  = val[15..0]
+             * We only act on DRVCONF (reg-id=7) writes here,
+             * latching the rdsel field for the next response. Other
+             * writes are accepted but not stored - the test never
+             * reads them back. */
             uint8_t b0 = c->in_buf[0];
             uint8_t reg_id = (uint8_t)((b0 >> 1) & 0x7);
             uint32_t val = ((uint32_t)(b0 & 1) << 16)
@@ -2140,15 +2204,17 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
             spi_state.ads_remaining--;
             resp = 0;
         }
-    } else if (spi_state.tmc_mode && tmc_active_chip >= 0) {
-        /* TMC2660 3-byte protocol: a registered chip's CS is currently
-         * low. Route this MOSI byte through the per-chip buffer; the
-         * pre-loaded out_buf was set on the CS falling edge. The
-         * datagram is finalized in tmc_cs_hook on the rising edge -
-         * we don't decode here because byte 3 doesn't always close a
-         * transaction (e.g. spi_transfer pads, klippy guarantees
-         * exactly 3 bytes per transaction so the assumption holds,
-         * but doing it on CS keeps the contract explicit). */
+    } else if (spi_state.tmc_mode && tmc_active_chip >= 0
+               && tmc_chips[tmc_active_chip].proto == TMC_PROTO_TMC2660) {
+        /* TMC2660 3-byte protocol: a registered tmc2660 chip's CS is
+         * currently low. Route this MOSI byte through the per-chip
+         * buffer; the pre-loaded out_buf was set on the CS falling
+         * edge. The datagram is finalized in tmc_cs_hook on the
+         * rising edge - we don't decode here because byte 3 doesn't
+         * always close a transaction (e.g. spi_transfer pads, klippy
+         * guarantees exactly 3 bytes per transaction so the
+         * assumption holds, but doing it on CS keeps the contract
+         * explicit). */
         struct tmc_chip *c = &tmc_chips[tmc_active_chip];
         if (c->out_pos < 3)
             resp = c->out_buf[c->out_pos++];
@@ -2156,7 +2222,16 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
             c->in_buf[c->in_pos++] = mosi;
     } else if (spi_state.tmc_mode) {
         /* TMC SPI: 5-byte datagrams. MISO byte_n is the response
-         * we computed at the END of the previous datagram. */
+         * we computed at the END of the previous datagram. The
+         * register file the decode reads/writes is the active
+         * chip's per-chip table (if one is CS-active and was
+         * registered via spi_tmc_chip), or the bus-default
+         * spi_state.tmc_regs (legacy single-chip fallback). The
+         * choice is captured once per datagram, at decode time,
+         * so a CS toggle mid-byte-counter can't split a single
+         * transaction across two register files - klippy CS-frames
+         * each 5-byte transaction, so by the time we hit byte 4
+         * the active chip is well-defined. */
         resp = spi_state.tmc_out_buf[spi_state.tmc_out_pos];
         if (spi_state.tmc_out_pos < 4)
             spi_state.tmc_out_pos++;
@@ -2172,9 +2247,15 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
                           |  (uint32_t)spi_state.tmc_in_buf[4];
             uint8_t reg = addr & 0x7f;
             int is_write = (addr & 0x80) != 0;
+            uint32_t *regs;
+            if (tmc_active_chip >= 0
+                && tmc_chips[tmc_active_chip].proto == TMC_PROTO_5BYTE)
+                regs = tmc_chips[tmc_active_chip].regs;
+            else
+                regs = spi_state.tmc_regs;
             if (is_write)
-                spi_state.tmc_regs[reg] = data;
-            uint32_t out = spi_state.tmc_regs[reg];
+                regs[reg] = data;
+            uint32_t out = regs[reg];
             spi_state.tmc_out_buf[0] = 0;        /* SPI_STATUS = OK */
             spi_state.tmc_out_buf[1] = (out >> 24) & 0xff;
             spi_state.tmc_out_buf[2] = (out >> 16) & 0xff;
@@ -2396,8 +2477,20 @@ apply_control_line(struct control_ctx *ctx, char *line)
         int pin = -1;
         char proto[16] = {0};
         int got = sscanf(line + 13, "%c %d %15s", &port, &pin, proto);
-        if (got == 3 && strcmp(proto, "tmc2660") == 0) {
-            apply_spi_tmc_chip(ctx, (int)(unsigned char)port, pin);
+        if (got == 3) {
+            enum tmc_proto p;
+            int known = 1;
+            if (strcmp(proto, "tmc2660") == 0)
+                p = TMC_PROTO_TMC2660;
+            else if (strcmp(proto, "tmc2130") == 0
+                     || strcmp(proto, "tmc5160") == 0
+                     || strcmp(proto, "tmc2240") == 0)
+                p = TMC_PROTO_5BYTE;
+            else
+                known = 0;
+            if (known)
+                apply_spi_tmc_chip(ctx,
+                                   (int)(unsigned char)port, pin, p);
         }
         return;
     }

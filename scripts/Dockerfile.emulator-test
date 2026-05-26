@@ -333,6 +333,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/bltouch.test", \
      "test/klippy/screws_tilt_adjust.test", \
      "test/klippy/tmc_spi.test", \
+     "test/klippy/tmc_spi_divergence.test", \
      "test/klippy/tmc.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
