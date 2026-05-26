@@ -23,6 +23,16 @@ TEMP_EMU_CTL = "_test_emu.ctl"
 # exit on stdin EOF; we kill it after a timeout and rely on log checks.
 EMULATOR_KLIPPY_DEADLINE = 180.0
 SERIAL_PLACEHOLDER = "__EMULATOR_PTY__"
+# An emulated MCU occasionally never finishes the serial connect/identify
+# handshake under tick-mode lockstep - a transient race in the cold
+# bridge<->klippy startup (klippy logs the identify sync noise but never
+# reaches "Loaded MCU"). klippy's own connect retry reuses the same
+# bridge process and so cannot recover (the simavr/renode instance is
+# already in the desynced state); spawning a fresh bridge almost always
+# does. So a test whose only failure is that connect race is re-run from
+# scratch up to this many times. A real failure connects first ("Loaded
+# MCU") and is never retried.
+EMULATOR_CONNECT_RETRIES = 3
 
 
 ######################################################################
@@ -1830,6 +1840,25 @@ class TestCase:
 # Startup
 ######################################################################
 
+def _emulator_connect_flake(log_path):
+    # True when a failed run's only problem is that an emulated MCU never
+    # finished the serial connect/identify handshake (the transient
+    # tick-connect race documented at EMULATOR_CONNECT_RETRIES), so the
+    # test is worth re-running with a fresh bridge. A non-emulator
+    # (fileoutput) run never does a serial connect, and a real failure
+    # gets the MCU connected ("Loaded MCU") first - neither is retried.
+    try:
+        with open(log_path) as f:
+            log = f.read()
+    except OSError:
+        return False
+    if "Starting serial connect" not in log:
+        return False
+    return ("Loaded MCU" not in log
+            or "Unable to connect" in log
+            or "Timeout on connect" in log)
+
+
 def main():
     # Parse args
     usage = "%prog [options] <test cases>"
@@ -1861,11 +1890,18 @@ def main():
     # Run each test
     failures = []
     for fname in args:
-        tc = TestCase(fname, options.dictdir, options.tempdir, options.verbose,
-                      options.keepfiles,
-                      force_emulator=options.force_emulator,
-                      default_fixture=options.default_fixture)
-        res = tc.run()
+        for attempt in range(EMULATOR_CONNECT_RETRIES + 1):
+            tc = TestCase(fname, options.dictdir, options.tempdir,
+                          options.verbose, options.keepfiles,
+                          force_emulator=options.force_emulator,
+                          default_fixture=options.default_fixture)
+            res = tc.run()
+            if res == 'success' or not _emulator_connect_flake(TEMP_LOG_FILE):
+                break
+            sys.stderr.write(
+                "    %s: emulated MCU connect race (attempt %d/%d) - "
+                "retrying with a fresh bridge\n"
+                % (fname, attempt + 1, EMULATOR_CONNECT_RETRIES + 1))
         if res != 'success':
             sys.stderr.write("\n\nTest case %s FAILED (%s)!\n\n"
                              % (fname, res))
