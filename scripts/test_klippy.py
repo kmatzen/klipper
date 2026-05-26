@@ -1973,7 +1973,7 @@ class TestCase:
 # Startup
 ######################################################################
 
-def _emulator_connect_flake(log_path):
+def _emulator_connect_flake(log_path, test_fname=None):
     # True when a failed run's only problem is the cold-start serial
     # connect/identify handshake never finishing (klippy logs the
     # identify sync noise but never reaches "Loaded MCU"). klippy's own
@@ -1983,6 +1983,12 @@ def _emulator_connect_flake(log_path):
     # A non-emulator (fileoutput) run never does a serial connect and a
     # plain logic-error failure gets the MCU connected ("Loaded MCU")
     # first - neither is retried.
+    #
+    # Multi-MCU tests EXPECT_LOG_CONTAINS "Loaded MCU 'X'" for each
+    # bridge they spawn; the cold-start race can hit any one of them,
+    # so we also flag a flake when a single-MCU loaded but a sibling
+    # is missing - the bare "Loaded MCU" substring check below would
+    # otherwise treat partial load as success.
     try:
         with open(log_path) as f:
             log = f.read()
@@ -1990,9 +1996,25 @@ def _emulator_connect_flake(log_path):
         return False
     if "Starting serial connect" not in log:
         return False
-    return ("Loaded MCU" not in log
-            or "Unable to connect" in log
-            or "Timeout on connect" in log)
+    if "Unable to connect" in log or "Timeout on connect" in log:
+        return True
+    if "Loaded MCU" not in log:
+        return True
+    if test_fname is not None:
+        try:
+            with open(test_fname) as tf:
+                for raw in tf:
+                    cpos = raw.find('#')
+                    line = raw[:cpos] if cpos >= 0 else raw
+                    parts = line.strip().split(None, 1)
+                    if len(parts) != 2 or parts[0] != "EXPECT_LOG_CONTAINS":
+                        continue
+                    pat = _parse_quoted(parts[1])
+                    if pat.startswith("Loaded MCU '") and pat not in log:
+                        return True
+        except OSError:
+            pass
+    return False
 
 
 def main():
@@ -2032,7 +2054,8 @@ def main():
                           force_emulator=options.force_emulator,
                           default_fixture=options.default_fixture)
             res = tc.run()
-            if res == 'success' or not _emulator_connect_flake(TEMP_LOG_FILE):
+            if (res == 'success'
+                    or not _emulator_connect_flake(TEMP_LOG_FILE, fname)):
                 break
             sys.stderr.write(
                 "    %s: emulated MCU connect race (attempt %d/%d) - "
