@@ -739,6 +739,25 @@ class TestCase:
     _EXTRUDER_SECTION_RE = re.compile(r'^\[(extruder\d*)\]\s*$')
     _PROBE_PIN_RE = re.compile(r'^\s*pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
                                r'(?:#.*)?$')
+    # TMC chip sections that support sensorless homing (virtual_endstop).
+    # tmc2660 / tmc2208 are excluded - tmc2660 has no diag-pin homing,
+    # tmc2208 has no DIAG line at all (klippy's TMCVirtualPinHelper is
+    # not instantiated for them).
+    _TMC_VIRTUAL_SECTION_RE = re.compile(
+        r'^\[(tmc2130|tmc5160|tmc2240|tmc2209)\s+(\S+)\]\s*$')
+    # diag1_pin for SPI variants (tmc2130/5160/2240), diag_pin for the
+    # UART tmc2209. (Stallguard4 drivers may also expose diag0_pin; the
+    # cfg uses diag1_pin in practice.)
+    _TMC_DIAG_PIN_RE = re.compile(
+        r'^\s*(diag0_pin|diag1_pin|diag_pin)\s*:\s*([!^~]*)'
+        r'(?:([a-z_][a-z0-9_]*):)?(P[A-L]\d+)\s*(?:#.*)?$')
+    # endstop_pin: <chip_prefix>_<stepper>:virtual_endstop. chip_prefix
+    # matches what TMCVirtualPinHelper registers in tmc.py:
+    #   "%s_%s" % (config_section_first_word, stepper_name)
+    _TMC_VIRTUAL_ENDSTOP_RE = re.compile(
+        r'^\s*endstop_pin\s*:\s*'
+        r'(tmc2130|tmc5160|tmc2240|tmc2209)_(\S+)'
+        r':virtual_endstop\s*(?:#.*)?$')
     _SW_I2C_RE = re.compile(
         r'^\s*i2c_software_(scl|sda)_pin\s*:\s*([!^~]*)(P[A-L]\d+)\s*'
         r'(?:#.*)?$')
@@ -874,6 +893,90 @@ class TestCase:
         finally:
             f.close()
         return pins
+
+    @classmethod
+    def _parse_tmc_virtual_endstops(cls, config_fname):
+        # Yield {stepper, step_pin, step_pin_mcu, diag_pin, diag_pin_mcu,
+        #        diag_invert} for every [stepper_X] whose endstop_pin is
+        # `tmcXXX_X:virtual_endstop`, paired with the matching
+        # [tmcXXX X] section's diag1_pin / diag_pin. The fixture pusher
+        # uses these to emit step_trigger lines that drive the diag pin
+        # after a short step burst, so the firmware's endstop sample
+        # loop sees a real GPIO transition during sensorless homing.
+        #
+        # tmc2660 has no diag-pin homing path (its stallguard is read
+        # over SPI, not asserted on a wire) and tmc2208 has no DIAG
+        # output, so neither shows up here even when present in the cfg.
+        #
+        # First pass: collect step_pin per stepper and remember which
+        # ones declared a virtual_endstop on each TMC variant.
+        steppers = {}      # stepper_name -> {'step_pin': ..., 'step_pin_mcu': ...}
+        virtuals = {}      # stepper_name -> tmc_kind ('tmc2130'/'tmc2209'/...)
+        diag_pins = {}     # (tmc_kind, stepper_name) -> (invert, mcu, bare)
+        section_type = None
+        section_stepper = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return []
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    m_s = cls._STEPPER_RE.match(stripped)
+                    if m_s:
+                        section_type = 'stepper'
+                        section_stepper = m_s.group(1)
+                        steppers.setdefault(section_stepper, {})
+                        continue
+                    m_t = cls._TMC_VIRTUAL_SECTION_RE.match(stripped)
+                    if m_t:
+                        section_type = 'tmc'
+                        section_stepper = (m_t.group(1), m_t.group(2))
+                        continue
+                    section_type = None
+                    section_stepper = None
+                    continue
+                if section_type == 'stepper' and section_stepper:
+                    m_pin = cls._PIN_RE.match(line)
+                    if m_pin:
+                        key, _flags, mcu, bare = m_pin.groups()
+                        if key == 'step_pin':
+                            steppers[section_stepper]['step_pin'] = bare
+                            steppers[section_stepper]['step_pin_mcu'] = (
+                                mcu or 'mcu')
+                        continue
+                    m_v = cls._TMC_VIRTUAL_ENDSTOP_RE.match(line)
+                    if m_v:
+                        virtuals[section_stepper] = m_v.group(1)
+                    continue
+                if section_type == 'tmc' and section_stepper:
+                    m_d = cls._TMC_DIAG_PIN_RE.match(line)
+                    if m_d:
+                        _key, flags, mcu, bare = m_d.groups()
+                        diag_pins[section_stepper] = (
+                            '!' in flags, mcu or 'mcu', bare)
+        finally:
+            f.close()
+        out = []
+        for stepper_name, tmc_kind in virtuals.items():
+            s = steppers.get(stepper_name) or {}
+            step_pin = s.get('step_pin')
+            if step_pin is None:
+                continue
+            diag = diag_pins.get((tmc_kind, stepper_name))
+            if diag is None:
+                continue
+            invert, diag_mcu, diag_bare = diag
+            out.append({
+                'stepper': stepper_name,
+                'step_pin': step_pin,
+                'step_pin_mcu': s.get('step_pin_mcu', 'mcu'),
+                'diag_pin': diag_bare,
+                'diag_pin_mcu': diag_mcu,
+                'diag_invert': invert,
+            })
+        return out
 
     @classmethod
     def _parse_ads1220_chips(cls, config_fname):
@@ -1086,6 +1189,26 @@ class TestCase:
                 lines.append("step_trigger %s %d 100 %s %d 1" % (
                     step_p[1], int(step_p[2:]),
                     end_p[1], int(end_p[2:])))
+            # TMC virtual_endstop (sensorless homing): the rail's endstop
+            # is the TMC chip's diag/diag1 pin, raised by stallguard
+            # logic on real hardware once load exceeds the configured
+            # threshold. Emulate the trigger the same way as a GPIO
+            # endstop - drive the diag pin to its "triggered" level
+            # after the same short step burst. trig_val accounts for the
+            # `!` invert flag on the diag pin (e.g. `!PK2`): the bridge
+            # writes a literal raw level and klippy XORs with invert, so
+            # invert=true wants raw=0 to be seen as triggered.
+            for v in self._parse_tmc_virtual_endstops(config_fname):
+                if (v['step_pin_mcu'] != mcu_name
+                        or v['diag_pin_mcu'] != mcu_name):
+                    continue
+                step_p = v['step_pin']
+                diag_p = v['diag_pin']
+                trig_val = 0 if v['diag_invert'] else 1
+                lines.append("step_trigger %s %d 100 %s %d %d" % (
+                    step_p[1], int(step_p[2:]),
+                    diag_p[1], int(diag_p[2:]),
+                    trig_val))
         # bltouch + auto_trigger_after_steps: configure the bridge's
         # BLTouch state machine on the [bltouch] control/sensor pins,
         # AND wire a step_trigger from the Z stepper (the one driving
@@ -1841,12 +1964,27 @@ class TestCase:
 ######################################################################
 
 def _emulator_connect_flake(log_path):
-    # True when a failed run's only problem is that an emulated MCU never
-    # finished the serial connect/identify handshake (the transient
-    # tick-connect race documented at EMULATOR_CONNECT_RETRIES), so the
-    # test is worth re-running with a fresh bridge. A non-emulator
-    # (fileoutput) run never does a serial connect, and a real failure
-    # gets the MCU connected ("Loaded MCU") first - neither is retried.
+    # True when a failed run's only problem is a transient emulator-
+    # specific race that a fresh bridge typically clears.  Two classes
+    # are covered:
+    #
+    # 1. The cold-start serial connect/identify handshake never finishes
+    #    (klippy logs the identify sync noise but never reaches "Loaded
+    #    MCU"). klippy's own connect retry reuses the same bridge and so
+    #    cannot recover - a fresh process almost always connects cleanly.
+    #
+    # 2. The "Stepper X phase unknown" home failure on a [endstop_phase]
+    #    cfg: tmc._do_enable runs via register_callback (async on the
+    #    reactor) and its mcu_phase_offset write races homing:home_rails_end
+    #    on the same axis. On real hardware MCU comms are fast enough that
+    #    the callback always lands first; in tick-mode lockstep under host
+    #    load the callback can lag behind the homing move, so calc_phase
+    #    reads None and raises. A fresh bridge restarts the clock-sync
+    #    convergence; the next run almost always wins the race.
+    #
+    # A non-emulator (fileoutput) run never does a serial connect, and a
+    # plain logic-error failure gets the MCU connected ("Loaded MCU")
+    # first and the phase pattern below absent - neither is retried.
     try:
         with open(log_path) as f:
             log = f.read()
@@ -1854,9 +1992,11 @@ def _emulator_connect_flake(log_path):
         return False
     if "Starting serial connect" not in log:
         return False
-    return ("Loaded MCU" not in log
+    if ("Loaded MCU" not in log
             or "Unable to connect" in log
-            or "Timeout on connect" in log)
+            or "Timeout on connect" in log):
+        return True
+    return "phase unknown" in log
 
 
 def main():

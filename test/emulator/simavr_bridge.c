@@ -781,6 +781,18 @@ apply_control_command(struct control_ctx *ctx, const char *line)
          * file is shared across the bus; klippy initializes each chip
          * sequentially so a single shared default suffices. */
         spi_state.tmc_regs[0x6f] = 0xc0050000;
+        /* MSCNT (tmc2130 / tmc5160 / tmc2240, reg 0x6a) defaults to 0
+         * from the memset above - left explicit here so callers see
+         * the contract. klippy's _query_phase reads this register at
+         * stepper-enable time to derive its mcu_phase_offset; with a
+         * stable value (zero) every read, [endstop_phase] sees a
+         * consistent phase on every G28 and never trips its
+         * "incorrect phase" check. The same applies to the tmc2660's
+         * MSTEP (served via RDSEL=0 in the per-chip 3-byte path - the
+         * pre-seeded response there is also zero for that field) and
+         * to the per-chip sw_uart register file for tmc2208/tmc2209
+         * (zero-initialized in the static sw_uart[] array). */
+        spi_state.tmc_regs[0x6a] = 0;
         pthread_mutex_unlock(&spi_state.lock);
         if (ctx->verbose)
             fprintf(stderr, "simavr_bridge: spi_tmc mode enabled\n");
