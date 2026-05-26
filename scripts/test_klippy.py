@@ -1964,27 +1964,15 @@ class TestCase:
 ######################################################################
 
 def _emulator_connect_flake(log_path):
-    # True when a failed run's only problem is a transient emulator-
-    # specific race that a fresh bridge typically clears.  Two classes
-    # are covered:
+    # True when a failed run's only problem is the cold-start serial
+    # connect/identify handshake never finishing (klippy logs the
+    # identify sync noise but never reaches "Loaded MCU"). klippy's own
+    # connect retry reuses the same bridge and so cannot recover - a
+    # fresh process almost always connects cleanly.
     #
-    # 1. The cold-start serial connect/identify handshake never finishes
-    #    (klippy logs the identify sync noise but never reaches "Loaded
-    #    MCU"). klippy's own connect retry reuses the same bridge and so
-    #    cannot recover - a fresh process almost always connects cleanly.
-    #
-    # 2. The "Stepper X phase unknown" home failure on a [endstop_phase]
-    #    cfg: tmc._do_enable runs via register_callback (async on the
-    #    reactor) and its mcu_phase_offset write races homing:home_rails_end
-    #    on the same axis. On real hardware MCU comms are fast enough that
-    #    the callback always lands first; in tick-mode lockstep under host
-    #    load the callback can lag behind the homing move, so calc_phase
-    #    reads None and raises. A fresh bridge restarts the clock-sync
-    #    convergence; the next run almost always wins the race.
-    #
-    # A non-emulator (fileoutput) run never does a serial connect, and a
+    # A non-emulator (fileoutput) run never does a serial connect and a
     # plain logic-error failure gets the MCU connected ("Loaded MCU")
-    # first and the phase pattern below absent - neither is retried.
+    # first - neither is retried.
     try:
         with open(log_path) as f:
             log = f.read()
@@ -1992,11 +1980,9 @@ def _emulator_connect_flake(log_path):
         return False
     if "Starting serial connect" not in log:
         return False
-    if ("Loaded MCU" not in log
+    return ("Loaded MCU" not in log
             or "Unable to connect" in log
-            or "Timeout on connect" in log):
-        return True
-    return "phase unknown" in log
+            or "Timeout on connect" in log)
 
 
 def main():
