@@ -326,6 +326,13 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/multi_mcu_avr_stm32_xmcu.test", \
      "test/klippy/multi_mcu_stm32_stm32.test", \
      "test/klippy/multi_mcu_linuxprocess_avr.test", \
+     "test/klippy/eddy.test", \
+     "test/klippy/load_cell.test", \
+     "test/klippy/temperature.test", \
+     "test/klippy/delta.test", \
+     "test/klippy/bltouch.test", \
+     "test/klippy/screws_tilt_adjust.test", \
+     "test/klippy/tmc_spi.test", \
      "test/klippy/printers.test", \
      "test/klippy/generic_cartesian_itex.test", \
      "test/klippy/generic_cartesian_iqex.test"]

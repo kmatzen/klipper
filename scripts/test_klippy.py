@@ -599,6 +599,14 @@ class TestCase:
                     # first PWM cycle into the firmware's past ("Timer too
                     # close" during config). Applied via the shim.
                     klippy_env.setdefault('KLIPPY_PWM_START_LEAD', '1.0')
+                    # First BLTouch servo-command lead
+                    # (extras.bltouch.CMD_SYNC_LEAD). Same converging-clock
+                    # reason as PWM_START_LEAD: the 0.1s default can map the
+                    # probe/self-test servo PWM edge into the firmware's
+                    # past ("Rescheduled timer in the past") for tick-mode
+                    # bltouch / screws_tilt_adjust runs. Applied via the
+                    # shim; harmless for tick runs with no [bltouch].
+                    klippy_env.setdefault('KLIPPY_BLTOUCH_CMD_LEAD', '1.0')
                 # The multi-mcu *homing* tests (multi_mcu_*, all with >1
                 # bridge) drive a stepper on an emulated mcu under
                 # tick-mode lockstep. The host<->mcu trsync homing

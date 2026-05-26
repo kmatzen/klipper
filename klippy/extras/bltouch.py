@@ -8,6 +8,15 @@ from . import probe
 
 SIGNAL_PERIOD = 0.020
 MIN_CMD_TIME = 5 * SIGNAL_PERIOD
+# Lead between the estimated current MCU print time and the first queued
+# BLTouch command in a synced sequence. The 0.1s (MIN_CMD_TIME) default
+# is ample on real hardware (sub-millisecond link). It is a plain named
+# constant -- bltouch never reads an env var -- so the deterministic
+# tick-mode emulator test shim can widen it: under tick lockstep the
+# connect-time clock estimate is still converging and the host<->mcu
+# byte shuttle is coarse, so the 0.1s lead can map the first servo PWM
+# edge into the firmware's past ("Rescheduled timer in the past").
+CMD_SYNC_LEAD = MIN_CMD_TIME
 
 TEST_TIME = 5 * 60.
 RETRY_RESET_TIME = 1.
@@ -98,7 +107,7 @@ class BLTouchProbe:
     def sync_mcu_print_time(self):
         curtime = self.printer.get_reactor().monotonic()
         est_time = self.mcu_pwm.get_mcu().estimated_print_time(curtime)
-        self.next_cmd_time = max(self.next_cmd_time, est_time + MIN_CMD_TIME)
+        self.next_cmd_time = max(self.next_cmd_time, est_time + CMD_SYNC_LEAD)
     def sync_print_time(self):
         toolhead = self.printer.lookup_object('toolhead')
         print_time = toolhead.get_last_move_time()
