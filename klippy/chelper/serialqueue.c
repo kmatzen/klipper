@@ -715,9 +715,13 @@ command_event(struct serialqueue *sq, double eventtime)
 // quanta, so it would not transmit until after the mcu had already run
 // past the command's clock, starving the step queue ("Timer too close").
 // Passing the real sendtime (not horizon) keeps the stored sent_time
-// honest so clock sync is unaffected. do_command_event() takes sq->lock,
-// so this is safe to call concurrently with the background thread; it is
-// never invoked on real hardware (no reactor tick mode there).
+// honest so clock sync is unaffected. Cross-thread safety: do_command_event()
+// takes sq->lock to serialize against the background thread's command_event
+// path, and any pollreactor_update_timer() reached via build_and_send_command
+// is itself serialized against pollreactor_check_timers() by pollreactor's
+// own timer_lock (see klippy/chelper/pollreactor.c) - so the timer plane is
+// not raced on either. Never invoked on real hardware (no reactor tick mode
+// there).
 void __visible
 serialqueue_flush_ready(struct serialqueue *sq, double sendtime, double horizon)
 {
