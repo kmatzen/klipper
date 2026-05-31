@@ -1,0 +1,22 @@
+# Cross-MCU AVR routing validation
+#
+# Like multi_mcu_avr.test, but stepper_z's pins (`other:PL3`,
+# `other:PD3`, ...) live on the second MCU. Exercises the fixture
+# pusher's MCU-prefix awareness: _PIN_RE captures the `other:` prefix
+# and the runner emits the Z `step_trigger` command on the `other`
+# bridge's control socket instead of the main mcu's. Without that
+# routing, _PIN_RE would skip the prefixed pins, no step_trigger
+# would fire on Z's endstop, and G28 would hang until klippy's
+# home_wait timeout fired.
+DICTIONARY atmega2560.dict other=atmega2560.dict
+CONFIG multi_mcu_avr_xmcu.cfg
+EMULATOR multi_mcu_avr_xmcu.fixture.json
+
+# G28 must home all three axes; if Z's step_trigger landed on the
+# wrong bridge (or got skipped entirely), the home would hang.
+G28
+M114
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

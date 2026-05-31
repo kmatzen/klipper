@@ -1,0 +1,26 @@
+# Multi-MCU AVR fan-out validation
+#
+# Exercises the EMULATOR multi-bridge plumbing introduced in this PR
+# (one simavr bridge per dict, klippy reactor connects to a `:`-list
+# of tick sockets and broadcasts advance/done in lockstep). All three
+# MCUs are atmega2560 -- the goal is to validate the fan-out path
+# itself, not any cross-architecture work. sample-multi-mcu.cfg has
+# the main mcu driving X/Y, zboard driving Z, and auxboard running
+# the extruder heater + bed heater + fan + thermistors.
+DICTIONARY atmega2560.dict other=atmega2560.dict
+CONFIG multi_mcu_avr.cfg
+EMULATOR multi_mcu_avr.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+# skipped (not degraded to fileoutput) when the emulator backend isn't built
+
+# A few harmless gcode lines to get past klippy:ready and exercise
+# motion / heater paths.
+G28
+M114
+M105
+
+# Each MCU loaded successfully (klippy logs one "Loaded MCU 'name'"
+# per MCU it identifies on startup).
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

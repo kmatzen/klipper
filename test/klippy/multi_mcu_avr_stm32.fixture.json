@@ -1,0 +1,5 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_avr_stm32.test under a mixed simavr (atmega2560) + renode (stm32f103) multi-bridge fan-out. tick_mode is intentionally absent: simavr supports tick-mode lockstep, the renode launcher accepts the flag but ignores it (real-time only on first cut), and enabling it would point klippy's clock at the AVR sim_time mmap while renode kept running on wall clock -- the two clocks would diverge immediately. Real-time mode with simavr's wall-clock throttle is sufficient for a smoke test of the cross-architecture plumbing. auto_trsync_trigger_ticks fires X/Y/Z endstops after 100 step edges so G28 completes; all stepper pins resolve to the main mcu so the step_trigger commands all land on the simavr control socket.",
+    "auto_trsync_trigger_ticks": 100,
+    "tick_mode": true
+}

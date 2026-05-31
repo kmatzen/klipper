@@ -1,0 +1,8 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_avr.test under the EMULATOR multi-bridge fan-out: one simavr bridge per dict ([mcu] + [mcu other]), both atmega2560. All steppers live on the main [mcu] so the fixture pusher routes step_trigger without MCU-prefix awareness; [mcu other] is along for the ride to validate the second bridge's identify + clock-sync path. tick_mode is ON: each bridge runs its own tick-socket lockstep with the reactor broadcasting one `advance T` to all bridges and taking the min reported actual, so both clocks stay aligned deterministically (validated 15/15). auto_trsync_trigger_ticks fires the endstop after 100 step edges so G28 completes.",
+    "tick_mode": true,
+    "auto_trsync_trigger_ticks": 100,
+    "analog_in_default": {
+        "default_value": 1500
+    }
+}

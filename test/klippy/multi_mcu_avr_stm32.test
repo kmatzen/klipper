@@ -1,0 +1,21 @@
+# Cross-architecture multi-MCU validation -- atmega2560 + stm32f103.
+# Exercises the EMULATOR multi-bridge fan-out across two different
+# backends simultaneously: the runner spawns a simavr bridge for the
+# AVR main and a renode launcher for the stm32 satellite, klippy
+# connects to both ptys, and clocksync runs against each independently
+# (real-time mode -- see fixture comment for why tick_mode is absent
+# in mixed-backend mode).
+DICTIONARY atmega2560.dict other=stm32f103.dict
+CONFIG multi_mcu_avr_stm32.cfg
+EMULATOR multi_mcu_avr_stm32.fixture.json
+
+# A few harmless gcode lines to get past klippy:ready and exercise
+# motion paths against the AVR main (steppers all live there).
+G28
+M114
+M105
+
+# klippy successfully identified each backend's MCU.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

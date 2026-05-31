@@ -1,0 +1,20 @@
+# Two-renode multi-MCU validation -- stm32f103 + stm32f407.
+# Exercises the EMULATOR multi-bridge fan-out with two independent
+# renode_launcher.py processes running concurrently. Each loads its
+# own platform .repl (stm32f103.repl vs stm32f4.repl), its own
+# firmware ELF, and its own UART pty; klippy talks to both and
+# clocksync runs in real time against each.
+DICTIONARY stm32f103.dict other=stm32f407.dict
+CONFIG multi_mcu_stm32_stm32.cfg
+EMULATOR multi_mcu_stm32_stm32.fixture.json
+
+# Harmless gcode to drive klippy past klippy:ready and exercise
+# motion against the stm32f103 main (where the steppers live).
+G28
+M114
+M105
+
+# klippy successfully identified each renode-backed MCU.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
