@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, threading, os
+import logging, threading, os, socket
 import serial
 
 import msgproto, chelper, util
@@ -31,6 +31,13 @@ class SerialReader:
         # Threading
         self.lock = threading.Lock()
         self.background_thread = None
+        # Deterministic tick-mode lockstep (see _start_session): the
+        # reactor drives transmit (_tick_flush_cb) and receive (_tick_fd_hdl
+        # read-callback) synchronously instead of the background thread.
+        self._tick_flush_cb = None
+        self._tick_need_prompt_cb = None
+        self._tick_fd_hdl = None
+        self._tick_response = None
         # Message handlers
         self.handlers = {}
         self.register_response(self._handle_unknown_init, '#unknown')
@@ -38,32 +45,49 @@ class SerialReader:
         # Sent message notification tracking
         self.last_notify_id = 0
         self.pending_notifications = {}
+    def _dispatch_response(self, response):
+        # Process one received message. Shared by the background thread
+        # (real hardware) and the reactor-driven tick-mode receive path
+        # (_tick_receive). The caller guarantees response.len >= 0.
+        if response.notify_id:
+            params = {'#sent_time': response.sent_time,
+                      '#receive_time': response.receive_time}
+            completion = self.pending_notifications.pop(response.notify_id)
+            self.reactor.async_complete(completion, params)
+            return
+        params = self.msgparser.parse(response.msg[0:response.len])
+        params['#sent_time'] = response.sent_time
+        params['#receive_time'] = response.receive_time
+        hdl = (params['#name'], params.get('oid'))
+        try:
+            with self.lock:
+                hdl = self.handlers.get(hdl, self.handle_default)
+                hdl(params)
+        except:
+            logging.exception("%sException in serial callback",
+                              self.warn_prefix)
     def _bg_thread(self):
         name_short = ("serialhdl %s" % (self.mcu_name))[:15]
         self.ffi_lib.set_thread_name(name_short.encode('utf-8'))
         response = self.ffi_main.new('struct pull_queue_message *')
         while 1:
             self.ffi_lib.serialqueue_pull(self.serialqueue, response)
-            count = response.len
-            if count < 0:
+            if response.len < 0:
                 break
-            if response.notify_id:
-                params = {'#sent_time': response.sent_time,
-                          '#receive_time': response.receive_time}
-                completion = self.pending_notifications.pop(response.notify_id)
-                self.reactor.async_complete(completion, params)
-                continue
-            params = self.msgparser.parse(response.msg[0:count])
-            params['#sent_time'] = response.sent_time
-            params['#receive_time'] = response.receive_time
-            hdl = (params['#name'], params.get('oid'))
-            try:
-                with self.lock:
-                    hdl = self.handlers.get(hdl, self.handle_default)
-                    hdl(params)
-            except:
-                logging.exception("%sException in serial callback",
-                                  self.warn_prefix)
+            self._dispatch_response(response)
+    def _tick_receive(self, eventtime):
+        # Reactor read-callback for the serial fd in deterministic tick
+        # mode (no background thread): synchronously read + parse whatever
+        # the firmware emitted, then dispatch the resulting messages on the
+        # reactor thread. Called when the fd is readable, which - because
+        # the bridge writes the firmware's response before replying "done"
+        # to an advance - is the reactor iteration right after that advance,
+        # so the response is handled at the advance's simulated time
+        # regardless of host load. See serialqueue.c serialqueue_tick_input.
+        self.ffi_lib.serialqueue_tick_input(self.serialqueue, eventtime)
+        response = self._tick_response
+        while self.ffi_lib.serialqueue_tick_pull(self.serialqueue, response):
+            self._dispatch_response(response)
     def _error(self, msg, *params):
         raise error(self.warn_prefix + (msg % params))
     def _get_identify_data(self, eventtime):
@@ -90,11 +114,50 @@ class SerialReader:
                                            serial_fd_type, client_id,
                                            self.sq_name),
             self.ffi_lib.serialqueue_free)
-        self.background_thread = threading.Thread(target=self._bg_thread)
-        self.background_thread.start()
-        # Obtain and load the data dictionary from the firmware
+        # Deterministic tick-mode lockstep (KLIPPY_TICK_SOCKET set).
+        # All paths below are no-ops without the env. See
+        # TICK_PROTOCOL_DESIGN.md section 2 for the protocol. Reactor-driven
+        # receive only applies to the synchronous AF_UNIX socket link
+        # (simavr, serial_fd_type 'p'); a renode pty ('u') is async and
+        # keeps the background thread, gaining only the flush below.
+        tick_socket = bool(os.environ.get('KLIPPY_TICK_SOCKET'))
+        reactor_driven = tick_socket and serial_fd_type == b'p'
+        if reactor_driven:
+            self._tick_response = self.ffi_main.new(
+                'struct pull_queue_message *')
+        else:
+            self.background_thread = threading.Thread(target=self._bg_thread)
+            self.background_thread.start()
+        if tick_socket:
+            sq = self.serialqueue
+            ffi_lib = self.ffi_lib
+            self._tick_flush_cb = (
+                lambda sendtime, horizon, sq=sq:
+                    ffi_lib.serialqueue_flush_ready(sq, sendtime, horizon))
+            self.reactor.register_tick_flush(self._tick_flush_cb)
+            # Bounded-quantum predicate (mode 0/1/2; see reactor
+            # _tick_request_advance and serialqueue_need_prompt). The
+            # reactor caps the advance at QWAIT (8 ms) when any tick MCU
+            # is blocked on a specific reply/trigger, else runs QMAX
+            # (100 ms) so streaming samples coalesce. Latency-only knob;
+            # rides the existing receive path on both socket and pty.
+            self._tick_need_prompt_cb = (
+                lambda sq=sq: int(ffi_lib.serialqueue_need_prompt(sq)))
+            self.reactor.register_tick_need_prompt(
+                self._tick_need_prompt_cb)
+            if reactor_driven:
+                self._tick_fd_hdl = self.reactor.register_fd(
+                    serial_dev.fileno(), self._tick_receive)
+        # Obtain and load the data dictionary from the firmware.
+        # Tick-mode advances sim time only per tick-socket round trip
+        # (~50 round trips per 5 sim-sec at the 100 ms cap), so the
+        # 10 KB dict's ~250 chunks need a wider sim-time deadline.
+        connect_timeout = 5.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            connect_timeout = 300.
         completion = self.reactor.register_callback(self._get_identify_data)
-        identify_data = completion.wait(self.reactor.monotonic() + 5.)
+        identify_data = completion.wait(
+            self.reactor.monotonic() + connect_timeout)
         if identify_data is None:
             logging.info("%sTimeout on connect", self.warn_prefix)
             self.disconnect()
@@ -117,7 +180,9 @@ class SerialReader:
                 self.serialqueue, receive_window)
         return True
     def connect_canbus(self, canbus_uuid, canbus_nodeid, canbus_iface="can0"):
-        import can # XXX
+        # python-can is an optional dependency, only needed for CAN bus MCUs.
+        # Import it lazily so non-CAN setups don't require the package.
+        import can
         txid = canbus_nodeid * 2 + 256
         filters = [{"can_id": txid+1, "can_mask": 0x7ff, "extended": False}]
         # Prep for SET_NODEID command
@@ -149,7 +214,10 @@ class SerialReader:
                                 self.warn_prefix, e)
                 self.reactor.pause(self.reactor.monotonic() + 5.)
                 continue
-            bus.close = bus.shutdown # XXX
+            # disconnect() tears the link down via serial_dev.close(), but a
+            # python-can Bus exposes shutdown() instead of close(). Alias it so
+            # the generic close path works on the CAN bus object too.
+            bus.close = bus.shutdown
             ret = self._start_session(bus, b'c', txid)
             if not ret:
                 continue
@@ -186,8 +254,16 @@ class SerialReader:
         # Initial connection
         logging.info("%sStarting serial connect", self.warn_prefix)
         start_time = self.reactor.monotonic()
+        # Outer connect deadline. In tick-mode lockstep with the
+        # MCU emulator, sim time advances slowly relative to wall and
+        # the inner connect_timeout (in _start_session) is much
+        # longer than the AVR-real-mcu default, so this outer guard
+        # has to be widened to match.
+        outer_timeout = 90.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            outer_timeout = 900.
         while 1:
-            if self.reactor.monotonic() > start_time + 90.:
+            if self.reactor.monotonic() > start_time + outer_timeout:
                 self._error("Unable to connect")
             try:
                 serial_dev = serial.Serial(baudrate=baud, timeout=0,
@@ -204,6 +280,38 @@ class SerialReader:
             ret = self._start_session(serial_dev)
             if ret:
                 break
+    def connect_unix(self, path):
+        # Connect to an MCU emulator that presents its host link as a Unix
+        # domain stream socket instead of a pty (see test/emulator/
+        # simavr_bridge.c). A socket delivers each klippy write
+        # synchronously - the bytes are in the peer's receive buffer
+        # within the write() syscall, with no n_tty line-discipline
+        # workqueue that could split a flush at a host-scheduling-dependent
+        # point - so the emulator reads each command flush whole and its
+        # byte-stream trace is deterministic in tick mode. Test-only path:
+        # real hardware uses connect_uart / connect_pipe. No stk500v2_leave
+        # (there is no Arduino bootloader behind a socket) and no baud/RTS
+        # (a socket has no line settings).
+        logging.info("%sStarting connect", self.warn_prefix)
+        start_time = self.reactor.monotonic()
+        outer_timeout = 90.
+        if os.environ.get('KLIPPY_TICK_SOCKET'):
+            outer_timeout = 900.
+        while 1:
+            if self.reactor.monotonic() > start_time + outer_timeout:
+                self._error("Unable to connect")
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.connect(path)
+            except (OSError, IOError) as e:
+                sock.close()
+                logging.warning("%sUnable to open port: %s",
+                                self.warn_prefix, e)
+                self.reactor.pause(self.reactor.monotonic() + 5.)
+                continue
+            ret = self._start_session(sock, serial_fd_type=b'p')
+            if ret:
+                break
     def connect_file(self, debugoutput, dictionary, pace=False):
         self.serial_dev = debugoutput
         self.msgparser.process_identify(dictionary, decompress=False)
@@ -215,11 +323,23 @@ class SerialReader:
         self.ffi_lib.serialqueue_set_clock_est(
             self.serialqueue, freq, conv_time, conv_clock, last_clock)
     def disconnect(self):
+        if self._tick_flush_cb is not None:
+            # Drop the reactor's references before the serialqueue is freed
+            # so a late advance can't flush / read into freed memory.
+            self.reactor.unregister_tick_flush(self._tick_flush_cb)
+            self._tick_flush_cb = None
+        if self._tick_need_prompt_cb is not None:
+            self.reactor.unregister_tick_need_prompt(self._tick_need_prompt_cb)
+            self._tick_need_prompt_cb = None
+        if self._tick_fd_hdl is not None:
+            self.reactor.unregister_fd(self._tick_fd_hdl)
+            self._tick_fd_hdl = None
         if self.serialqueue is not None:
             self.ffi_lib.serialqueue_exit(self.serialqueue)
             if self.background_thread is not None:
                 self.background_thread.join()
             self.background_thread = self.serialqueue = None
+            self._tick_response = None
         if self.serial_dev is not None:
             self.serial_dev.close()
             self.serial_dev = None

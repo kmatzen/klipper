@@ -58,6 +58,16 @@ struct serialqueue {
     // Input reading
     struct pollreactor *pr;
     int serial_fd, serial_fd_type, client_id;
+    // Deterministic tick-mode lockstep (KLIPPY_TICK_SOCKET set). In tick
+    // mode the background thread is NOT started: the reactor drives both
+    // transmit (serialqueue_flush_ready, before each advance) and receive
+    // (serialqueue_tick_input + serialqueue_tick_pull, after each advance)
+    // synchronously on one thread, so the firmware's response to an advance
+    // is read and dispatched at that advance's simulated time rather than
+    // whenever the OS happens to schedule the bg thread - the source of the
+    // load-dependent flakes that tick mode otherwise has. Off tick mode
+    // (real hardware) both stay zero and the bg thread runs as before.
+    int tick_mode, thread_started;
     uint8_t input_buf[4096];
     uint8_t need_sync;
     int input_pos;
@@ -103,6 +113,12 @@ struct serialqueue {
 #define SQT_UART 'u'
 #define SQT_CAN 'c'
 #define SQT_DEBUGFILE 'f'
+// A bidirectional byte stream that is not a tty (a Unix domain socket
+// used by the MCU emulator's synchronous host link). Read/write are the
+// generic non-CAN path; it differs from SQT_UART only in that
+// retransmit_event must not tcflush() it (sockets have no output queue
+// to flush, and tcflush on a non-tty fails with ENOTTY).
+#define SQT_PIPE 'p'
 
 #define MIN_RTO 0.025
 #define MAX_RTO 5.000
@@ -163,6 +179,11 @@ receive_append_wake(struct receiver *receiver, struct list_head *msgs)
 static void
 kick_bg_thread(struct serialqueue *sq)
 {
+    if (sq->tick_mode)
+        // No background thread in tick mode - the reactor drives transmit
+        // via serialqueue_flush_ready, so there is nothing to wake (and
+        // the pipe is never drained, which would otherwise fill up).
+        return;
     int ret = write(sq->transmit_requests.pipe_fds[1], ".", 1);
     if (ret < 0)
         report_errno("pipe write", ret);
@@ -468,10 +489,13 @@ retransmit_event(struct serialqueue *sq, double eventtime)
     return waketime;
 }
 
-// Construct a block of data to be sent to the serial port
+// Construct a block of data to be sent to the serial port. sendtime is
+// the actual (current) time the block is written to the wire; it stamps
+// the stored message's sent_time/receive_time and so must never be a
+// look-ahead horizon, or the clock-sync rtt estimate is corrupted.
 static int
 build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
-                       , double eventtime)
+                       , double sendtime)
 {
     int len = MESSAGE_HEADER_SIZE;
     while (sq->ready_bytes) {
@@ -516,12 +540,12 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
     buf[len - MESSAGE_TRAILER_SYNC] = MESSAGE_SYNC;
 
     // Store message block
-    double idletime = eventtime > sq->idle_time ? eventtime : sq->idle_time;
+    double idletime = sendtime > sq->idle_time ? sendtime : sq->idle_time;
     idletime += calculate_bittime(sq, pending + len);
     struct queue_message *out = message_alloc();
     memcpy(out->msg, buf, len);
     out->len = len;
-    out->sent_time = eventtime;
+    out->sent_time = sendtime;
     out->receive_time = idletime;
     if (list_empty(&sq->sent_queue))
         pollreactor_update_timer(sq->pr, SQPT_RETRANSMIT, idletime + sq->rto);
@@ -659,19 +683,25 @@ check_send_command(struct serialqueue *sq, int pending, double eventtime)
     return idletime + (wantclock - ack_clock) / sq->ce.est_freq;
 }
 
-// Callback timer to send data to the serial port
+// Transmit all commands ready to send. `horizon` is the time used to
+// decide which queued commands are ready (their req_clock minus the
+// pre-transmit lead); `sendtime` is the actual current time stamped on
+// the sent messages. They are equal for the normal background-thread
+// path (command_event); the tick-mode flush passes a future horizon
+// (the next advance target) with the real current sendtime so commands
+// get their pre-transmit lead without corrupting clock-sync timestamps.
 static double
-command_event(struct serialqueue *sq, double eventtime)
+do_command_event(struct serialqueue *sq, double horizon, double sendtime)
 {
     pthread_mutex_lock(&sq->lock);
     uint8_t buf[MESSAGE_MAX * MAX_PENDING_BLOCKS];
     int buflen = 0;
     double waketime;
     for (;;) {
-        waketime = check_send_command(sq, buflen, eventtime);
+        waketime = check_send_command(sq, buflen, horizon);
         if (waketime != PR_NOW)
             break;
-        buflen += build_and_send_command(sq, &buf[buflen], buflen, eventtime);
+        buflen += build_and_send_command(sq, &buf[buflen], buflen, sendtime);
         if (buflen + MESSAGE_MAX > sizeof(buf))
             break;
     }
@@ -679,12 +709,129 @@ command_event(struct serialqueue *sq, double eventtime)
         // Write message blocks
         do_write(sq, buf, buflen);
         sq->bytes_write += buflen;
-        double idletime = eventtime > sq->idle_time ? eventtime : sq->idle_time;
+        double idletime = sendtime > sq->idle_time ? sendtime : sq->idle_time;
         sq->idle_time = idletime + calculate_bittime(sq, buflen);
         waketime = PR_NOW;
     }
     pthread_mutex_unlock(&sq->lock);
     return waketime;
+}
+
+// Callback timer to send data to the serial port
+static double
+command_event(struct serialqueue *sq, double eventtime)
+{
+    return do_command_event(sq, eventtime, eventtime);
+}
+
+// Synchronously transmit any commands ready to send by simulated time
+// `horizon`, stamping them sent at `sendtime`. The deterministic
+// tick-mode emulator (see klippy/reactor.py tick lockstep) calls this
+// just before asking the emulator to run the mcu forward: sendtime is
+// the current simulated time and horizon is the next advance target. A
+// command whose req_clock is only the normal MIN_REQTIME_DELTA ahead is
+// thus written to the wire before the mcu reaches that clock - the same
+// pre-transmit lead a real serial link provides. The background thread
+// alone cannot do this: it observes simulated time advance only in whole
+// quanta, so it would not transmit until after the mcu had already run
+// past the command's clock, starving the step queue ("Timer too close").
+// Passing the real sendtime (not horizon) keeps the stored sent_time
+// honest so clock sync is unaffected. Cross-thread safety: do_command_event()
+// takes sq->lock to serialize against the background thread's command_event
+// path, and any pollreactor_update_timer() reached via build_and_send_command
+// is itself serialized against pollreactor_check_timers() by pollreactor's
+// own timer_lock (see klippy/chelper/pollreactor.c) - so the timer plane is
+// not raced on either. Never invoked on real hardware (no reactor tick mode
+// there).
+void __visible
+serialqueue_flush_ready(struct serialqueue *sq, double sendtime, double horizon)
+{
+    do_command_event(sq, horizon, sendtime);
+}
+
+// Synchronously read and parse any bytes the firmware has emitted to the
+// serial port, stamping received messages at simulated time `eventtime`.
+// The deterministic tick-mode reactor calls this after each advance (the
+// receive counterpart to serialqueue_flush_ready) instead of relying on
+// the background thread's pty poll, so a firmware response is delivered at
+// the advance's simulated time, not at a host-scheduling-dependent moment.
+// Reuses input_event() (the same code the bg thread runs on real hardware);
+// handle_message()/fast-reader callbacks therefore run on the reactor
+// thread here. Never invoked on real hardware. The single-threaded
+// invariant in tick mode (no bg thread) means the receiver.lock and
+// fast_reader_dispatch_lock are uncontended.
+void __visible
+serialqueue_tick_input(struct serialqueue *sq, double eventtime)
+{
+    input_event(sq, eventtime);
+}
+
+// Non-blocking variant of serialqueue_pull for the tick-mode reactor. Pops
+// one message off the receiver queue into pqm if available and returns 1;
+// returns 0 (leaving pqm->len < 0) when the queue is empty - unlike
+// serialqueue_pull this never waits on the condition variable (in tick mode
+// the reactor drains the queue inline after serialqueue_tick_input and must
+// not block). Never invoked on real hardware.
+int __visible
+serialqueue_tick_pull(struct serialqueue *sq, struct pull_queue_message *pqm)
+{
+    struct receiver *receiver = &sq->receiver;
+    pthread_mutex_lock(&receiver->lock);
+    if (list_empty(&receiver->queue)) {
+        pqm->len = -1;
+        pthread_mutex_unlock(&receiver->lock);
+        return 0;
+    }
+    struct queue_message *qm = list_first_entry(
+        &receiver->queue, struct queue_message, node);
+    list_del(&qm->node);
+    memcpy(pqm->msg, qm->msg, qm->len);
+    pqm->len = qm->len;
+    pqm->sent_time = qm->sent_time;
+    pqm->receive_time = qm->receive_time;
+    pqm->notify_id = qm->notify_id;
+    if (qm->len)
+        qm = _debug_queue_add(&receiver->old_receive, qm);
+    pthread_mutex_unlock(&receiver->lock);
+    message_free(qm);
+    return 1;
+}
+
+// Tick-mode throughput knob (see TICK_PROTOCOL_DESIGN.md NEED_PROMPT). Reports
+// what kind of prompt firmware interaction klippy is currently waiting on, so
+// the reactor can size the next advance:
+//   2 (HOMING): a trsync is active (trdispatch_start registered a fastreader).
+//     klippy must keep receiving trsync_state reports to extend the firmware
+//     watchdog and to see the trigger, but those reports are periodic, not
+//     one-shot - so the reactor uses a small FIXED quantum (no per-byte
+//     early-exit), which both keeps the heartbeat alive and lets concurrent
+//     streaming output (e.g. a load-cell probe) coalesce instead of forcing a
+//     round trip per sample.
+//   1 (REQUEST): a raw_send_wait_ack is in flight (identify, every
+//     send_with_response/query, clock-sync) with no active trsync. The reply is
+//     one-shot, so the bridge early-exits its advance the instant the firmware
+//     responds (fast identify / queries).
+//   0 (NONE): merely advancing toward a future timer (e.g. a bulk-sensor
+//     batch_timer); unsolicited streaming output need not stop the advance, so
+//     the bridge runs the full quantum and many samples coalesce.
+// fast_readers takes precedence over notify_queue: during a probe both are set
+// (trsync + clock-sync query), and reporting mode 2 lets the reactor pick the
+// single-mcu probe quantum. Splitting them so a pending query forces the small
+// quantum was tried and REGRESSED throughput: queries are near-continuous
+// during a load_cell probe (clock-sync + bulk-sensor _update_clock), so it
+// pinned the descent at the small quantum and hit the wall deadline again.
+// Never invoked on real hardware.
+int __visible
+serialqueue_need_prompt(struct serialqueue *sq)
+{
+    pthread_mutex_lock(&sq->lock);
+    int mode = 0;
+    if (!list_empty(&sq->fast_readers))
+        mode = 2;
+    else if (!list_empty(&sq->notify_queue))
+        mode = 1;
+    pthread_mutex_unlock(&sq->lock);
+    return mode;
 }
 
 // Main background thread for reading/writing to serial port
@@ -715,6 +862,18 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
     sq->client_id = client_id;
     strncpy(sq->name, name, sizeof(sq->name));
     sq->name[sizeof(sq->name)-1] = '\0';
+    // Tick-mode lockstep (deterministic emulator tests only): the reactor
+    // drives all serial I/O synchronously, so the bg thread is not started.
+    // KLIPPY_TICK_SOCKET is the same signal klippy/reactor.py and
+    // klippy/serialhdl.py gate their tick-mode paths on; it is never set on
+    // real hardware. Gate on SQT_PIPE - the synchronous AF_UNIX host link
+    // (serialhdl.connect_unix) the simavr bridge presents in tick mode; only
+    // that transport delivers each write synchronously, which is what makes a
+    // single-threaded reactor receive deterministic. A renode pty (SQT_UART)
+    // or a CAN / debug-file queue keeps its background thread.
+    const char *tick_env = getenv("KLIPPY_TICK_SOCKET");
+    sq->tick_mode = (serial_fd_type == SQT_PIPE
+                     && tick_env != NULL && tick_env[0] != '\0');
 
     int ret = pipe(sq->transmit_requests.pipe_fds);
     if (ret)
@@ -773,9 +932,12 @@ serialqueue_alloc(int serial_fd, char serial_fd_type, int client_id
     ret = pthread_mutex_init(&sq->fast_reader_dispatch_lock, NULL);
     if (ret)
         goto fail;
-    ret = pthread_create(&sq->tid, NULL, background_thread, sq);
-    if (ret)
-        goto fail;
+    if (!sq->tick_mode) {
+        ret = pthread_create(&sq->tid, NULL, background_thread, sq);
+        if (ret)
+            goto fail;
+        sq->thread_started = 1;
+    }
 
     return sq;
 
@@ -789,6 +951,9 @@ void __visible
 serialqueue_exit(struct serialqueue *sq)
 {
     pollreactor_do_exit(sq->pr);
+    if (!sq->thread_started)
+        // Tick mode: no bg thread was created, so nothing to wake or join.
+        return;
     kick_bg_thread(sq);
     int ret = pthread_join(sq->tid, NULL);
     if (ret)
@@ -873,7 +1038,13 @@ serialqueue_rm_fastreader(struct serialqueue *sq, struct fastreader *fr)
     list_del(&fr->node);
     pthread_mutex_unlock(&sq->lock);
 
-    pthread_mutex_lock(&sq->fast_reader_dispatch_lock); // XXX - goofy locking
+    // Unlinking fr above does not stop a dispatch already in progress: the
+    // background thread drops sq->lock but holds fast_reader_dispatch_lock
+    // across the fr->func() callback (see handle_message). Acquire and
+    // immediately release that lock here as a barrier - it blocks until any
+    // in-flight callback for this fastreader has returned, so the caller can
+    // safely free fr afterward without its callback running on freed memory.
+    pthread_mutex_lock(&sq->fast_reader_dispatch_lock);
     pthread_mutex_unlock(&sq->fast_reader_dispatch_lock);
 }
 
