@@ -1,6 +1,7 @@
 # Test cases on printers with dual carriage and multiple extruders
 CONFIG dual_carriage.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # First home the printer
 G90

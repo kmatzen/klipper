@@ -1,5 +1,6 @@
 # Extruder tests
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 CONFIG pressure_advance.cfg
 
 SET_PRESSURE_ADVANCE ADVANCE=0.1

@@ -1,0 +1,8 @@
+# Software I2C bit-bang ACK regression. Exercises pca9632 init via
+# the bridge's sw_i2c emulator on PB1/PB2.
+DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
+CONFIG led_pca9632.cfg
+
+EXPECT_LOG_NOT_CONTAINS "I2C request to addr 98 reports error START_NACK"
+EXPECT_LOG_CONTAINS "Loaded MCU"

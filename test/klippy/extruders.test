@@ -1,5 +1,6 @@
 # Extruder tests
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 CONFIG extruders.cfg
 
 # Extrude only

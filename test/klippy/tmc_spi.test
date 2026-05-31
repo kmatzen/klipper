@@ -1,0 +1,20 @@
+# TMC SPI register-file regression. Exercises tmc2130, tmc5160,
+# tmc2240, tmc2660 init through the simavr bridge's spi_tmc mode.
+DICTIONARY atmega2560.dict
+EMULATOR tmc_spi.fixture.json
+CONFIG tmc_spi.cfg
+
+# Probe register reads via DUMP_TMC. The extruder is a tmc2660 and
+# uses 3-byte (20-bit) datagrams instead of the 5-byte protocol the
+# other three chips share - exercising it here ensures the bridge's
+# CS-aware per-chip protocol routing keeps the byte counter aligned
+# for the rest of the bus.
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# No shutdowns; klippy printed the dump.
+EXPECT_LOG_NOT_CONTAINS "TMC stepper_x failed to init"
+EXPECT_LOG_NOT_CONTAINS "TMC stepper_y failed to init"
+EXPECT_LOG_NOT_CONTAINS "TMC stepper_z failed to init"
+EXPECT_LOG_NOT_CONTAINS "TMC extruder failed to init"
+EXPECT_LOG_CONTAINS "Loaded MCU"

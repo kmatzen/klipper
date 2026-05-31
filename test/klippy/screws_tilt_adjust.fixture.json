@@ -1,0 +1,14 @@
+{
+    "_comment": "screws_tilt_adjust uses bltouch + samples=3 + sample_retract_dist=2 mm at probe_speed=5 mm/s on a Z stepper with rotation_distance=8, microsteps=16 (200 full steps/rev) -> 0.0025 mm/step.\n\nauto_trigger_after_steps=800 (= 2 mm / 0.0025 mm = retract_dist worth of steps): the bridge's step_trigger drives the bltouch sensor pin to triggered after 800 stepper edges each sample, modeling a physical probe touch after the toolhead has moved `retract_dist` into the bed. Klippy's stepcompress_find_past_position then reports a consistent trig_pos across samples, satisfying samples_tolerance.\n\nbltouch: configures the bridge's BLTouch state machine on the control + sensor pins. The C bridge decodes klippy's PWM commands (pin_up / pin_down / touch_mode / reset / ...) by their high-pulse durations and drives the sensor pin to match (with a brief 50ms self-pulse on touch_mode/pin_down so klippy's verify_state sees 'triggered' then settles back).\n\n`invert` mirrors the `!` flag on the [bltouch] sensor_pin in the .cfg. screws_tilt_adjust.cfg has plain `sensor_pin: PC7` (no `!`), so we set invert=false: RAISED -> pin=0, ARMED -> pin=1.\n\nanalog_in_default keeps the EPCOS 100K thermistors on PK5/PK6 in their min/max range so klippy doesn't shutdown on 'ADC out of range' before the test even starts. 5000 maps to ~80 C - within the [0,250] (extruder) and [0,130] (bed) bounds.",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "auto_trigger_after_steps": 800,
+    "auto_trsync_trigger_ticks": 6400000,
+    "bltouch": {
+        "control_pin": "PC5",
+        "sensor_pin": "PC7",
+        "invert": false
+    },
+    "tick_mode": true
+}

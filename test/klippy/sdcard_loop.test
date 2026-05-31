@@ -1,6 +1,11 @@
 ; Virtual SD card unit tests
 
 DICTIONARY atmega2560.dict
+; NOTE: this test does not opt into the EMULATOR backend.  The big.gcode
+; print SDCARD_PRINT_FILE schedules drives ~750 s of *simulated* time,
+; which under the tick-mode 1:1 sim:wall pace exceeds the runner's
+; EMULATOR_KLIPPY_DEADLINE (180 s wall).  Fileoutput's symbolic backend
+; runs the same gcode in seconds, so the test stays there.
 CONFIG sdcard_loop.cfg
 
 G28

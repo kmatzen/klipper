@@ -1,0 +1,6 @@
+{
+    "_comment": "Drives the full tmc.cfg through the simavr bridge: tmc2130 / tmc2208 / tmc2209 / tmc5160 / tmc2660 / tmc2240. spi_tmc handles the 5-byte SPI variants on the shared register file (with a per-chip 3-byte path auto-emitted for the tmc2660). sw_uart_auto handles the tmc2208 / tmc2209 single-wire UART variants. auto_trsync_trigger_ticks drives the GPIO endstops on stepper_x1 / stepper_z / stepper_z1 AND the sensorless virtual_endstop diag/diag1 pins on stepper_x (tmc2130:PK2) / stepper_y (tmc5160:PK7) / stepper_y1 (tmc2209:PH6) after a short step burst so G28 completes. The TMC register file's MSCNT entry (and tmc2660 MSTEP / sw_uart MSCNT mirror) reads as zero, which lets [endstop_phase] derive a stable phase offset at enable time.",
+    "spi_tmc": true,
+    "auto_trsync_trigger_ticks": 160000,
+    "tick_mode": true
+}

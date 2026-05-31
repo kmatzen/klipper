@@ -1,6 +1,10 @@
-# Tests for the tmc drivers
+# Tests for the tmc drivers. Runs through the simavr bridge
+# (EMULATOR mode) so the SPI variants (tmc2130/5160/2240/2660) and
+# the UART variants (tmc2208/2209) are exercised end-to-end against
+# real klipper firmware.
 CONFIG tmc.cfg
 DICTIONARY atmega2560.dict
+EMULATOR tmc.fixture.json
 
 ; Start by homing the printer.
 G28
