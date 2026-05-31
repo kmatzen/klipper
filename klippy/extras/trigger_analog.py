@@ -47,20 +47,37 @@ GeneratedSOS = {
          1.0, -1.3651172372392975, 0.4775922500725171],
         [1.0, 2.0, 1.0, 1.0, -1.6117270964574348, 0.7445208382054344],
     ],
+    # Bessel lowpass (phase-normalized) - constant group delay, no
+    # step-response overshoot (trade group delay for clean transient).
+    ('lowpass_bessel', 400.0/25.0, 4): [
+        [0.0008592534389077334, 0.0017185068778154669,
+         0.0008592534389077334, 1.0, -1.3828674578370999,
+         0.4840478121263431],
+        [1.0, 2.0, 1.0, 1.0, -1.463675411715695, 0.5995521352071179],
+    ],
 }
 
 # Helper tool to pre-generate SOS filters.  Run with something like:
 #  python -c 'import trigger_analog as m; m.pre_gen_filt("lowpass", 400, 25, 4)'
-def pre_gen_filt(btype, sps, freq, order):
+#  python -c 'import trigger_analog as m; \
+#             m.pre_gen_filt("lowpass", 400, 25, 4, family="bessel")'
+def pre_gen_filt(btype, sps, freq, order, family="butter"):
     global GeneratedSOS
     GeneratedSOS = {}
     # Create filter
     df = DigitalFilter(sps, ImportError)
-    fs = df._butter(freq, btype, order)
+    if family == "butter":
+        fs = df._butter(freq, btype, order)
+        key_btype = btype
+    elif family == "bessel":
+        fs = df._bessel(freq, btype, order)
+        key_btype = btype + "_bessel"
+    else:
+        raise ValueError("Unknown filter family: %s" % (family,))
     # Write filter info to stdout
     msgs = []
     msgs.append("    ('%s', %s/%s, %d): ["
-                % (btype, repr(float(sps)), repr(float(freq)), order))
+                % (key_btype, repr(float(sps)), repr(float(freq)), order))
     for data in fs:
         coeffs = ", ".join([repr(float(c)) for c in data])
         msgs.append("        [%s]," % coeffs,)
@@ -88,6 +105,15 @@ class DigitalFilter:
     def add_lowpass(self, lowpass, lowpass_order):
         f = self._butter(lowpass, "lowpass", lowpass_order)
         self.filter_sections.extend(f)
+    # Bessel: linear phase, no step-response overshoot. Used by the
+    # eddy diff_peak tap detector so its derivative doesn't ring on a
+    # noise-free count stream.
+    def add_lowpass_bessel(self, lowpass, lowpass_order):
+        f = self._bessel(lowpass, "lowpass", lowpass_order)
+        self.filter_sections.extend(f)
+    def add_highpass_bessel(self, highpass, highpass_order):
+        f = self._bessel(highpass, "highpass", highpass_order)
+        self.filter_sections.extend(f)
     def add_notch(self, notch_freq, notch_quality):
         signal = self.get_scipy_signal()
         b, a = signal.iirnotch(notch_freq, Q=notch_quality,
@@ -108,6 +134,16 @@ class DigitalFilter:
         signal = self.get_scipy_signal()
         return signal.butter(order, Wn=frequency, btype=btype,
             fs=self.sample_frequency, output='sos')
+    def _bessel(self, frequency, btype, order):
+        # Phase-normalized Bessel: matches the analog prototype's group delay
+        # at DC, which is what we want for keeping the transient clean.
+        key = (btype + "_bessel",
+               float(self.sample_frequency)/frequency, int(order))
+        if key in GeneratedSOS:
+            return GeneratedSOS[key]
+        signal = self.get_scipy_signal()
+        return signal.bessel(order, Wn=frequency, btype=btype,
+            fs=self.sample_frequency, output='sos', norm='phase')
     def get_filter_sections(self):
         return self.filter_sections
     def get_initial_state(self):
