@@ -448,14 +448,16 @@ class TMCCommandHelper:
             self.fields.set_field("toff", self.toff)
         self._init_registers()
         did_reset = self.echeck_helper.start_checks()
-        if did_reset:
-            self.mcu_phase_offset = None
-        # Calculate phase offset
-        if self.mcu_phase_offset is not None:
+        # On a driver reset, refresh mcu_phase_offset, but don't expose
+        # a transient None to event handlers running on other greenlets
+        # (endstop_phase.handle_home_rails_end raises AttributeError on
+        # None); leave the prior value in place until the final
+        # _handle_sync_mcu_pos() below overwrites it atomically.
+        if not did_reset and self.mcu_phase_offset is not None:
             return
         gcode = self.printer.lookup_object("gcode")
         with gcode.get_mutex():
-            if self.mcu_phase_offset is not None:
+            if not did_reset and self.mcu_phase_offset is not None:
                 return
             logging.info("Pausing toolhead to calculate %s phase offset",
                          self.stepper_name)
