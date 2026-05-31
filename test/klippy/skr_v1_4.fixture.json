@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the BIGTREETECH SKR V1.4 (NXP LPC1768) in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous uart0<->pty byte shuttle); LPC keeps time with generic/armcm_timer.c against the local DWT (lpc176x.repl Miscellaneous.DWT @ 100MHz). The four TMC2208s use single-wire UART (each its own dedicated uart_pin P1.10/P1.9/P1.8/P1.4, rx==tx, all datagram-address 0); renode_hooks.sw_uart broadcasts the framed reply (always master-addressed 0xff) onto every registered RX pin by writing the LPC fast-GPIO FIOPIN bit (the 'LPCn' port sentinel selects that path), so klippy's strictly-sequential per-driver IFCNT-verified register init succeeds against a shared TMC register file. The two 100K thermistors read through the IRQ-driven LPC ADC (test/emulator/repl/lpc176x_adc.cs, which raises ADC_IRQn so klipper's ADC_IRQHandler-collected burst samples complete): analog_in pins them to ~0.93 of full scale (raw 7600 / 8184) so both EPCOS 100K thermistors read ~36 C - inside the extruder [0,260] and bed [0,130] ranges. LPC ADC channels (src/lpc176x/adc.c adc_pins[]): P0.24 = channel 1 (extruder), P0.25 = channel 2 (bed). Values reach the C# ADC through renode_hooks adc_default / adc_set via the FeedSample / SetDefaultValue methods (it is named sysbus.adc, present only on the LPC platform).",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 1},
+        "_bed": {"default_value": 7600, "channel": 2}
+    },
+    "tick_mode": true
+}

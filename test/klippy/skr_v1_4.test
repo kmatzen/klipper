@@ -1,0 +1,93 @@
+# End-to-end EMULATOR test for the BIGTREETECH SKR V1.4 (NXP LPC1768)
+# in DETERMINISTIC TICK MODE. Boots klipper firmware under Renode
+# against the skr-v1.4 pin map, completes klippy identify + clocksync,
+# brings up the full MCU config (4 TMC2208s, 2 software-PWM heaters, a
+# fan, endstops, 2 thermistors), reads the thermistors through the
+# IRQ-driven LPC ADC, round-trips the four TMC2208 register files over
+# their per-driver software UART, and exercises interactive gcode
+# (M114/M105) against real firmware.
+#
+# This is the LPC176x per-printer test, the sibling of skr_pico
+# (RP2040) and skr_mini_e3_v2 (STM32F103). What it adds over those:
+#
+#   - SINGLE-WIRE-PER-DRIVER TMC UART. The four TMC2208s each have their
+#     own dedicated uart_pin (P1.10/P1.9/P1.8/P1.4, rx == tx, no tx_pin,
+#     no multi-drop address) instead of sharing one bus by datagram
+#     address. The responder can't tell from a TMC2208 request which pin
+#     it targets, so renode_hooks.sw_uart broadcasts each framed reply
+#     onto every registered RX pin; klippy initialises and reads the
+#     drivers strictly sequentially from the shared register file, so the
+#     content lines up and per-driver IFCNT write-verify passes. DUMP_TMC
+#     below reads back the live register file for stepper_x (first pin)
+#     and extruder (last pin), proving the per-driver UART read path at
+#     both ends.
+#
+#   - The IRQ-DRIVEN LPC ADC. klipper's src/lpc176x/adc.c collects burst
+#     samples in ADC_IRQHandler, so unlike the polled ADC stubs the other
+#     chips use, nothing completes a thermistor read unless the ADC
+#     interrupt actually fires. test/emulator/repl/lpc176x_adc.cs is a C#
+#     model that raises ADC_IRQn (-> nvic@22) per conversion. With a
+#     broken IRQ path the burst never finishes, klippy never receives an
+#     analog_in_state, and the heaters silently sit at temp=0.0 with no
+#     shutdown - so the "temp=3" assertion below (both EPCOS 100K
+#     thermistors read ~36 C) is the positive proof the IRQ-driven ADC
+#     delivered samples.
+#
+# Two LPC-specific harness pieces this exercises:
+#   - scripts/test_klippy.py emits sw_uart for the LPC "Pn.m" pin names
+#     (the 'LPCn' port sentinel); the STM32/SAM path only handled "PXn"
+#     and RP2040 "gpioN".
+#   - renode_hooks.sw_uart drives the firmware-side RX bit by writing the
+#     LPC fast-GPIO FIOPIN register (0x2009C000 + port*0x20 + 0x14),
+#     because the LPC GPIO is modelled as a plain storeback region.
+#
+# The real SKR V1.4 is USB-CDC / UART0; the firmware here is the generic
+# serial-mode lpc176x build (lpc176x.dict, host link on P0.3/P0.2) and
+# the test exercises the pin map, which is independent of the host link.
+# As with skr_pico / skr_mini_e3_v2, the gated path is motion-free.
+DICTIONARY lpc176x.dict
+CONFIG skr_v1_4.cfg
+EMULATOR skr_v1_4.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode.
+M114
+M105
+# Read back the live TMC register file over the per-driver UART for the
+# first and last drivers. DUMP_TMC reads every register (incl. IOIN)
+# live, so it only produces a full dump if the firmware round-tripped the
+# read datagrams for that driver's pin.
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# klippy connected, loaded the dictionary, and built the full config
+# against real firmware.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+# DUMP_TMC dumped the first and last per-driver pins; the IOIN read
+# returning the TMC version byte (0x21) proves the single-wire UART read
+# path returned framed, CRC-valid responses on each dedicated pin.
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+# Positive proof the IRQ-driven LPC ADC delivered burst samples: both
+# thermistors read ~36 C, so a periodic Stats line carries "temp=36.x".
+# A broken ADC IRQ leaves them at temp=0.0 with no shutdown, which this
+# catches where the no-error assertions below cannot.
+EXPECT_LOG_CONTAINS "temp=3"
+# A broken UART round-trip surfaces as a TMC init failure or a direct
+# read/write error; the deterministic tick clock must produce neither.
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+# A renode-side crash (wrong sysbus peripheral, hook callback error)
+# kills serial; klippy then gets EOF and TMC init / identify time out.
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# With the deterministic clock the config / TMC / ADC path pushes no
+# deadline into the firmware's past, so nothing shuts down.
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

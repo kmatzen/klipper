@@ -1,0 +1,13 @@
+{
+    "_comment": "End-to-end fixture for duet2-maestro on SAM4S8C via renode in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous uart1<->pty byte shuttle), so the SAM4S CYCCNT advances at exactly CONFIG_CLOCK_FREQ (120 MHz, pinned in sam4s8c.repl's dwt.frequency) instead of the wall-clock-bound JIT rate that drifts in free-run (klippy's old 'configured for 120Mhz but running at 80Mhz'). That removes the SAM4S clock drift at the root. analog_in_default sets every ADC channel to mid-range (~25 C cold-thermistor reading); the per-channel overrides give the adc_scaled reference pins distinct values so the (PB0 - PA19) / (PA17 - PA19) ratio doesn't divide by zero. sw_uart is auto-emitted (default sw_uart_auto=true) and routes to the renode 6-arg form because the bridge's backend is renode; renode_hooks.sw_uart attaches CPU PC hooks at tmcuart_read_event etc and bit-drives the response. (No auto_trsync_trigger_ticks: the gated test is motion-free - homing works once the drift is gone but the renode-tick motion path is contention-sensitive on a shared host; see duet2_maestro.test.)",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_vref": {"default_value": 8000, "channel": 0},
+        "_vssa": {"default_value": 100, "channel": 2},
+        "_bed": {"default_value": 5000, "channel": 3},
+        "_hot_extruder_0": {"default_value": 1200, "channel": 4}
+    },
+    "tick_mode": true
+}

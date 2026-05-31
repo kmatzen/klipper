@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the synthetic SAMD21G18 printer via renode in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous sercom0<->pty byte shuttle). SAMD21 is a Cortex-M0+ with no DWT; it keeps time with the Timers.SAMD21_Timer (TC4) model, a virtual-time peripheral that tracks simulated time directly (like the RP2040 timer skr_pico uses) so it needs no frequency pin. sw_uart is auto-emitted; the four TMC2209s are multi-drop on PA6/PA7 (uart_address 0..3), and renode_hooks.sw_uart drives the firmware RX bit through the SAMD21 PORT model (gpio_a.OnGPIO) - one shared state + register file serves all four addresses because klippy initialises drivers sequentially. The two EPCOS 100K thermistors read through the SAMD21 ADC (0x42004000), served by test/emulator/samd21_adc_stub.py: analog_in pins each channel to raw 7600 / 8184 (~0.93 of full scale) so both read ~36 C - inside the extruder [0,250] and bed [0,130] ranges. SAMD21 ADC channels (src/atsamd/adc.c adc_pins[], CONFIG_MACH_SAMD21): PA4 = channel 4 (extruder), PA5 = channel 5 (bed). Values reach the stub through renode_hooks adc_set, which pokes magic offsets 0x104+ch*4; the stub returns RESULT for whichever channel INPUTCTRL.MUXPOS last selected.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 4},
+        "_bed": {"default_value": 7600, "channel": 5}
+    },
+    "tick_mode": true
+}

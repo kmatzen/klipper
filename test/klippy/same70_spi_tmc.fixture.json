@@ -1,0 +1,5 @@
+{
+    "_comment": "Enables the renode_hooks TMC SPI chain responder (spi_tmc) for the SAME70 TMC5160 probe, in deterministic tick mode (free-run SAME70 clocksync drifts badly under a multi-SPI config and drops the connection mid-init). The responder hooks spidev_transfer, reads MOSI from the firmware buffer, synthesises the chain MISO response, and PC-skips the real hardware transfer.",
+    "spi_tmc": true,
+    "tick_mode": true
+}

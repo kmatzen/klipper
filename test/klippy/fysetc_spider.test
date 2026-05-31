@@ -1,0 +1,80 @@
+# End-to-end EMULATOR test for the FYSETC Spider (STM32F446) in
+# DETERMINISTIC TICK MODE. Boots klipper firmware under Renode against
+# the FYSETC Spider pin map, completes klippy identify + clocksync,
+# brings up the full MCU config (4 TMC2208s on dedicated single-wire UART
+# pins, software-PWM heaters, fan, endstops, 2 thermistors), reads the
+# thermistors through ADC1, round-trips the four TMC2208 register files
+# over their software UARTs, and exercises interactive gcode (M114/M105)
+# against real firmware.
+#
+# This is the STM32F4 per-printer test. The TMC2208 single-wire-per-
+# driver UART path is shared with skr_v1_4.test (LPC176x): each driver
+# has its own uart_pin (PE7/PE15/PD10/PD7), rx==tx, no datagram address,
+# so renode_hooks.sw_uart registers one state per pin and broadcasts the
+# framed (always master-addressed) reply onto every registered RX pin;
+# klippy initialises and reads the drivers sequentially against a shared
+# register file, so the reply is correct for whichever driver is live.
+# Here that broadcast drives the STM32 gpioPortE / gpioPortD inputs via
+# OnGPIO (the LPC test drives the LPC FIOPIN region instead). The new
+# ADC ground vs the F1 sibling is only the chip: F4 shares src/stm32/adc.c
+# and the SR/CR2/SQR3/DR register slice with F1, so the SAME stub
+# (test/emulator/stm32_adc_stub.py) serves it - the one difference, the
+# ADC_CR2 SWSTART bit position (bit22 F1 / bit30 F4), is absorbed inside
+# the stub. Thermistors are on ADC1 channel 10 (PC0, extruder) and
+# channel 13 (PC3, bed), read end to end by M105.
+#
+# As with the other per-printer tests, the gated path is MOTION-FREE:
+# tick mode resolves the renode wall-clock-vs-virtual-time drift, but
+# motion commands (homing) are delivered by klippy's wall-clock-paced
+# serialqueue background thread, which under shared-host CPU contention
+# can deliver a tightly-scheduled stepper command late and trip "Timer
+# too close". The boot / config / TMC-init / ADC / DUMP_TMC / M114 / M105
+# path schedules no such tight-lead commands and is deterministically
+# green. The firmware is the generic serial-mode stm32f446 build
+# (stm32f446.dict); the real board is USB-only but the STM32F4 Renode
+# platform models no USB device, and the printer pin map this test
+# exercises is independent of the host link.
+DICTIONARY stm32f446.dict
+CONFIG fysetc_spider.cfg
+EMULATOR fysetc_spider.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+# Interactive gcode round-trip against real firmware in tick mode.
+# M114 reports toolhead position; M105 reports temperatures, reading both
+# thermistors through ADC1 end to end. Neither drives a stepper.
+M114
+M105
+# Read back the live TMC register file over two different single-wire
+# UARTs (stepper_x on PE7, extruder on PD7). DUMP_TMC reads every
+# register (incl. IOIN) live, so it only produces a full dump if the
+# firmware round-tripped the read datagrams for that driver's pin.
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+# klippy connected, loaded the dictionary, and built the full config
+# against real firmware.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+# DUMP_TMC dumped two different drivers on two different pins; the IOIN
+# read returning the version byte (0x21) proves the per-driver UART read
+# path returned framed, CRC-valid responses.
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+# A broken UART round-trip surfaces as a TMC init failure or a direct
+# read/write error; the deterministic tick clock must produce neither.
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+# A renode-side crash (wrong sysbus peripheral, hook callback error)
+# kills serial; klippy then gets EOF and TMC init / identify time out.
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+# With the deterministic clock the config / TMC / ADC path pushes no
+# deadline into the firmware's past, so nothing shuts down. A broken ADC
+# stub would surface as a flat-zero / out-of-range thermistor read.
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

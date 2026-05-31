@@ -1,0 +1,12 @@
+{
+    "_comment": "End-to-end fixture for the UltiMachine Archim2 (Atmel SAM3X8E) via renode in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous uart<->pty byte shuttle), so the SAM3X DWT->CYCCNT clock advances at exactly CONFIG_CLOCK_FREQ (84 MHz, pinned in sam3x8e.repl) instead of the wall-clock-bound JIT rate that drifts in free-run. The four TMC2130s are read over SOFTWARE SPI; spi_tmc switches renode_hooks into the TMC SPI chain responder (PC-hook on spidev_transfer, the single hw+sw SPI chokepoint), which synthesises 5-byte datagram responses from a shared register file - IOIN reads back version=0x30, proving the SPI read path round-tripped. The two thermistors read through the SAM3X ADC (0x400C0000), served by test/emulator/sam4s_adc_stub.py (src/atsam/adc.c is shared SAM3X/SAM4S, register-identical): analog_in pins each channel to raw 7600 / 8184 (~0.93 of full scale) so the hotend (ATC Semitec 104GT-2, channel index 12 = PB19) and bed (EPCOS 100K, channel index 13 = PB20) both read ~36 C. Values reach the stub through renode_hooks adc_set, which pokes magic offsets 0x104+ch*4 (per channel); the stub returns LCDR for whichever channel CHER/CR_START last selected.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_hotend": {"default_value": 7600, "channel": 12},
+        "_bed": {"default_value": 7600, "channel": 13}
+    },
+    "spi_tmc": true,
+    "tick_mode": true
+}
