@@ -1,0 +1,54 @@
+# Nightly byte-identical determinism proof for the MCU emulator's
+# deterministic tick-mode protocol. Builds the emulator-test Docker
+# image and runs test/emulator/proof.sh against the validated tick-mode
+# regression traces (currently temperature.test; load_cell.test joins
+# the proof set once it re-gates per the PR8 known limitation).
+#
+# Proof: run the test N=3 times under KLIPPY_TICK_TRACE; every
+# klippy-side R-trace and bridge-side B-trace must hash identical across
+# runs, independent of host scheduling. See
+# test/emulator/TICK_PROTOCOL_DESIGN.md §5.2.
+#
+# Runs nightly + on push to the emulator-test branches + via manual
+# dispatch. The build-test job (.github/workflows/build-test.yaml)
+# remains the per-PR gate; this workflow guards the tick-mode
+# determinism path against silent regression at a coarser cadence
+# because building the emulator image is heavier than a stock CI cycle.
+name: Tick-mode determinism proof
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # nightly 07:00 UTC
+  workflow_dispatch:
+  push:
+    branches:
+      - add-mcu-emulator-test-infra
+    paths:
+      - 'klippy/reactor.py'
+      - 'klippy/serialhdl.py'
+      - 'klippy/chelper/serialqueue.c'
+      - 'klippy/chelper/serialqueue.h'
+      - 'klippy/chelper/pollreactor.c'
+      - 'klippy/chelper/pyhelper.c'
+      - 'test/emulator/simavr_bridge.c'
+      - 'test/emulator/renode_launcher.py'
+      - 'test/emulator/proof.sh'
+      - 'scripts/Dockerfile.emulator-test'
+
+jobs:
+  proof:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build emulator-test image
+        run: |
+          docker build \
+              -t klipper-emu \
+              -f scripts/Dockerfile.emulator-test .
+
+      - name: Proof - temperature.test (N=3)
+        run: |
+          docker run --rm klipper-emu \
+              bash test/emulator/proof.sh temperature 3
