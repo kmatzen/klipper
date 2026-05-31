@@ -34,9 +34,22 @@ DECL_ENUMERATION_RANGE("pin", "gpio1_0", GPIO(1, 0), 32);
 DECL_ENUMERATION_RANGE("pin", "gpio2_0", GPIO(2, 0), 32);
 DECL_ENUMERATION_RANGE("pin", "gpio3_0", GPIO(3, 0), 32);
 
+#ifdef CONFIG_PRU_HOST_BUILD
+// Host build replaces the four AM335x GPIO MMIO blocks with plain
+// host-process backing storage so firmware writes/reads land in
+// regular memory instead of faulting on a hardware address. struct
+// gpio_regs is file-static, so the storage has to live in this
+// translation unit too.
+static struct gpio_regs _host_gpio_banks[4];
+static struct gpio_regs *digital_regs[] = {
+    &_host_gpio_banks[0], &_host_gpio_banks[1],
+    &_host_gpio_banks[2], &_host_gpio_banks[3]
+};
+#else
 static struct gpio_regs *digital_regs[] = {
     (void*)0x44e07000, (void*)0x4804c000, (void*)0x481ac000, (void*)0x481ae000
 };
+#endif
 
 
 /****************************************************************
