@@ -112,6 +112,13 @@ class ClockSync:
             self.clock_covariance + diff_sent_time * diff_clock * DECAY)
         # Update prediction from linear regression
         new_freq = self.clock_covariance / self.time_variance
+        if new_freq <= 0.:
+            # Discard transient non-positive slope estimates (cannot
+            # occur on a real link; observed under emulator connect-time
+            # jitter, and would otherwise OverflowError in the unsigned
+            # C set_clock_est). The next clock message produces a sane
+            # slope from the accumulators updated above.
+            return
         pred_stddev = math.sqrt(self.prediction_variance)
         self.serial.set_clock_est(new_freq, self.time_avg + TRANSMIT_EXTRA,
                                   int(self.clock_avg - 3. * pred_stddev))
