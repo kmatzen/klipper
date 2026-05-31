@@ -145,9 +145,14 @@ command_config_ds18b20(uint32_t *args)
     uint8_t *serial = command_decode_ptr(args[2]);
     if (memchr(serial, '/', serial_len))
         goto fail1;
-    char fname[56];
-    snprintf(fname, sizeof(fname), "/sys/bus/w1/devices/%.*s/w1_slave"
-             , serial_len, serial);
+    // Path prefix is overridable so emulator-mode tests can populate
+    // a tempdir w1_slave mock without needing /sys to be writable.
+    const char *prefix = getenv("KLIPPER_W1_DEVICES_PATH");
+    if (!prefix)
+        prefix = "/sys/bus/w1/devices";
+    char fname[256];
+    snprintf(fname, sizeof(fname), "%s/%.*s/w1_slave"
+             , prefix, serial_len, serial);
     int fd = open(fname, O_RDONLY|O_CLOEXEC);
     if (fd < 0) {
         report_errno("open ds18", fd);
