@@ -1,0 +1,85 @@
+// Renode platform description for ATSAMD21G18 (Cortex-M0+).
+//
+// Renode upstream ships platforms/cpus/atsamd21j17d-aft.repl with the
+// useful peripheral models for this family (SAMD21_Timer, SAMD5_UART,
+// SAMD21_GPIO) but it is not directly usable for klipper SAMD21:
+//
+//   1. Memory layout matches the J17 variant (128 KB flash); klipper
+//      SAMD21G18 builds expect 256 KB flash / 32 KB SRAM.
+//   2. GCLK is exposed as `Memory.ArrayMemory @ 0x40000C00 size 0x20`
+//      - plain RAM. klipper SystemInit writes GCLK_CTRL_SWRST and
+//      then `while (GCLK->CTRL.reg & GCLK_CTRL_SWRST)`. Plain memory
+//      reads back the bit forever, so the firmware spins.
+//   3. The SYSCTRL block is exposed via Tag/Memory regions only - the
+//      0xFFFF override at PCLKSR (0x4000080C) is enough for the DFLL
+//      open-loop path, but DPLLSTATUS at 0x40000850 has no override
+//      so X32K-reference clock setups would spin on
+//      `while ((DPLLSTATUS & (LOCK|CLKRDY)) != (LOCK|CLKRDY))`.
+//
+// We therefore stand the platform up from scratch so the choices stay
+// explicit. GCLK / SYSCTRL / PM / NVMCTRL / WDT stubs are runtime-
+// injected by renode_launcher.py (Python.PythonPeripheral instances
+// backed by samd21_*_stub.py / samd_storeback.py) - same pattern
+// SAMD51 uses for its OSCCTRL / GCLK / OSC32KCTRL / MCLK / CMCC stubs.
+//
+// IRQ 9  = SERCOM0_IRQn   (klipper installs SERCOM0_Handler here in
+//                          src/atsamd/serial.c when CONFIG_MACH_SAMD21).
+// IRQ 19 = TC4_IRQn       (klipper's src/atsamd/timer.c installs
+//                          TC4_Handler here for the 32-bit chained
+//                          TC3+TC4 free-running timer).
+//
+// SAMD21 Cortex-M0+ does not have a DWT (the M0+ optional DWT
+// excludes the cycle counter), so unlike SAMD51 we do not declare a
+// `dwt:` block - klipper's atsamd timer path goes through TC4
+// directly rather than generic/armcm_timer.c.
+
+cpu0: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0+"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu0@0
+    systickFrequency: 48000000
+
+flash0: Memory.MappedMemory @ sysbus 0x0
+    size: 0x40000
+
+sram0: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x8000
+
+// NVMCTRL auxiliary flash rows. klipper's clock_init_internal does
+// GET_FUSE(FUSES_DFLL48M_COARSE_CAL) / GET_FUSE(FUSES_DFLL48M_FINE_CAL)
+// which dereference NVMCTRL_OTP4 + 4 / + 8 (= 0x00806024 / 0x00806028).
+// Reads return 0 on un-programmed memory; klipper uses the cal value
+// only as the initial DFLLVAL load and the DFLL ready-bit synthesis
+// in the SYSCTRL stub completes the init regardless. The USER row
+// (BOD33 / wait-state cal) at 0x00804000 is not read by klipper
+// SAMD21 firmware in serial mode but is mapped for safety so any
+// future fuse access lands on a real region rather than triggering
+// an unmapped-sysbus warning.
+nvm_user: Memory.MappedMemory @ sysbus 0x00804000
+    size: 0x400
+
+nvm_otp: Memory.MappedMemory @ sysbus 0x00806000
+    size: 0x400
+
+// SERCOM0 USART - klipper host link on PA10/PA11 (TXPO=1, RXPO=3).
+// SAMD5_UART is the same model SAMD51 uses; the SERCOM register
+// layout is identical between SAMX2 and SAMX5 so it works for both.
+sercom0: UART.SAMD5_UART @ sysbus 0x42000800
+    ->nvic@9
+
+// TC4 32-bit timer (TC3+TC4 chained). klipper's timer_init writes
+// CTRLA.MODE_COUNT32 then enables; reads COUNT for free-running time
+// and writes CC[0] for the next deadline. Renode's SAMD21_Timer
+// model implements 32-bit chain mode internally.
+tc4: Timers.SAMD21_Timer @ sysbus 0x42003000
+    baseFrequency: 48000000
+    IRQ -> nvic@19
+
+// PORT (gpio). klipper writes per-pin PMUX / PINCFG / OUTSET / OUTCLR
+// during gpio_peripheral and gpio_out_setup; SAMD21_GPIO models
+// the port group register set used by these accesses.
+gpio_a: GPIOPort.SAMD21_GPIO @ sysbus 0x41004400
+
+gpio_b: GPIOPort.SAMD21_GPIO @ sysbus 0x41004480

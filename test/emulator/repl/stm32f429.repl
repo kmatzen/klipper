@@ -1,0 +1,12 @@
+// Local override of upstream stm32f429.repl - adds the same ADCs
+// that test/emulator/repl/stm32f4.repl adds for the rest of the F4
+// family. Upstream stm32f429.repl extends stm32f4.repl with LTDC
+// (display controller) and an external memory bank, neither of which
+// klipper's tests exercise; the only F4-wide gap that matters here
+// is the missing analog stack, which we add the same way as for the
+// rest of the F4 chips.
+using "platforms/cpus/stm32f429.repl"
+
+adc1: Analog.STM32_ADC @ sysbus 0x40012000
+adc2: Analog.STM32_ADC @ sysbus 0x40012100
+adc3: Analog.STM32_ADC @ sysbus 0x40012200

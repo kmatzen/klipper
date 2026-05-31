@@ -1,0 +1,36 @@
+# SAME70Q20B USB-CDC boot/connect smoke test in DETERMINISTIC TICK MODE
+# (the tick-lockstep sibling of same70_usb_smoke, which runs free-run).
+# Boots the CONFIG_ATSAM_USB firmware variant under Renode against the
+# local USBHS peripheral (test/emulator/repl/same70_usbhs.cs), completes
+# klippy identify + clocksync + config over the synthetic BULK_IN/BULK_OUT
+# pipe Renode exposes as a pty (UARTBase) - but with the host<->mcu link
+# riding tick lockstep through identify rather than free-running.
+#
+# Why this is now possible: in tick mode klippy's reactor advances
+# simulated time one quantum per host<->mcu round trip. The renode launcher
+# RunFor's exactly that quantum. Until now the renode pty did not register
+# the serialqueue_need_prompt predicate (only the simavr AF_UNIX socket
+# did), so the reactor advanced a full QMAX (100 ms) per round trip and a
+# ~250-chunk identify dictionary scan cost ~25 s of simulated time - orders
+# of magnitude longer than real hardware, with the connect window unable to
+# close. klippy/serialhdl.py now registers need_prompt for every tick MCU,
+# so identify/clock-sync round trips advance at the small QWAIT (8 ms)
+# quantum and the dictionary scan completes promptly. need_prompt only
+# gates the quantum; the renode receive still rides its background thread.
+DICTIONARY same70q20b-usb.dict
+CONFIG same70_usb_smoke.cfg
+EMULATOR same70_usb_tick.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+M105
+
+# klippy connected and stayed connected through identify + clocksync +
+# config under tick lockstep over the synthetic USBHS bulk endpoints.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,24 @@
+# LPC176x boot/connect smoke test. The local lpc176x.repl is the only
+# path - Renode upstream has no LPC176x platform and no LPC176x-
+# specific peripheral models (lpc2294.repl is the older ARM7 LPC2000
+# series and is unrelated). The repl pairs an upstream NS16550
+# (wideRegisters: true matches the 32-bit-spaced LPC UART register
+# layout) with the local LPC_SC stub - that stub is the chip-specific
+# path that this test exercises end-to-end. printers.test reaches
+# lpc176x via smoothieboard / btt-skr-1.x boards at config-parse
+# depth; this is the firmware-boot regression target.
+DICTIONARY lpc176x.dict
+CONFIG lpc176x_smoke.cfg
+EMULATOR lpc176x_smoke.fixture.json
+
+# A few harmless gcode lines so klippy gets past klippy:ready.
+M114
+M105
+M105
+M105
+
+# klippy connected and stayed connected long enough to do the
+# clocksync handshake against the firmware's generic/armcm_timer view.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,23 @@
+# SAMD21 boot/connect smoke test. Klipper SAMD21 firmware does not
+# share generic/armcm_timer.c with the rest of the renode-backed
+# Cortex-M ports - it drives a real TC3+TC4 32-bit chained timer
+# (src/atsamd/timer.c). This test exercises that path end-to-end:
+# SystemInit clock setup against the GCLK/SYSCTRL stubs, TC4 timer
+# boot, SERCOM0 host link on PA10/PA11. There is no SAMD21-based
+# printer config in config/, so this is the only place SAMD21G18
+# is wired through the test runner today.
+DICTIONARY samd21g18.dict
+CONFIG samd21_smoke.cfg
+EMULATOR samd21_smoke.fixture.json
+
+# A few harmless gcode lines so klippy gets past klippy:ready.
+M114
+M105
+M105
+M105
+
+# klippy connected and stayed connected long enough to do the
+# clocksync handshake against the TC4-driven firmware clock.
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,3 @@
+{
+    "_comment": "Minimal fixture for the STM32H7 boot/connect smoke test. No analog_in / i2c / step_trigger entries - the test just verifies that the firmware boots through SystemInit (the stm32h7_pwr_stub.py supplies PWR->CSR1.ACTVOSRDY / D3CR.VOSRDY; upstream Miscellaneous.STM32H7_RCC handles HSE/PLL; the local stm32h723.repl adds the DWT and pins SysTick to 520MHz so armcm_timer's SysTick IRQ source matches its DWT time base), the system clock advances, and klippy completes its identify + clocksync handshake over the USART1 pty Renode exposes. Free-run (no tick_mode): with the DWT and SysTick both pinned to CONFIG_CLOCK_FREQ there is no timer-rate mismatch, so clocksync converges without the 'Rescheduled timer in the past' shutdown. Uses the stm32h723 build."
+}

@@ -1,0 +1,30 @@
+# Renode deterministic tick-mode regression (ARM / Cortex-M).
+#
+# Deterministic-time lockstep variant of stm32f103_smoke: the fixture
+# sets tick_mode, so klippy's reactor advances simulated time only via
+# `advance T` round-trips over the launcher's tick socket, and the
+# launcher drives Renode with `emulation RunFor` + a synchronous
+# USART1<->pty byte shuttle (renode_hooks.serial_write_hex / RunFor /
+# serial_drain_hex). This removes the wall-clock-vs-virtual-time drift
+# the free-running (non-tick) Renode path suffers from.
+#
+# This used to mis-frame identify ("Unknown message -16"): the launcher's
+# monitor round-trips were delimited by matching Renode's `(<context>)`
+# prompt, which an echoed command containing a parenthesised identifier
+# could satisfy mid-chunk, desyncing every subsequent round-trip and
+# corrupting the byte shuttle. The sentinel-delimited _send_monitor
+# (renode_launcher.py) fixed that, and single-MCU ARM tick mode now
+# passes reliably on a clean host. (Multi-renode tick lockstep is still
+# flaky under host contention; the simavr/AVR tick path still needs a
+# synchronous shuttle - see emulator_tick_mode.test.)
+DICTIONARY stm32f103.dict
+CONFIG stm32f103_smoke.cfg
+EMULATOR stm32f103_tick.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
