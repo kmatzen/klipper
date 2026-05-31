@@ -1,0 +1,3 @@
+{
+    "_comment": "Minimal fixture for the PRU host-emulation boot/connect smoke test. No analog_in / i2c / step_trigger entries - the test just verifies that the firmware boots through main(), the host IEP timer thread fires IEP_EVENT once timer_init programs CMP0, and klippy completes its identify + clocksync handshake over the pty src/pru/host_pru.c opens. linuxpru.dict is routed through the linuxprocess backend (no control socket); peripheral state plumbing happens via the host_pru.c globals rather than a fixture-pushed bridge command stream."
+}

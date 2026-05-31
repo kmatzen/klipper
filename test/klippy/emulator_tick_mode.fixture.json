@@ -1,0 +1,16 @@
+{
+    "_comment": "Tick-mode counterpart of emulator_smoke.fixture.json. tick_mode: true tells the runner to allocate a tick socket, pass --tick-socket to the bridge, and export KLIPPY_TICK_SOCKET so the reactor connects on startup; the bridge then only advances simavr in response to klippy's `advance T` lines. Implies sim_time. Same SHT3X i2c reads as the parallel-mode smoke test so the sensor decode path is exercised under deterministic timing.",
+    "tick_mode": true,
+    "i2c": {
+        "sht3x": {
+            "reads": [
+                [0, 16, 194],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162],
+                [102, 102, 147, 128, 0, 162]
+            ]
+        }
+    }
+}

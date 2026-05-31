@@ -1,0 +1,18 @@
+# The emulator-test image (scripts/Dockerfile.emulator-test) rebuilds
+# every firmware .dict/.elf and the simavr bridge from source, so none
+# of these need to enter the build context. Keeping them out makes the
+# `docker build` context transfer fast and stops stale host artifacts
+# from being COPYed into /klipper.
+.git
+out
+ci_build
+.claude
+.run_logs
+**/__pycache__
+*.pyc
+# Built C-helper library: chelper.get_ffi() compiles it in-container. A
+# host-built copy (e.g. an arm64 .so rsynced onto an x86_64 build host)
+# would be COPYed in, look "up to date" by mtime, and make get_ffi() skip
+# the rebuild then fail to dlopen the wrong-arch binary.
+*.so
+_test_*

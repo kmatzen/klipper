@@ -1,0 +1,385 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    gcc make libffi-dev build-essential \
+    gcc-avr avr-libc \
+    gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi \
+    git libelf-dev pkg-config curl ca-certificates \
+    libicu70 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Renode for the STM32 backend. We use the portable .NET self-
+# contained tarball (not the .deb) so the same Dockerfile builds on
+# both linux/amd64 and linux/arm64 hosts - the .deb is amd64-only
+# and pulls in Mono, while the portable-dotnet bundle ships a
+# self-contained .NET 6 runtime and exists for both architectures
+# starting with Renode 1.16. Pinned to a specific release so
+# peripheral model drift doesn't silently break tests between
+# rebuilds; bump the version when a new Renode release is validated
+# to still pass the suite. Buildkit injects TARGETARCH automatically.
+ARG TARGETARCH
+ARG RENODE_VERSION=1.16.1
+RUN case "${TARGETARCH}" in \
+        amd64) renode_arch_suffix="linux-portable-dotnet" ;; \
+        arm64) renode_arch_suffix="linux-arm64-portable-dotnet" ;; \
+        *) echo "renode: no portable-dotnet build for arch ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -L -o /tmp/renode.tar.gz \
+        "https://github.com/renode/renode/releases/download/v${RENODE_VERSION}/renode-${RENODE_VERSION}.${renode_arch_suffix}.tar.gz" \
+    && mkdir -p /opt/renode \
+    && tar -xzf /tmp/renode.tar.gz -C /opt/renode --strip-components=1 \
+    && rm /tmp/renode.tar.gz \
+    && ln -s /opt/renode/renode /usr/local/bin/renode \
+    && /usr/local/bin/renode --version 2>&1 | head -3
+
+# Build simavr from upstream rather than using Ubuntu's 1.6 package.
+# The packaged version has a known issue dispatching interrupts across
+# the `sei; nop; cli` pattern that klipper's irq_wait() relies on -
+# IRQs get raised but the I-flag-pending dispatch never happens, so
+# klipper firmware spins in run_tasks waiting for SchedStatus to flip.
+# Upstream master fixed this; we also need uart_pty from
+# examples/parts which the install target doesn't ship.
+COPY scripts/simavr-fixes.patch /tmp/simavr-fixes.patch
+RUN git clone --depth 1 \
+        https://github.com/buserror/simavr.git /tmp/simavr \
+    && cd /tmp/simavr \
+    && patch -p1 < /tmp/simavr-fixes.patch \
+    && make build-simavr install RELEASE=1 DESTDIR=/usr/local 2>&1 | tail -5 \
+    && mkdir -p /usr/local/include/simavr/parts \
+    && cp examples/parts/uart_pty.h /usr/local/include/simavr/parts/ \
+    && cp examples/parts/uart_pty.c /usr/local/include/simavr/parts/ \
+    && rm -rf /tmp/simavr /tmp/simavr-fixes.patch \
+    && ldconfig
+
+WORKDIR /klipper
+COPY . /klipper
+
+RUN rm -rf out .config .config.old \
+        klippy/__pycache__ klippy/extras/__pycache__ \
+        klippy/kinematics/__pycache__ klippy/chelper/__pycache__ \
+        test/emulator/__pycache__ test/__pycache__ \
+    || true
+
+RUN python3 -m venv /venv \
+    && /venv/bin/pip install --no-cache-dir \
+        greenlet cffi Jinja2 markupsafe pyserial python-can msgspec \
+        numpy scipy
+
+# Build .dict and .elf files for every AVR config the test harness
+# might reference. The .elf is what the simavr-based bridge will run
+# (cycle-accurate firmware execution), the .dict is what klippy uses
+# to interpret the protocol.
+RUN mkdir -p ci_build/dict ci_build/elf \
+    && for cfg in atmega2560 atmega1280 atmega1284p atmega644p \
+                  at90usb1286; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
+# Also build linuxprocess - this is a host-arch binary (gcc, not
+# avr-gcc) that runs the firmware in-process. test_klippy.py's
+# linuxprocess backend spawns it directly with -I <slave-link>; the
+# binary opens a pty and symlinks the slave end to that path so klippy
+# connects to it as if it were a real serial device. Used by
+# linuxtest.test (DS18B20) and any future host-MCU coverage.
+RUN make distclean V=1 || true \
+    && cp test/configs/linuxprocess.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/linuxprocess.dict \
+    && cp out/klipper.elf ci_build/elf/linuxprocess.elf
+
+# linuxpru: src/pru/ compiled against host gcc instead of pru-cgt.
+# pru-specific intrinsics, the IEP timer, the PRU INTC, and the
+# four AM335x GPIO MMIO blocks are stubbed by src/pru/host_pru.c +
+# src/pru/host_inc/, and the pru0 rpmsg shuttle is replaced by a
+# pty-based console bridge. The resulting host-arch klipper.elf is
+# dispatched through the linuxprocess backend in test_klippy.py
+# (linuxpru.dict matches the linuxprocess shape: binary spawned
+# with -I <slave-link>, opens its own pty, no control socket). PRU
+# is the only chip family in scope for which Renode has no upstream
+# CPU model - the host build is the only path to end-to-end
+# coverage on PRU firmware.
+RUN make distclean V=1 || true \
+    && cp test/configs/linuxpru.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/linuxpru.dict \
+    && cp out/klipper.elf ci_build/elf/linuxpru.elf
+
+# STM32 firmware builds for the renode backend. Each chip's
+# -serial.config selects MACH_STM32{chip} + STM32_SERIAL_USART1; klippy
+# then talks to the firmware over the USART1 pty Renode exposes
+# (Renode does not model STM32 USB-OTG well enough for klipper's CDC
+# stack). printers.test references stm32f103.dict and
+# stm32f103-serial.dict separately, so we publish the F1 build under
+# both names; all other chips use one canonical basename.
+RUN for cfg in stm32f070 stm32f401 stm32f405 stm32f407 stm32f429 \
+               stm32f446 stm32g0b1 stm32h723 stm32h743; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}-serial.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done \
+    && make distclean V=1 || true \
+    && cp test/configs/stm32f103-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/stm32f103.dict \
+    && cp out/klipper.elf ci_build/elf/stm32f103.elf \
+    && cp out/klipper.dict ci_build/dict/stm32f103-serial.dict \
+    && cp out/klipper.elf ci_build/elf/stm32f103-serial.elf
+
+# Atmel SAM firmware builds for the renode backend. Each -serial.config
+# selects ATSAM_SERIAL / ATSAMD_SERIAL so klippy talks to the
+# chip-specific UART (single unnumbered UART on SAM3X, UART1 on
+# SAM4S, UART0 on SAM4E, UART2 on SAME70 - see src/atsam/serial.c;
+# SERCOM0 PA10/PA11 on SAMD21 / SAMD51 - see src/atsamd/serial.c)
+# over a pty exposed by Renode. Scope is limited to chips Renode
+# either ships an upstream platform for (SAM4S, SAME70) or for which
+# we carry a local platform plus Python.PythonPeripheral stubs (SAM3X
+# - test/emulator/repl/sam3x8e.repl, SAM4E -
+# test/emulator/repl/sam4e8e.repl, SAMD21 -
+# test/emulator/repl/samd21g18.repl, SAMD51 -
+# test/emulator/repl/samd51p20.repl).
+RUN for cfg in sam3x8c sam3x8e sam4s8c sam4e8e same70q20b samd21g18 samd51p20; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}-serial.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
+# SAME70 USB-CDC firmware build for the renode backend. The duet3-6hc
+# / duet3-6xd printer configs are USB+CAN-only on real hardware (no
+# serial-mode firmware variant exists), so we build CONFIG_ATSAM_USB
+# alongside the serial-mode ${cfg}.dict above. The companion Renode
+# peripheral (test/emulator/repl/same70_usbhs.cs) uses a "skip-enum
+# cheat" - inject a SET_CONFIGURATION SETUP packet on EP0 so klipper's
+# CDC stack reaches bulk-active without needing a full USB host
+# emulation, then exposes BULK_IN/BULK_OUT as a UART pipe to the host
+# pty via UARTBase. Routing in test_klippy.py keys off the dict
+# basename (`same70q20b-usb` -> renode backend, `same70q20b-usb`
+# chip key in renode_launcher's _PLATFORM_FOR_CHIP / _HOST_LINK_FOR_CHIP
+# / _CSHARP_INCLUDES_FOR_CHIP). Validated by same70_usb_smoke.test.
+RUN make distclean V=1 || true \
+    && cp test/configs/same70q20b-usb.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/same70q20b-usb.dict \
+    && cp out/klipper.elf ci_build/elf/same70q20b-usb.elf
+
+# NXP LPC176x firmware build for the renode backend. -serial.config
+# selects LPC_SERIAL_UART0 (P0.3/P0.2) so klippy talks to the
+# classic 16550-style UART0 (NS16550 with wideRegisters: true in
+# test/emulator/repl/lpc176x.repl). The LPC_SC clock controller
+# stub at 0x400FC000 (test/emulator/lpc_sc_stub.py) is runtime-
+# injected by renode_launcher.py - same path SAMD51 clock stubs
+# follow.
+RUN make distclean V=1 || true \
+    && cp test/configs/lpc176x-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/lpc176x.dict \
+    && cp out/klipper.elf ci_build/elf/lpc176x.elf
+
+# HDSC HC32F460 firmware builds for the renode backend. printers.test
+# references two dict basenames (one per host-link pin pair):
+# hc32f460-serial-PA3PA2 (anycubic-kobra-go-2022,
+# anycubic-kobra-plus-2022) and hc32f460-serial-PA7PA8
+# (creality-ender2pro-hc32-2022). Both pin combinations use USART1
+# in the firmware; the .repl wires UART.HC32F460_USART (loaded as
+# C# via `i @hc32f460_uart.cs` by renode_launcher.py) at 0x4001D000
+# with named IRQs to nvic@0/1/2/3 matching the hardcoded
+# IrqRegistration mapping in src/hc32f460/serial.c. INTC/PORT/PWC/
+# SYSREG/EFM/AOS regions are storeback stubs (renode_launcher.py
+# _EXTRA_PERIPHERAL_STUBS_FOR_CHIP['hc32f460']) since none gate
+# firmware boot progress on a status-bit poll.
+RUN for cfg in hc32f460-serial-PA3PA2 hc32f460-serial-PA7PA8; do \
+        make distclean V=1 || true; \
+        cp test/configs/${cfg}.config .config && \
+        make olddefconfig && \
+        make && \
+        cp out/klipper.dict ci_build/dict/${cfg}.dict && \
+        cp out/klipper.elf ci_build/elf/${cfg}.elf; \
+    done
+
+# Raspberry Pi RP2040 firmware build for the renode backend. -serial.config
+# selects RPXXXX_SERIAL_UART0_PINS_0_1 + RPXXXX_FLASH_START_4000 so klippy
+# talks to the chip's PL011 UART0 at 0x40034000 (UART.PL011 in
+# test/emulator/repl/rp2040.repl) and the ELF's reset vector lands
+# directly at the application instead of behind a boot stage 2 image.
+# CLOCKS/RESETS/XOSC/PLL bit-set stubs (rp2040_*_stub.py) +
+# Timers.RP2040_Timer C# model (loaded via `i @repl/rp2040_timer.cs`)
+# are runtime-injected by renode_launcher.py - same path the HC32F460
+# C# UART model follows. printers.test references rp2040.dict for the
+# generic-bigtreetech-skr-pico-v1.0 config.
+RUN make distclean V=1 || true \
+    && cp test/configs/rp2040-serial.config .config \
+    && make olddefconfig \
+    && make \
+    && cp out/klipper.dict ci_build/dict/rp2040.dict \
+    && cp out/klipper.elf ci_build/elf/rp2040.elf
+
+# Build the simavr bridge program. Lives in test/emulator/simavr_bridge.c
+# and links against libsimavr; produces the binary that runs the
+# klipper firmware and exposes its UART as a pty for klippy plus a
+# control socket for fixture-driven physical state.
+RUN gcc -O2 -Wall -Wextra \
+        -I/usr/local/include/simavr \
+        -L/usr/local/lib \
+        -o ci_build/simavr_bridge \
+        test/emulator/simavr_bridge.c \
+        /usr/local/include/simavr/parts/uart_pty.c \
+        -lsimavr -lpthread -lutil -lelf
+
+RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi()"
+
+# printers.test + the two generic_cartesian_* tests are the
+# remaining fileoutput-only suites once the renode backend is wired -
+# they exercise STM32 dicts and so route through Renode in
+# scripts/test_klippy.py:_backend_for_dict. They run alongside the
+# pre-existing AVR + linuxprocess smoke tests so a regression in any
+# backend is caught by the same CMD. The multi_mcu_* group exercises
+# the EMULATOR multi-bridge fan-out across every backend pairing the
+# runner has to span: AVR+AVR (simavr only), AVR+AVR cross-mcu
+# stepper routing, AVR+STM32 (simavr+renode), AVR+STM32 cross-mcu
+# stepper, STM32+STM32 (renode+renode), and AVR+linuxprocess
+# (simavr+native pty).
+#
+# This default CMD runs the subset that passes RELIABLY end-to-end under
+# the real emulator backend - verified with scripts/test_klippy.py
+# --force-emulator on a clean native-Linux host. same70_usb_smoke (the old
+# known-blocked test) now passes and is included (SysTick=300 + USBHS
+# SETUP-on-RXSTPES injection - see its header).
+#
+# The two tests that home a stepper on a RENODE-hosted MCU under
+# deterministic tick lockstep - multi_mcu_stm32_stm32 and
+# multi_mcu_avr_stm32_xmcu - used to be held out of this gate: under
+# full-suite contention on a shared host their renode-hosted homing
+# intermittently failed ("Communication timeout during homing" or
+# "Timer too close"). The fix is at the source rather than in test
+# shims: in tick mode the reactor flushes ready serial commands at
+# each advance target before the bridge runs the mcu forward
+# (klippy/chelper/serialqueue.c serialqueue_flush_ready), so commands
+# arrive with their normal real-hardware lead. The trsync homing
+# watchdog and the first software-PWM cycle lead each got their own
+# klippy-side fix: trsync's watchdog window naturally clears once the
+# pre-advance flush keeps the keep-alive cadence inside the window,
+# and MCU_pwm / MCU_queued_pwm / MCU_pwm_cycle defer their first
+# queue_pwm_out call out of _build_config and into a
+# register_post_init_callback (so PWM_START_LEAD measures against the
+# firmware's just-finalized state instead of an implicit config-flush
+# latency budget). The whole tick-mode surface is gated behind
+# KLIPPY_TICK_SOCKET; real-hardware paths are byte-identical to
+# upstream master. A mis-routed endstop still fails the test (homing
+# just stops later), so no homing bug is masked. Both tests gate.
+#
+# eddy.test and load_cell.test are NOT in the default gate post-rebase
+# onto upstream master (see the PR body "Known limitations" entry):
+# upstream `d2aa4bd7e ldc1612: Increase sample rate to 400 samples per
+# second (up from 250)` bumped the default data_rate and the AVR atmega2560
+# at 250 kbaud serial cannot sustain the resulting bulk_sensor frame load -
+# samples drop and the eddy gather trips "Eddy: Gaps in the data". The
+# upstream probe-helper refactor (b13ae529a / c92b1f73a / 21ad5d820) lands
+# in the same range and the eddy fixture's count-ramp + calibration knobs
+# need joint retuning against the new probe-session flow. A clean fix is
+# either a per-board `data_rate` config option on `[ldc1612]` (so the
+# emulator AVR cfg can pin 250) plus end-to-end fixture/bridge retune, or
+# an ARM-MCU eddy test (the rate bump is fine on STM32). The pre-rebase
+# fixture + helper combination passed cleanly; tracked as the next item
+# in the PR's "Next steps".
+#
+# Earlier framework rationale (kept for reference even though both tests
+# are temporarily out of the default gate): the deterministic tick path
+# (reactor-driven receive + bounded quantum + barrier-pause) exposed both
+# as false-passes the old non-deterministic background-thread + connect-
+# retry path had masked: with a constant sensor sample the eddy virtual
+# endstop never crossed threshold and the load-cell collector saw
+# SAMPLES=0. Both got a Z-ramped sensor fixture: the simavr bridge
+# synthesizes a probe sample that tracks the Z stepper position
+# (ldc1612_ramp for the eddy LDC1612 I2C DATA0 count; probe_step for the
+# load_cell ADS1220), so the virtual endstop crosses threshold on descent
+# and the collector gets real samples. The one operation NOT gated is
+# eddy `PROBE METHOD=tap`: its diff_peak detector differentiates the
+# sample stream and needs a continuously-sampled oscillator, but the
+# firmware reads the synthetic count on a jittery ~2ms
+# poll grid, so the per-sample derivative carries timing noise above the tap
+# threshold; that one line is skipped under the emulator (eddy.fixture.json
+# emulator_skip_gcode) and runs only in fileoutput. A mis-routed endstop
+# still fails the test (homing stops later), so no homing bug is masked.
+#
+# delta_calibrate.test gates here. The cfg's rotation_distance was rescaled
+# from the original fileoutput-only 0.32 (contrived for clean integer
+# heightN_pos values) to a real-printer 40 mm/rev: at 0.32 the homing /
+# probe step rate exceeds what an AVR atmega2560 can sustain, so the test
+# always shut down with "Rescheduled timer in the past" under the real-MCU
+# bridge. The saved heightN_pos values were rescaled by the same factor
+# (1/125) so DELTA_ANALYZE's stable-position math stays self-consistent at
+# config-load; the manual DELTA_CALIBRATE the test runs first overwrites
+# them with fresh probe positions before extended calibration runs. The
+# .test gcode and DELTA_ANALYZE assertions are untouched; fileoutput still
+# passes since it only checks for a clean exit.
+CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
+     "test/klippy/emulator_smoke.test", \
+     "test/klippy/sht3x_crc_regression.test", \
+     "test/klippy/linuxtest.test", \
+     "test/klippy/samd21_smoke.test", \
+     "test/klippy/samd21_printer.test", \
+     "test/klippy/stm32f103_smoke.test", \
+     "test/klippy/stm32f103_tick.test", \
+     "test/klippy/stm32f4_smoke.test", \
+     "test/klippy/stm32g0_smoke.test", \
+     "test/klippy/stm32h7_smoke.test", \
+     "test/klippy/samd51_smoke.test", \
+     "test/klippy/duet3_mini.test", \
+     "test/klippy/sam3x_smoke.test", \
+     "test/klippy/archim2.test", \
+     "test/klippy/sam4s_smoke.test", \
+     "test/klippy/duet2_maestro.test", \
+     "test/klippy/skr_mini_e3_v2.test", \
+     "test/klippy/fysetc_spider.test", \
+     "test/klippy/skr_mini_e3_v3.test", \
+     "test/klippy/skr_pico.test", \
+     "test/klippy/sam4e_smoke.test", \
+     "test/klippy/duet2_wifi.test", \
+     "test/klippy/same70_smoke.test", \
+     "test/klippy/same70_usb_smoke.test", \
+     "test/klippy/same70_usb_tick.test", \
+     "test/klippy/same70_spi_tmc.test", \
+     "test/klippy/duet3_6hc.test", \
+     "test/klippy/duet3_6hc_usb.test", \
+     "test/klippy/duet3_6xd.test", \
+     "test/klippy/octopus_pro_h723.test", \
+     "test/klippy/lpc176x_smoke.test", \
+     "test/klippy/skr_v1_4.test", \
+     "test/klippy/hc32f460_smoke.test", \
+     "test/klippy/anycubic_kobra_go.test", \
+     "test/klippy/rp2040_smoke.test", \
+     "test/klippy/linuxpru.test", \
+     "test/klippy/multi_mcu_avr.test", \
+     "test/klippy/multi_mcu_avr_xmcu.test", \
+     "test/klippy/multi_mcu_avr_stm32.test", \
+     "test/klippy/multi_mcu_avr_stm32_xmcu.test", \
+     "test/klippy/multi_mcu_stm32_stm32.test", \
+     "test/klippy/multi_mcu_linuxprocess_avr.test", \
+     "test/klippy/temperature.test", \
+     "test/klippy/delta.test", \
+     "test/klippy/delta_calibrate.test", \
+     "test/klippy/bltouch.test", \
+     "test/klippy/screws_tilt_adjust.test", \
+     "test/klippy/tmc_spi.test", \
+     "test/klippy/tmc_spi_divergence.test", \
+     "test/klippy/tmc.test", \
+     "test/klippy/printers.test", \
+     "test/klippy/generic_cartesian_itex.test", \
+     "test/klippy/generic_cartesian_iqex.test"]

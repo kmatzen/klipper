@@ -1,0 +1,44 @@
+{
+    "_comment": "Sensible defaults for --force-emulator runs. analog_in_default supplies a mid-range raw ADC value (~5000 of the atmega2560 max 8184) so cold heaters (typically the bed) decode to roughly room temperature. The leading entries in `analog_in` apply hot values (~190 C with the EPCOS 100K B57560G104F formula) to the FIRST few configured analog_in OIDs, which in standard klippy configs are the extruder thermistors - this lets tests with extrusion gcode get past klippy's `min_extrude_temp` (default 170 C) without per-test fixture scripting. The cold default takes over once the labelled entries are exhausted, keeping bed thermistors below their max_temp. auto_trsync_trigger_ticks fires a synthetic homing trigger ~10 ms after each endstop_home so tests that home an axis can complete without per-test scripting. i2c_default.register_responses returns the LDC1612 MANUFACTURER_ID (0x5449) and DEVICE_ID (0x3055) for any i2c bus the host probes - klippy raises 'Invalid ldc1612 id' otherwise even on tests that don't directly drive eddy current sensors. Tests that need precise control should reference their own EMULATOR fixture.",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_hot_extruder_0": {
+            "default_value": 1200
+        },
+        "_hot_extruder_1": {
+            "default_value": 1200
+        },
+        "_hot_extruder_2": {
+            "default_value": 1200
+        },
+        "_hot_extruder_3": {
+            "default_value": 1200
+        }
+    },
+    "i2c_default": {
+        "register_responses": {
+            "0x7e": [
+                84,
+                73
+            ],
+            "0x7f": [
+                48,
+                85
+            ]
+        }
+    },
+    "auto_trsync_trigger_ticks": 160000,
+    "probe_pin_after_steps": 800,
+    "prepend_gcode": [
+        "M105",
+        "G4 P2000",
+        "M105"
+    ],
+    "emulator_skip_gcode": [
+        "RESTART"
+    ],
+    "sim_time": true,
+    "tick_mode": true
+}

@@ -1,6 +1,17 @@
 out
 *.so
 *.pyc
+__pycache__/
 .config
 .config.old
 klippy/.version
+
+# Emulator test harness scratch (working tree only)
+ci_build/
+.run_logs/
+_test_*.gcode
+_test_*.log
+_test_*.cfg
+
+# Claude Code session state
+.claude/
