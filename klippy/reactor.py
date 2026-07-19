@@ -441,8 +441,10 @@ class SelectReactor:
         # after_fds is True when this iteration already ran _check_fds. Such an
         # iteration must still be COUNTED: fd readiness is not sim-time
         # progress, and an fd that goes ready more often than once every
-        # _TICK_STALL_LIMIT iterations (the renode link is an async pty drained
-        # by a background thread, so it does) would otherwise reset the streak
+        # _TICK_STALL_LIMIT iterations (the renode link was an async pty drained
+        # by a background thread and did exactly that; it now uses the same
+        # synchronous AF_UNIX link as simavr, but the guard must not depend on
+        # that) would otherwise reset the streak
         # forever and the guard could never fire - the livelock survives the
         # guard. It must not, however, ADVANCE on the healthy timeout > 0 path:
         # that is deferred to the next iteration, so a forced advance can only

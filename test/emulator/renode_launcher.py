@@ -731,7 +731,8 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
     usart = _host_link_peripheral(chip)
     if tick_mode:
         # Tick mode: skip Renode's pty terminal entirely. The launcher
-        # creates an openpty() pair itself and shuttles bytes through
+        # binds an AF_UNIX host link itself (_TickHostLink - synchronous,
+        # so klippy satisfies invariant A1) and shuttles bytes through
         # renode_hooks.serial_init / serial_write_hex / serial_drain_hex
         # synchronously with each emulation RunFor.
         uart_block = ''
@@ -1056,47 +1057,124 @@ _DEFAULT_I2C_ADDRS = (0x2a, 0x29)
 # arrives after RunFor returns) so the launcher can treat the
 # Monitor reply as the "advance complete" signal.
 
-def _setup_tick_pty(slave_link):
-    # Open a fresh pty pair; keep the master fd in this process for
-    # synchronous byte shuttle between klippy and the firmware UART.
-    # Klippy connects to the slave end via slave_link; we close the
-    # slave fd here since klippy reopens it. Master is set raw so 8-bit
-    # binary klipper protocol bytes pass through unchanged AND
-    # non-blocking so _drain_pty_klippy_writes can poll without hanging
-    # the tick loop.
-    import pty as _pty
-    import termios
-    import fcntl
-    master_fd, slave_fd = _pty.openpty()
-    slave_path = os.ttyname(slave_fd)
-    os.close(slave_fd)
-    try:
-        attrs = termios.tcgetattr(master_fd)
-        iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
-        iflag = 0
-        oflag = 0
-        lflag = 0
-        cflag |= termios.CS8
-        cc[termios.VMIN] = 0
-        cc[termios.VTIME] = 0
-        termios.tcsetattr(master_fd, termios.TCSANOW,
-                          [iflag, oflag, cflag, lflag,
-                           ispeed, ospeed, cc])
-    except (termios.error, OSError) as e:
-        sys.stderr.write("renode_launcher: tick pty raw mode err %s\n"
-                         % e)
-    try:
-        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
-        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    except OSError as e:
-        sys.stderr.write("renode_launcher: tick pty O_NONBLOCK err %s\n"
-                         % e)
-    try:
-        os.unlink(slave_link)
-    except OSError:
-        pass
-    os.symlink(slave_path, slave_link)
-    return master_fd
+class _TickHostLink:
+    """Synchronous AF_UNIX host link for tick mode (replaces the pty).
+
+    A pty is an *asynchronous* transport: klippy's write lands in the tty
+    layer's n_tty workqueue, so the byte becomes readable here at a
+    wall-clock-dependent moment. That is precisely why serialqueue gates
+    `tick_mode` on SQT_PIPE (serialqueue.c) - a pty link ('u') keeps the
+    background reader thread, which violates invariant A1 ("no parallel
+    reader races the advance", TICK_PROTOCOL_DESIGN.md 1.4) and with it
+    determinism. It is why renode traces were not byte-identical while
+    simavr's were: only the simavr link had been moved to a socket.
+
+    An AF_UNIX SOCK_STREAM delivers inside the sender's write() syscall,
+    so klippy's flush is readable here at a deterministic virtual time.
+    Binding the socket AT `slave_link` also flips klippy over on its own:
+    mcu.py `_is_unix_socket()` sees S_ISSOCK and routes to
+    `serialhdl.connect_unix()` -> serial_fd_type 'p' -> `tick_mode` on and
+    reactor-driven receive with no background thread. No klippy-side
+    change is needed.
+
+    Writes use the same KEEP-TAIL discipline as simavr_bridge.c's
+    `suart_drain_output`: never block, keep the unwritten remainder, and
+    retry it on the next advance. Blocking here would deadlock - while we
+    are servicing an advance klippy is blocked awaiting `done` and is by
+    definition not reading, so a full socket buffer must not stall us.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._conn = None
+        self._pending = b''
+        self._warned = False
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        srv.setblocking(False)
+        self._srv = srv
+
+    def _conn_or_none(self):
+        # Klippy connects during its mcu connect phase, well after the
+        # launcher binds; accept lazily so neither side has to sequence.
+        if self._conn is not None:
+            return self._conn
+        try:
+            conn, _addr = self._srv.accept()
+        except (BlockingIOError, OSError):
+            return None
+        conn.setblocking(False)
+        self._conn = conn
+        return conn
+
+    def read(self):
+        # Drain everything klippy has flushed. Empty bytes is the normal
+        # "nothing pending" result.
+        conn = self._conn_or_none()
+        if conn is None:
+            return b''
+        chunks = []
+        while True:
+            try:
+                d = conn.recv(4096)
+            except (BlockingIOError, OSError):
+                break
+            if not d:
+                break
+            chunks.append(d)
+        return b''.join(chunks)
+
+    def write(self, data):
+        if data:
+            self._pending += data
+        self.flush()
+
+    # Backlog past which we complain. Not a cap: unlike simavr_bridge.c's
+    # fixed g_suart_tx we can grow, so we never drop firmware output. But a
+    # backlog this size means klippy stopped draining the link every
+    # dispatch iteration (2.5 D-PRE), which is the precondition the
+    # no-drop/no-overflow argument rests on - so say so once rather than
+    # growing silently. This is the renode analogue of g_out_dropped.
+    _PENDING_WARN = 16384
+
+    def flush(self):
+        # KEEP-TAIL: send what fits, retain the rest for the next advance.
+        conn = self._conn_or_none()
+        if conn is None or not self._pending:
+            return
+        try:
+            n = conn.send(self._pending)
+            self._pending = self._pending[n:]
+        except (BlockingIOError, OSError):
+            pass
+        if len(self._pending) >= self._PENDING_WARN and not self._warned:
+            self._warned = True
+            sys.stderr.write(
+                "renode_launcher: host-link backlog %d B - klippy is not "
+                "draining the link between advances (D-PRE broken); "
+                "byte delivery is no longer at a deterministic advance\n"
+                % len(self._pending))
+
+    def close(self):
+        for s in (self._conn, self._srv):
+            try:
+                if s is not None:
+                    s.close()
+            except OSError:
+                pass
+        self._conn = self._srv = None
+
+
+def _setup_tick_link(slave_link):
+    # Bind the tick-mode host link at slave_link. Klippy's
+    # _wait_for_slave_link only needs the path to exist (lexists), and a
+    # bound socket satisfies that just as the old pty symlink did.
+    return _TickHostLink(slave_link)
 
 
 def _make_tick_state(sim_time_file=None):
@@ -1151,27 +1229,17 @@ def _tick_publish_sim_time(tick_state):
 _HEX_RE = re.compile(rb'\n\r([0-9a-fA-F]*)\([\w-]+\)\s')
 
 
-def _drain_pty_klippy_writes(master_fd):
-    # Non-blocking drain of bytes klippy wrote to the slave. Returns
-    # bytes object (possibly empty). BlockingIOError is the normal
-    # "nothing to read" exit; OSError (typically EIO when the slave
-    # has been closed between klippy attempts) is also non-fatal -
-    # the next slave open will reopen the pty.
-    if master_fd is None:
+def _drain_link_klippy_writes(host_link):
+    # Drain bytes klippy flushed to the host link. Delivery is
+    # synchronous (AF_UNIX), so everything klippy wrote before it asked
+    # for this advance is already readable here - that is what makes the
+    # split point deterministic rather than a wall-clock race.
+    if host_link is None:
         return b''
-    chunks = []
-    while True:
-        try:
-            d = os.read(master_fd, 4096)
-        except (BlockingIOError, OSError):
-            break
-        if not d:
-            break
-        chunks.append(d)
-    return b''.join(chunks)
+    return host_link.read()
 
 
-def _tick_run_for(monitor_sock, tick_state, delta_us, master_fd=None):
+def _tick_run_for(monitor_sock, tick_state, delta_us, host_link=None):
     # Advance virtual time by `delta_us` microseconds via the
     # `emulation RunFor "<seconds>"` Monitor command (= EmulationManager
     # .Instance.CurrentEmulation.RunFor, the global master time source).
@@ -1181,20 +1249,25 @@ def _tick_run_for(monitor_sock, tick_state, delta_us, master_fd=None):
     # Monitor variant runs at near 1:1 virtual:wall on this host,
     # actually faster than real-time when firmware is idle.
     #
-    # In tick mode (master_fd != None) we additionally shuttle UART
+    # In tick mode (host_link != None) we additionally shuttle UART
     # bytes synchronously: drain klippy writes BEFORE RunFor so the
     # firmware sees them this quantum, drain firmware-emitted bytes
-    # AFTER RunFor and write them to the pty so klippy's serialqueue
+    # AFTER RunFor and write them to the host link so klippy's serialqueue
     # poll() sees them on its next wake-up.
-    if delta_us <= 0 and master_fd is None:
+    if delta_us <= 0 and host_link is None:
         return
     tx_bytes = b''
     with tick_state['lock']:
-        if master_fd is not None:
-            tx_bytes = _drain_pty_klippy_writes(master_fd)
+        if host_link is not None:
+            # Retry any tail a previous advance could not write before
+            # generating more output (KEEP-TAIL, see _TickHostLink). By
+            # now klippy has drained the link for its own dispatch
+            # iteration, so the buffer has room.
+            host_link.flush()
+            tx_bytes = _drain_link_klippy_writes(host_link)
             if tx_bytes:
                 tick_state['tx_bytes_total'] += len(tx_bytes)
-        if delta_us > 0 and master_fd is not None:
+        if delta_us > 0 and host_link is not None:
             # 3-step shuttle:
             #   1. serial_write_hex(klippy_tx_bytes)   - inject to UART
             #   2. emulation RunFor "<sec>"            - advance virt time
@@ -1247,7 +1320,7 @@ def _tick_run_for(monitor_sock, tick_state, delta_us, master_fd=None):
                         return
                     tick_state['rx_bytes_total'] += len(rx_bytes)
                     try:
-                        os.write(master_fd, rx_bytes)
+                        host_link.write(rx_bytes)
                     except OSError:
                         pass
             return
@@ -1273,17 +1346,17 @@ def _tick_run_for(monitor_sock, tick_state, delta_us, master_fd=None):
                 return
             tick_state['virt_us'] += delta_us
             _tick_publish_sim_time(tick_state)
-            if master_fd is not None:
-                _drain_firmware_to_pty(
-                    monitor_sock, tick_state, master_fd)
-        elif master_fd is not None:
+            if host_link is not None:
+                _drain_firmware_to_link(
+                    monitor_sock, tick_state, host_link)
+        elif host_link is not None:
             # delta_us == 0: still drain any pending firmware emission
             # in case bytes arrived during a previous RunFor that we
             # bailed out of early.
-            _drain_firmware_to_pty(monitor_sock, tick_state, master_fd)
+            _drain_firmware_to_link(monitor_sock, tick_state, host_link)
 
 
-def _drain_firmware_to_pty(monitor_sock, tick_state, master_fd):
+def _drain_firmware_to_link(monitor_sock, tick_state, host_link):
     cmd = ('python "import sys; '
            'sys.stdout.write(renode_hooks.serial_drain_hex() '
            'or \\"\\")"')
@@ -1310,11 +1383,9 @@ def _drain_firmware_to_pty(monitor_sock, tick_state, master_fd):
     sys.stderr.write(
         "renode_launcher: tick RX %d bytes (head=%r)\n"
         % (len(rx_bytes), rx_bytes[:32]))
-    try:
-        os.write(master_fd, rx_bytes)
-    except OSError as e:
-        sys.stderr.write(
-            "renode_launcher: tick RX pty write err %s\n" % e)
+    # KEEP-TAIL write; never raises, retains any unwritten remainder for
+    # the next advance (see _TickHostLink.write).
+    host_link.write(rx_bytes)
     return rx_bytes
 
 
@@ -1375,7 +1446,7 @@ def _bind_tick_socket(tick_path):
 
 
 def _tick_socket_loop(srv, monitor_sock, tick_state, stop_evt,
-                      master_fd=None):
+                      host_link=None):
     # AF_UNIX accept loop on the pre-bound `srv`. Klippy connects,
     # sends `advance T\n` (T in seconds, monotonic), launcher RunFor's
     # the delta, replies `done T_actual\n`. Same wire protocol as
@@ -1399,7 +1470,7 @@ def _tick_socket_loop(srv, monitor_sock, tick_state, stop_evt,
         if cli is None:
             return
         _tick_serve_client(cli, monitor_sock, tick_state, stop_evt,
-                           master_fd=master_fd)
+                           host_link=host_link)
     try:
         srv.close()
     except OSError:
@@ -1410,7 +1481,7 @@ _TICK_DIAG = bool(os.environ.get('BRIDGE_TICK_DIAG'))
 
 
 def _tick_serve_client(cli, monitor_sock, tick_state, stop_evt,
-                       master_fd=None):
+                       host_link=None):
     cli.settimeout(0.5)
     buf = b''
     seq = 0
@@ -1479,7 +1550,7 @@ def _tick_serve_client(cli, monitor_sock, tick_state, stop_evt,
             # infinite hang.
             try:
                 _tick_run_for(monitor_sock, tick_state, delta_us,
-                              master_fd=master_fd)
+                              host_link=host_link)
             except Exception:
                 sys.stderr.write(
                     "renode_launcher: tick RunFor unhandled exception "
@@ -1586,7 +1657,7 @@ def _translate_fixture_command(line):
 # ---------------------------------------------------------------------
 
 def _control_socket_loop(srv, monitor_sock, stop_evt,
-                         tick_state=None, master_fd=None):
+                         tick_state=None, host_link=None):
     # Accept connections from _push_fixture_to_control_socket. Each
     # newline-terminated command is either a hook setter (translated
     # to a Renode python call) or one of the bridge-protocol verbs
@@ -1678,7 +1749,7 @@ def _control_socket_loop(srv, monitor_sock, stop_evt,
                             # so this doesn't race a klippy-driven
                             # RunFor.
                             _tick_run_for(monitor_sock, tick_state,
-                                          usec, master_fd=master_fd)
+                                          usec, host_link=host_link)
                         else:
                             time.sleep(usec / 1e6)
                         try:
@@ -1729,7 +1800,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--elf', required=True)
     ap.add_argument('--slave-link', required=True,
-                    help='symlink published to the host pty Renode opens '
+                    help='host link published for klippy (AF_UNIX socket in '
+                         'tick mode, pty symlink otherwise) '
                          'for USART1; klippy connects to this path.')
     ap.add_argument('--control-socket', required=True,
                     help='unix socket that receives newline-terminated '
@@ -1806,7 +1878,7 @@ def main():
     startup_deadline = time.monotonic() + 90.0
     deadline = None
 
-    serial_master_fd = None
+    serial_host_link = None
     early_tick_state = None
     early_tick_srv = None
     # Pre-bind the control socket at launcher startup so the runner's
@@ -1842,7 +1914,7 @@ def main():
             # the slave to klippy via the symlink. Renode never sees
             # the pty - we shuttle bytes through renode_hooks instead
             # of CreateUartPtyTerminal.
-            serial_master_fd = _setup_tick_pty(args.slave_link)
+            serial_host_link = _setup_tick_link(args.slave_link)
         else:
             # Wait for the pty Renode creates, then publish the
             # symlink so klippy's _wait_for_slave_link sees the slave
@@ -1915,7 +1987,7 @@ def main():
             target=_control_socket_loop,
             args=(early_ctl_srv, monitor_sock, stop_evt),
             kwargs={'tick_state': tick_state,
-                    'master_fd': serial_master_fd},
+                    'host_link': serial_host_link},
             daemon=True)
         ctl_thread.start()
 
@@ -1925,7 +1997,7 @@ def main():
                 target=_tick_socket_loop,
                 args=(early_tick_srv, monitor_sock, tick_state,
                       stop_evt),
-                kwargs={'master_fd': serial_master_fd},
+                kwargs={'host_link': serial_host_link},
                 daemon=True)
             tick_thread.start()
 
@@ -2010,11 +2082,8 @@ def main():
                 os.unlink(p)
             except OSError:
                 pass
-        if serial_master_fd is not None:
-            try:
-                os.close(serial_master_fd)
-            except OSError:
-                pass
+        if serial_host_link is not None:
+            serial_host_link.close()
         try:
             shutil.rmtree(workdir, ignore_errors=True)
         except OSError:

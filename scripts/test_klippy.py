@@ -580,9 +580,12 @@ class TestCase:
                                                   env=proc_env))
             for p, b in zip(emu_procs, bridges):
                 is_lp = (b['backend'] == 'linuxprocess')
-                # renode publishes the slave end via
-                # `emulation CreateUartPtyTerminal` followed by a
-                # symlink, so it uses the symlink-readiness branch like
+                # renode publishes its host link at slave_link itself:
+                # in tick mode an AF_UNIX socket (_TickHostLink, so the
+                # link is synchronous and klippy's _is_unix_socket()
+                # routes it to connect_unix -> tick_mode), otherwise a
+                # symlink to the pty from CreateUartPtyTerminal. Both
+                # satisfy the lexists() readiness branch, same as
                 # linuxprocess. simavr writes the slave dev path into
                 # slave_link as a plain file, so it falls through to
                 # the original poll branch.

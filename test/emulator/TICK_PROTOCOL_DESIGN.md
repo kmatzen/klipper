@@ -607,9 +607,12 @@ distinguished by CPU profile; both are now fixed at the source.
    sim_time never moves; the fresh clock sample that would fix the estimate can
    only arrive once sim_time advances, so the stall is self-sustaining.
    **Trigger:** host-scheduling RX jitter perturbing clock-sync. The socket
-   transport removed this for the simavr link, but the **renode** link is still
-   an async pty drained by a background thread, so renode multi-MCU runs
-   (`multi_mcu_avr_stm32`, `…_xmcu`) still hit it intermittently. Measured: with
+   transport removed this for the simavr link; the **renode** link was still an
+   async pty drained by a background thread, so renode multi-MCU runs
+   (`multi_mcu_avr_stm32`, `…_xmcu`) hit it intermittently. *(Renode now uses
+   the same synchronous AF_UNIX host link — see the §7.2 history note — so this
+   trigger is gone at the source. The guard below stays: it is cheap, and it
+   bounds any future transport that reintroduces a parallel reader.)* Measured: with
    the guard disabled the overdue-timer streak on a wedged renode run climbs
    into the **tens of millions** (sim frozen, spinning to the deadline), whereas
    every healthy run — `temperature`, `load_cell`, all simavr multi-MCU — peaks
@@ -632,10 +635,11 @@ distinguished by CPU profile; both are now fixed at the source.
    first written was **not sufficient**, for a reason the CPU-profile analysis
    above misses. `_check_fds` ran in the `if` branch and the guard in the
    `elif`, and the fd branch reset `_tick_stall_iters` to 0 unconditionally. But
-   fd readiness is *not* sim-time progress: on the renode link — an async pty
-   drained by a background thread, i.e. exactly the link this section says still
-   livelocks — an fd can go ready more often than once every 64 iterations, so
-   the streak was reset before it could ever trip and the guard never fired.
+   fd readiness is *not* sim-time progress: on the renode link — at the time an
+   async pty drained by a background thread, i.e. exactly the link this section
+   describes as livelocking — an fd can go ready more often than once every 64
+   iterations, so the streak was reset before it could ever trip and the guard
+   never fired.
    TLC finds a genuine lasso (streak oscillating 0→1→0, sim frozen forever).
    Making the reset conditional on real progress is *also* insufficient: while
    the guard sat in the `elif`, an fd-ready iteration skipped it entirely.
@@ -831,30 +835,37 @@ To confirm determinism: the empirical trace (§5.2) on `multi_mcu_stm32_stm32`
 is byte-identical *and* free of "Timer too close" with `MIN_REQTIME_DELTA` at
 its default. **Both PART-12 multi-MCU knobs are now gone; the §7.2 claim holds.**
 
-> **CORRECTION — the byte-identical half of that claim does not currently
-> reproduce.** Re-measured on a 16-core x86_64 Linux host: `proof.sh
-> multi_mcu_stm32_stm32 3` diverges on **every** attempt (0 byte-identical / 3
-> diverged, repeated 3×), as does `proof.sh stm32f103_tick 3`. Both reproduce
-> identically on unmodified code and with either of the fixes in this commit
-> applied in isolation — i.e. this is **pre-existing and unrelated to those
-> fixes**, not a regression they introduced.
+> **HISTORY — this claim was false when written, and is now true.** As
+> originally committed the byte-identical half did not reproduce: measured on a
+> 16-core x86_64 Linux host, `proof.sh multi_mcu_stm32_stm32 3` diverged on
+> **every** attempt (0 byte-identical / 3 diverged, repeated 3×), as did
+> `proof.sh stm32f103_tick 3`. It reproduced identically on unmodified code, so
+> it was pre-existing rather than a regression.
 >
-> The *functional* half of the claim still holds: the full 53-test gate passes
-> with 0 "Timer too close" and 0 "Communication timeout", `multi_mcu_stm32_stm32`
-> included. What fails is only trace-level byte-identity.
+> **Root cause: the renode link violated A1.** `tick_mode` is gated on
+> `SQT_PIPE` (`serialqueue.c`). The renode host link was a **pty** (`SQT_UART`),
+> so it kept `serialhdl`'s background reader thread — a parallel reader racing
+> the advance, exactly what invariant A1 (§1.4) forbids, and A1 is what buys
+> determinism. The simavr link had already been moved to a synchronous AF_UNIX
+> socket; renode had not. That asymmetry, not anything about Renode itself, was
+> the whole defect. It also explains the §5.1 observation that only *renode*
+> multi-MCU runs hit the clock-sync livelock: they were the only links with a
+> background reader left to perturb clock-sync.
 >
-> The likely cause is structural and already documented elsewhere in this file:
-> `tick_mode` is gated on `SQT_PIPE`, so the **renode** link keeps its async pty
-> and its background reader thread (§1.2, §5.1). Invariant A1 — "no parallel
-> reader to race the advance" — therefore does not hold for renode links, and A1
-> is exactly what buys determinism. The simavr path, which does satisfy A1, *is*
-> byte-identical (`temperature`, verified in the same session).
+> **Fix:** the launcher now binds an AF_UNIX `SOCK_STREAM` at `slave_link`
+> instead of opening a pty (`_TickHostLink`, `renode_launcher.py`). In tick mode
+> the launcher already bypassed `CreateUartPtyTerminal` and shuttled bytes
+> itself, so it owned both ends and this is a transport swap, not a protocol
+> change. No klippy-side change was needed: `mcu.py:_is_unix_socket()` sees
+> `S_ISSOCK`, routes to `connect_unix()` → `serial_fd_type 'p'` → `tick_mode` on
+> → reactor-driven receive, no background thread. Writes use the same KEEP-TAIL
+> discipline as `suart_drain_output` (§2.5) — blocking would deadlock, since
+> klippy is awaiting `done` and therefore not reading while an advance runs.
 >
-> So §5.2's proof procedure currently demonstrates determinism for the
-> **simavr** backend only. Either the renode link needs the same synchronous
-> socket transport the simavr link got, or this claim should be scoped to
-> simavr. Tracked as open; do not read the unqualified sentence above as
-> currently verified.
+> **Verified after the fix** (same host): `stm32f103_tick`,
+> `multi_mcu_stm32_stm32` and `temperature` are all byte-identical over 3 runs,
+> with the full 53-test gate green. §5.2's proof procedure now covers **both**
+> backends, which is what it always claimed.
 
 ### 7.3 EOF / klippy exit. If R closes TICK (klippy done/killed), B reads EOF at
 B0 and shuts down cleanly. The `start_ts`/`--duration` restart on the setup

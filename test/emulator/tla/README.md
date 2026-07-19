@@ -49,7 +49,11 @@ draining between retries, violating §2.5 D-PRE. See §7.2 for why.
 ## `livelock/` — reactor dispatch-loop liveness (§5.1)
 
 Reactor timers vs. the stall guard, with an environment action that makes an fd
-readable (the renode background pty drain).
+readable. That environment action modelled the renode background pty drain,
+which no longer exists — renode now uses the same synchronous AF_UNIX host link
+as simavr, so it satisfies A1 too. The model is kept as-is deliberately: the
+guard must remain correct for *any* transport that reintroduces a parallel
+reader, and `MCGuardFd` is the proof that the pre-fix loop shape was not.
 
 | Config | Models | Result |
 |---|---|---|
@@ -82,6 +86,12 @@ the XOFF/refill path in the reverse direction.
 | `DrainB.cfg` | `avr_run` strides >1 cycle/step | `EventualFeed` violated — see caveat |
 | `DrainC.cfg` / `DrainC2.cfg` | adversarial short `write()` | **modelling artifacts**, discount |
 | `DrainF.cfg` | staged-tail probe | **incomplete**, the sharpened property was never run |
+
+The KEEP-TAIL discipline modelled here is now implemented twice — in
+`simavr_bridge.c`'s `suart_drain_output` and in `renode_launcher.py`'s
+`_TickHostLink`. Both must never block: while an advance is running klippy is
+blocked awaiting `done` and is by definition not reading, so a blocking write
+deadlocks. `DrainA` is the model of that discipline behaving.
 
 `DrainD`/`DrainE` are the load-bearing result: they show §2.5's "R fully drains
 the pty" is a *precondition* of the no-drop invariant, not a consequence of it.
