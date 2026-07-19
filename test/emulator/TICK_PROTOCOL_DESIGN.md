@@ -320,11 +320,27 @@ change to R's await and cannot deadlock:
 
 Why this is deterministic *and* drop-free:
 
-- At the start of every advance the pty buffer is **empty**: R fully drains the
-  pty (dispatch-loop `select(pty,0)` repeats until no POLLIN) before it ever
-  issues the next `advance` (R only advances when no fd is ready — reactor.py
-  447). So B2 writes into an empty buffer; with O1, `g_suart_tx_len` at B2 is
-  ≤ ~OUTPUT_CAP, which fits → the common case is a single `write`, no tail.
+- **D-PRE (precondition, not merely rationale).** At the start of every advance
+  the pty buffer is **empty**: R fully drains the pty (dispatch-loop
+  `select(pty,0)` repeats until no POLLIN) before it ever issues the next
+  `advance`. So B2 writes into an empty buffer; with O1, `g_suart_tx_len` at B2
+  is ≤ ~OUTPUT_CAP, which fits → the common case is a single `write`, no tail.
+
+  **This is a precondition of the B-invariant below, not a consequence of it.**
+  A TLA+ model of this section (`tla/drain/Drain.tla`, config `DrainE`) reaches a byte-dropping
+  state as soon as D-PRE is removed: the socket stays full, `suart_drain_output`
+  writes zero bytes per advance, KEEP-TAIL retains the tail, and the advance
+  loop still appends ≥1 byte per advance because O1 is checked *after* `avr_run`
+  (`simavr_bridge.c` — deliberate, so every advance makes ≥1 cycle of progress).
+  `g_suart_tx_len` then ratchets to `sizeof(g_suart_tx)` and bytes are lost. The
+  model confirms no drops and no overflow *with* D-PRE, and a reachable drop
+  *without* it — so any change to the dispatch loop must preserve it.
+
+  D-PRE is enforced structurally by `_check_fds` running before the advance
+  branch on every dispatch iteration. Note this was previously enforced by the
+  `elif` (R advanced only when no fd was ready); the livelock guard fix (§5.1)
+  replaced that with an explicit drain-then-decide ordering, which preserves
+  D-PRE while letting the guard observe fd-ready iterations. Do not reorder.
 - Any split point is the deterministic pty-buffer boundary against an
   empty buffer (a constant), not a wall-clock race ⇒ the byte stream R sees,
   and the advance at which each byte arrives, are identical across runs.
@@ -610,7 +626,28 @@ distinguished by CPU profile; both are now fixed at the source.
    reply that unblocks the stuck timer, while **not** running the MCU past
    klippy's queued steps. A larger forced jump (a full quantum, or even the 8 ms
    wait-quantum) mid-move underruns the renode stepper queue and trips
-   "Timer too close"; the `+1`-cycle step does not. The `64` limit sits an order
+   "Timer too close"; the `+1`-cycle step does not.
+
+   **Guard reachability (TLA+, `tla/livelock/TickLivelock.tla`, config `MCGuardFd`).** The guard as
+   first written was **not sufficient**, for a reason the CPU-profile analysis
+   above misses. `_check_fds` ran in the `if` branch and the guard in the
+   `elif`, and the fd branch reset `_tick_stall_iters` to 0 unconditionally. But
+   fd readiness is *not* sim-time progress: on the renode link — an async pty
+   drained by a background thread, i.e. exactly the link this section says still
+   livelocks — an fd can go ready more often than once every 64 iterations, so
+   the streak was reset before it could ever trip and the guard never fired.
+   TLC finds a genuine lasso (streak oscillating 0→1→0, sim frozen forever).
+   Making the reset conditional on real progress is *also* insufficient: while
+   the guard sat in the `elif`, an fd-ready iteration skipped it entirely.
+
+   The fix is an ordering, not a counter tweak: `_check_fds` runs first
+   (preserving §2.5 D-PRE — a forced advance must never bypass the drain), then
+   `_tick_decide_advance(timeout, eventtime, after_fds)` is consulted on *every*
+   tick iteration. On an fd-ready iteration it returns True only at the stall
+   limit, so healthy runs are unchanged. Verified in TLC: liveness holds with
+   fds arriving; the pre-fix shape violates it.
+
+   The `64` limit sits an order
    of magnitude above the ≤ 3 healthy peak and far below the millions a real
    livelock reaches, so the guard is **inert** on healthy runs (verified:
    `temperature`/`load_cell` traces stay byte-identical, 174 / 490 advances/run;
@@ -656,8 +693,17 @@ A proof sketch is necessary but not sufficient; we also *measure* determinism:
 
 1. A `KLIPPY_TICK_TRACE=<path>` mode appends, per round-trip, a CSV line
    `seq T mode actual` on the R side (mode = the NEED_PROMPT mode that chose the
-   quantum) and `seq target target_cycle end_cycle out_total out_hash` on the B
-   side (out_hash = a running FNV-1a over every AVR-emitted byte). *(Implemented;
+   quantum) and `seq target_cycle end_cycle out_total out_hash dropped` on the B
+   side (out_hash = a running FNV-1a over every AVR-emitted byte that was
+   actually **retained**; `dropped` counts bytes discarded on a full
+   `g_suart_tx`, and is 0 on any healthy run).
+
+   Note the hash deliberately excludes dropped bytes. It previously folded every
+   byte in *before* the buffer-full check, which made this procedure blind to the
+   one failure mode §2.5's drop guard exists to catch: two runs that both dropped
+   data still produced identical `out_total`/`out_hash`, so "byte-identical"
+   could not distinguish a clean run from a corrupt one. Byte-identical traces
+   now mean identical *delivered* streams. *(Implemented;
    the `KLIPPY_SUART_TRACE` per-byte host↔AVR trace added for the cold-start
    investigation is a separate, finer diagnostic.)*
 2. Run a target test (`temperature`, then `load_cell`, then a homing test)
@@ -717,6 +763,42 @@ order). `NEED_PROMPT()` is OR'd (max) across links. Determinism proof applies
 per link; cross-link ordering is fixed by R's iteration order. **C8:** R visits
 links in a deterministic order.
 
+**C10 — the reactor's clock must not overshoot the slowest bridge.** `monotonic()`
+reads the sim-time mmap of the *canonical* (first) bridge only, but a bridge may
+reply `done` short of the target (O1 output cap), so the canonical clock is not
+"the time every bridge has reached". `_tick_request_advance` computed
+`min(actuals)` and returned it with a docstring saying it exists "so klippy never
+thinks any bridge is ahead of where it actually is" — but **no call site ever
+consumed the return value**; all three only test `is None`. TLC violates the
+invariant in 3 steps (`tla/lockstep/Lockstep.tla`, config `AsBuilt`): canonical reaches the target,
+a second bridge caps early, klippy adopts the canonical clock and flushes against
+a horizon the slow bridge has not reached → its commands carry a `req_clock` that
+bridge already considers past → step-queue underrun / "Timer too close".
+
+Fixed by clamping the target/flush `eventtime` to the previous round's
+`min(actuals)` — i.e. by actually using the value. No-op for a single mcu, where
+the min *is* the canonical clock. Verified: `NoKlippyOvershoot` holds
+exhaustively at N=3.
+
+**Residual (known, unfixed).** The converse — a *fast* bridge running ahead of
+klippy's clock — is not addressed by the clamp, and TLC still violates
+`NoBridgeAhead` under it. Bridges only ever run to `target`, so the skew is
+bounded by roughly one quantum and is covered in practice by the
+`MIN_REQTIME_DELTA` (0.1 s) pre-transmit lead; but QMAX is also 0.1 s, so the
+margin is thin. The complete fix is a true barrier — re-advance laggards to the
+same target until all report it — which TLC shows restores `NoKlippyOvershoot`,
+`NoBridgeAhead`, *and* `BoundedSkew` at N=3. It is **not** implemented here
+because a naive retry loop would re-advance without draining the link between
+retries, violating §2.5 D-PRE and reintroducing byte drops; a correct barrier has
+to interleave `_check_fds` between retries, which moves the §2.4 deterministic
+dispatch point and needs the emulator suite to validate.
+
+**C11 — cross-bridge skew is not bounded.** L1's `+1` fires whenever
+`target <= avr->cycle`, so a bridge that has already run past the target keeps
+stepping one cycle per round and never re-converges; `BoundedSkew` fails in TLC.
+One cycle per advance (~62 ns at 16 MHz) is slow enough not to matter in a test
+run, but it does not self-correct. Subsumed by the barrier above if implemented.
+
 **Knobs — what was actually subsumed.** The pre-determinism path carried two
 multi-MCU margin-widening env knobs (PART 12).
 
@@ -748,6 +830,31 @@ multi-MCU margin-widening env knobs (PART 12).
 To confirm determinism: the empirical trace (§5.2) on `multi_mcu_stm32_stm32`
 is byte-identical *and* free of "Timer too close" with `MIN_REQTIME_DELTA` at
 its default. **Both PART-12 multi-MCU knobs are now gone; the §7.2 claim holds.**
+
+> **CORRECTION — the byte-identical half of that claim does not currently
+> reproduce.** Re-measured on a 16-core x86_64 Linux host: `proof.sh
+> multi_mcu_stm32_stm32 3` diverges on **every** attempt (0 byte-identical / 3
+> diverged, repeated 3×), as does `proof.sh stm32f103_tick 3`. Both reproduce
+> identically on unmodified code and with either of the fixes in this commit
+> applied in isolation — i.e. this is **pre-existing and unrelated to those
+> fixes**, not a regression they introduced.
+>
+> The *functional* half of the claim still holds: the full 53-test gate passes
+> with 0 "Timer too close" and 0 "Communication timeout", `multi_mcu_stm32_stm32`
+> included. What fails is only trace-level byte-identity.
+>
+> The likely cause is structural and already documented elsewhere in this file:
+> `tick_mode` is gated on `SQT_PIPE`, so the **renode** link keeps its async pty
+> and its background reader thread (§1.2, §5.1). Invariant A1 — "no parallel
+> reader to race the advance" — therefore does not hold for renode links, and A1
+> is exactly what buys determinism. The simavr path, which does satisfy A1, *is*
+> byte-identical (`temperature`, verified in the same session).
+>
+> So §5.2's proof procedure currently demonstrates determinism for the
+> **simavr** backend only. Either the renode link needs the same synchronous
+> socket transport the simavr link got, or this claim should be scoped to
+> simavr. Tracked as open; do not read the unqualified sentence above as
+> currently verified.
 
 ### 7.3 EOF / klippy exit. If R closes TICK (klippy done/killed), B reads EOF at
 B0 and shuts down cleanly. The `start_ts`/`--duration` restart on the setup

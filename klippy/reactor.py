@@ -176,6 +176,10 @@ class SelectReactor:
         self._tick_stall_iters = 0
         self._tick_stall_max = 0
         self._tick_stall_forced = 0
+        # min(actuals) from the previous advance - the slowest bridge's real
+        # sim time. See its use in _tick_request_advance. None until the first
+        # advance completes; always == monotonic() for a single-mcu run.
+        self._tick_last_actual = None
         self._tick_stall_log = bool(os.environ.get('KLIPPY_TICK_STALL_LOG'))
         try:
             self._TICK_STALL_LIMIT = int(
@@ -416,7 +420,7 @@ class SelectReactor:
             self._tick_need_prompt_callbacks.remove(callback)
         except ValueError:
             pass
-    def _tick_decide_advance(self, timeout, eventtime):
+    def _tick_decide_advance(self, timeout, eventtime, after_fds=False):
         # Decide whether the dispatch loop should hand control to the
         # bridge(s) this iteration. Returns True to advance, False to keep
         # running timers. The normal case is "a future timer is pending"
@@ -433,9 +437,21 @@ class SelectReactor:
         # jump would do mid-move and underrun the step queue ("Timer too
         # close"). Inert on healthy runs (the overdue-with-frozen-sim streak
         # there stays far below the limit). Streak resets on any progress.
+        #
+        # after_fds is True when this iteration already ran _check_fds. Such an
+        # iteration must still be COUNTED: fd readiness is not sim-time
+        # progress, and an fd that goes ready more often than once every
+        # _TICK_STALL_LIMIT iterations (the renode link is an async pty drained
+        # by a background thread, so it does) would otherwise reset the streak
+        # forever and the guard could never fire - the livelock survives the
+        # guard. It must not, however, ADVANCE on the healthy timeout > 0 path:
+        # that is deferred to the next iteration, so a forced advance can only
+        # happen after the link was drained (the TICK_PROTOCOL_DESIGN.md 2.5
+        # D-PRE precondition; advancing with the link undrained ratchets the
+        # bridge tx buffer to its cap and silently drops bytes).
         if timeout > 0.:
             self._tick_stall_iters = 0
-            return True
+            return not after_fds
         if self._next_timer > eventtime:
             # Overdue timer already rescheduled into the future (e.g. the
             # _check_timers "busy" short-circuit, or a healthy timer fire):
@@ -469,6 +485,20 @@ class SelectReactor:
         # any bridge is ahead of where it actually is) or None on EOF.
         target = self._next_timer
         eventtime = self.monotonic()
+        # monotonic() reads the sim-time mmap of the CANONICAL (first) bridge
+        # only. With more than one mcu that is not the same thing as "the
+        # simulated time every bridge has reached": a bridge may reply `done`
+        # short of the target (the O1 output cap in simavr_bridge.c breaks the
+        # run loop once the tx buffer hits OUTPUT_CAP), so the canonical clock
+        # can be ahead of a slower bridge. Computing the flush horizon from it
+        # then hands that bridge commands whose req_clock it already considers
+        # past -> step-queue underrun / "Timer too close". Clamp to the slowest
+        # bridge's last reported actual - i.e. actually USE the min(actuals)
+        # this function returns, which previously no caller consumed. No-op for
+        # a single mcu, where the min IS the canonical clock.
+        if (self._tick_last_actual is not None
+                and self._tick_last_actual < eventtime):
+            eventtime = self._tick_last_actual
         # Ask each transport what it is waiting on (TICK_PROTOCOL_DESIGN.md
         # NEED_PROMPT): >=1 means klippy is blocked on a specific firmware
         # reply (1 = identify/query/clock-sync) or trigger (2 = trsync homing)
@@ -582,6 +612,8 @@ class SelectReactor:
             result = min(actuals)
         except ValueError:
             return None
+        # Remember the slowest bridge for the next target computation above.
+        self._tick_last_actual = result
         if self._tick_trace_fp is not None:
             self._tick_trace_fp.write(
                 "%d %.9f %d %.9f\n" % (self._tick_trace_seq, target,
@@ -601,13 +633,19 @@ class SelectReactor:
             res = select.select(self._read_fds, self._write_fds, [],
                                 wait_timeout)
             eventtime = self.monotonic()
-            if res[0] or res[1]:
+            after_fds = bool(res[0] or res[1])
+            if after_fds:
                 busy = True
-                self._tick_stall_iters = 0
                 hdls = ([(fd, self._READ) for fd in res[0]]
                         + [(fd, self._WRITE) for fd in res[1]])
+                # Drain first, unconditionally: the advance below must never
+                # run with a readable link still buffered (2.5 D-PRE).
                 eventtime = self._check_fds(eventtime, hdls)
-            elif in_tick and self._tick_decide_advance(timeout, eventtime):
+            # Consult the livelock guard on EVERY tick iteration, including
+            # ones that serviced an fd. It returns True on an fd iteration only
+            # when the stall limit is reached, so healthy runs are unaffected.
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                     after_fds):
                 if self._tick_request_advance() is None:
                     self.end()
                     continue
@@ -691,11 +729,14 @@ class PollReactor(SelectReactor):
             wait_ms = 0 if in_tick else int(math.ceil(timeout * 1000.))
             res = self._poll.poll(wait_ms)
             eventtime = self.monotonic()
-            if res:
+            after_fds = bool(res)
+            if after_fds:
                 busy = True
-                self._tick_stall_iters = 0
+                # Drain first (2.5 D-PRE), then let the guard see this
+                # iteration - see _tick_decide_advance.
                 eventtime = self._check_fds(eventtime, res)
-            elif in_tick and self._tick_decide_advance(timeout, eventtime):
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                    after_fds):
                 if self._tick_request_advance() is None:
                     self.end()
                     continue
@@ -735,11 +776,14 @@ class EPollReactor(SelectReactor):
             wait_timeout = 0. if in_tick else timeout
             res = self._epoll.poll(wait_timeout)
             eventtime = self.monotonic()
-            if res:
+            after_fds = bool(res)
+            if after_fds:
                 busy = True
-                self._tick_stall_iters = 0
+                # Drain first (2.5 D-PRE), then let the guard see this
+                # iteration - see _tick_decide_advance.
                 eventtime = self._check_fds(eventtime, res)
-            elif in_tick and self._tick_decide_advance(timeout, eventtime):
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                    after_fds):
                 if self._tick_request_advance() is None:
                     self.end()
                     continue

@@ -3337,6 +3337,8 @@ static uint8_t g_suart_tx[16384];            /* AVR -> host pending */
 static size_t g_suart_tx_len = 0;
 static uint8_t g_suart_in[4096];             /* host bytes read, unfed */
 static size_t g_suart_in_pos = 0, g_suart_in_len = 0;
+static uint64_t g_suart_refill_cycle = 0;    /* cycle of last refill read */
+static int g_suart_refilled = 0;             /* g_suart_refill_cycle valid? */
 
 /* Determinism trace (TICK_PROTOCOL_DESIGN.md 5.1), enabled only when
  * KLIPPY_TICK_TRACE is set. A running FNV-1a over every byte the AVR
@@ -3347,15 +3349,34 @@ static size_t g_suart_in_pos = 0, g_suart_in_len = 0;
  * is the point of the socket transport. Ships disabled (zero cost). */
 static uint64_t g_out_total = 0;
 static uint64_t g_out_hash = 1469598103934665603ULL;  /* FNV-1a offset */
+/* Bytes discarded because g_suart_tx was full. The drop path below is
+ * unreachable while the host drains the link every dispatch iteration
+ * (TICK_PROTOCOL_DESIGN.md 2.5 D-PRE) - a drop means that precondition
+ * broke, which silently corrupts the serial stream, so count it and say
+ * so rather than losing the byte without a trace. */
+static uint64_t g_out_dropped = 0;
 
 static void
 suart_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
 {
     (void)irq; (void)param;
+    if (g_suart_tx_len >= sizeof(g_suart_tx)) {
+        /* Count the drop but do NOT fold the byte into the trace: the
+         * hash/total are the "what did the host actually receive" observable
+         * (5.2), so a dropped byte must change them. Folding it in first -
+         * as this hook used to - made the determinism proof blind to the one
+         * failure mode the guard exists to catch: two runs that both drop
+         * data still produced identical out_total/out_hash. */
+        if (!g_out_dropped)
+            fprintf(stderr, "simavr_bridge: host-link tx buffer full (%zu B),"
+                    " DROPPING output - serial stream is now corrupt\n",
+                    sizeof(g_suart_tx));
+        g_out_dropped++;
+        return;
+    }
     g_out_total++;
     g_out_hash = (g_out_hash ^ (uint8_t)value) * 1099511628211ULL;
-    if (g_suart_tx_len < sizeof(g_suart_tx))
-        g_suart_tx[g_suart_tx_len++] = (uint8_t)value;
+    g_suart_tx[g_suart_tx_len++] = (uint8_t)value;
 }
 static void
 suart_xon_hook(struct avr_irq_t *irq, uint32_t value, void *param)
@@ -3461,8 +3482,17 @@ suart_feed_one(uint64_t cycle)
     if (g_suart_xoff || g_suart_in_irq == NULL)
         return;
     if (g_suart_in_pos >= g_suart_in_len) {
-        if (cycle & 0x1FF)
+        /* Throttle the refill read to once per 512 cycles (see above), but
+         * gate on ELAPSED cycles rather than on `cycle & 0x1FF`. avr_run
+         * advances the cycle counter by 1-4 cycles per step and fast-forwards
+         * across SLEEP, so a phase test can step straight over the multiple
+         * of 512 and wait another full period - unboundedly so if the stride
+         * stays in lockstep with the mask. Elapsed-time gating refills within
+         * 512 cycles of becoming empty no matter the stride. */
+        if (g_suart_refilled && cycle - g_suart_refill_cycle < 512)
             return;
+        g_suart_refilled = 1;
+        g_suart_refill_cycle = cycle;
         suart_refill_input();
     }
     if (g_suart_in_pos < g_suart_in_len)
@@ -3791,8 +3821,10 @@ main(int argc, char *argv[])
     size_t tick_fill = 0;
     /* Optional determinism trace (KLIPPY_TICK_TRACE), tick mode only.
      * One CSV line per advance: seq target_cycle end_cycle out_total
-     * out_hash (see g_out_hash). The filename matches the tick socket's
-     * basename so multi-MCU runs get one trace per bridge. */
+     * out_hash dropped (see g_out_hash / g_out_dropped). The filename
+     * matches the tick socket's basename so multi-MCU runs get one trace
+     * per bridge. `dropped` is 0 on any healthy run; nonzero means the
+     * 2.5 D-PRE drain precondition broke and the stream is corrupt. */
     FILE *g_tick_trace = NULL;
     uint64_t g_tick_seq = 0;
     const char *trace_env = getenv("KLIPPY_TICK_TRACE");
@@ -3964,12 +3996,16 @@ main(int argc, char *argv[])
             if (sim_time_ptr)
                 *sim_time_ptr = (double)avr->cycle / (double)avr->frequency;
             if (g_tick_trace) {
-                fprintf(g_tick_trace, "%llu %llu %llu %llu %llu\n",
+                /* Trailing field is the drop count (always 0 on a healthy
+                 * run); a nonzero column makes a broken D-PRE visible in the
+                 * trace instead of silently corrupting the byte stream. */
+                fprintf(g_tick_trace, "%llu %llu %llu %llu %llu %llu\n",
                         (unsigned long long)g_tick_seq++,
                         (unsigned long long)target_cycle,
                         (unsigned long long)avr->cycle,
                         (unsigned long long)g_out_total,
-                        (unsigned long long)g_out_hash);
+                        (unsigned long long)g_out_hash,
+                        (unsigned long long)g_out_dropped);
                 fflush(g_tick_trace);
             }
             /* Honor the wall-clock duration safety net even in tick
