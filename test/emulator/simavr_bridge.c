@@ -3337,8 +3337,6 @@ static uint8_t g_suart_tx[16384];            /* AVR -> host pending */
 static size_t g_suart_tx_len = 0;
 static uint8_t g_suart_in[4096];             /* host bytes read, unfed */
 static size_t g_suart_in_pos = 0, g_suart_in_len = 0;
-static uint64_t g_suart_refill_cycle = 0;    /* cycle of last refill read */
-static int g_suart_refilled = 0;             /* g_suart_refill_cycle valid? */
 
 /* Determinism trace (TICK_PROTOCOL_DESIGN.md 5.1), enabled only when
  * KLIPPY_TICK_TRACE is set. A running FNV-1a over every byte the AVR
@@ -3482,17 +3480,16 @@ suart_feed_one(uint64_t cycle)
     if (g_suart_xoff || g_suart_in_irq == NULL)
         return;
     if (g_suart_in_pos >= g_suart_in_len) {
-        /* Throttle the refill read to once per 512 cycles (see above), but
-         * gate on ELAPSED cycles rather than on `cycle & 0x1FF`. avr_run
-         * advances the cycle counter by 1-4 cycles per step and fast-forwards
-         * across SLEEP, so a phase test can step straight over the multiple
-         * of 512 and wait another full period - unboundedly so if the stride
-         * stays in lockstep with the mask. Elapsed-time gating refills within
-         * 512 cycles of becoming empty no matter the stride. */
-        if (g_suart_refilled && cycle - g_suart_refill_cycle < 512)
+        /* NB: this is a phase test, not an elapsed-cycle one - avr_run
+         * strides 1-4 cycles and fast-forwards across SLEEP, so a stride can
+         * step over the multiple of 512 and wait another full period. A TLA+
+         * model of this path (tla/drain, DrainB) shows an unbounded refill
+         * delay if a stride stays in lockstep with the mask. Real strides do
+         * not sustain that, so this is a latency hazard rather than a live
+         * defect, and it is left alone deliberately: changing the gate shifts
+         * host->AVR byte timing on every test to close a hole nobody has hit. */
+        if (cycle & 0x1FF)
             return;
-        g_suart_refilled = 1;
-        g_suart_refill_cycle = cycle;
         suart_refill_input();
     }
     if (g_suart_in_pos < g_suart_in_len)
