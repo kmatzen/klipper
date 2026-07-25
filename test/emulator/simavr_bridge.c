@@ -1409,13 +1409,19 @@ ldc1612_count_at_cycle(uint64_t cycle)
                         * (int64_t)ldc1612_ramp.depress_per_step
                        >> LDC_FRAC_SHIFT);
         }
-        /* Floor at just above the calibration's lowest frequency (the
-         * cfg's furthest cal point, 3.0 MHz = raw 0x2000000). At high Z
-         * the count would fall below the calibrated range and a scan /
-         * rapid_scan sample there maps to "out of range"; clamping keeps
-         * every settled read a valid in-range height. The floor is far
-         * below the gt threshold, so it never affects triggering. */
-        if (v < 0x2010000) v = 0x2010000;
+        /* Floor just above the calibration's lowest frequency (the
+         * cfg's furthest cal point is z=5.0mm at 2.7 MHz; 0x1CEA000 =
+         * 2.711 MHz). At high Z the count would fall below the
+         * calibrated range and a scan / rapid_scan sample there maps to
+         * "out of range"; clamping keeps every settled read a valid
+         * in-range height. The floor must stay BELOW the descend
+         * trigger frequency (height_to_freq(descend_z=0.4) = 2.875 MHz
+         * = raw 0x1EAB6AA) or the 'gt' trigger is already satisfied at
+         * arm time and homing fires instantly at any height - the
+         * previous 0x2010000 (3.006 MHz) floor sat above it and pegged
+         * the whole ramp, which also starved the tap's diff_peak
+         * detector of any signal. */
+        if (v < 0x1CEA000) v = 0x1CEA000;
         if (v > 0x03ffffff) v = 0x03ffffff;  /* MAX_VALID_RAW_VALUE */
         raw = (uint32_t)v;
     } else {
