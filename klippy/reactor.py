@@ -108,15 +108,17 @@ class SelectReactor:
     # TICK_PROTOCOL_DESIGN.md section 2.3): per-advance quantum caps.
     # _TICK_MAX_QUANTUM bounds an idle reactor's yield-to-bridge;
     # _TICK_WAIT_QUANTUM is the smaller cap used while a tick MCU is
-    # blocked on a specific reply/trigger (must stay below the multi-MCU
-    # trsync watchdog mcu.py TRSYNC_TIMEOUT = 0.025 s).
+    # blocked on a specific reply/trigger. It must stay below the
+    # multi-MCU trsync watchdog (mcu.py TRSYNC_TIMEOUT); mcu.py enforces
+    # that invariant at import time under KLIPPY_TICK_SOCKET.
     _TICK_MAX_QUANTUM = 0.1
     _TICK_WAIT_QUANTUM = 0.008
     # Tick-mode livelock guard (TICK_PROTOCOL_DESIGN.md section 5.1). After this
     # many consecutive no-progress iterations (timer overdue while
-    # sim_time frozen) force a single +1-cycle advance so the bridge
-    # delivers the reply that unblocks the stuck timer. Set well above
-    # any healthy-run transient streak.
+    # sim_time frozen) fail fast with a diagnosis instead of hanging to
+    # the test deadline. Set well above any healthy-run transient streak
+    # (measured high-water is 0; the one real trigger - the async renode
+    # pty - was removed at the source by the synchronous AF_UNIX link).
     _TICK_STALL_LIMIT = 64
     # Hard safety net for the lockstep `done` recv (tick mode); fires
     # only if a bridge genuinely stops replying, names the socket, and
@@ -175,7 +177,6 @@ class SelectReactor:
         # limit can be confirmed safely above any healthy-run transient.
         self._tick_stall_iters = 0
         self._tick_stall_max = 0
-        self._tick_stall_forced = 0
         # min(actuals) from the previous advance - the slowest bridge's real
         # sim time. See its use in _tick_request_advance. None until the first
         # advance completes; always == monotonic() for a single-mcu run.
@@ -427,16 +428,12 @@ class SelectReactor:
         # (timeout > 0). The livelock guard covers the case where a timer is
         # overdue (waketime <= eventtime) yet sim_time is frozen because
         # _check_timers keeps returning 0 (see _TICK_STALL_LIMIT): after a
-        # streak of such no-progress iterations it lets the advance through.
-        # That advance clamps its target to eventtime (the overdue timer's
-        # waketime is <= eventtime), so the bridge steps the MCU by exactly
-        # one cycle (its L1 +1-cycle guard) - the reactor analogue of that
-        # guard. A minimal step is deliberate: it moves sim_time forward to
-        # deliver the firmware reply that unblocks the stuck timer WITHOUT
-        # running the MCU past klippy's queued steps, which a larger forced
-        # jump would do mid-move and underrun the step queue ("Timer too
-        # close"). Inert on healthy runs (the overdue-with-frozen-sim streak
-        # there stays far below the limit). Streak resets on any progress.
+        # streak of such no-progress iterations it raises ReactorError with
+        # a diagnosis, so a wedged protocol state surfaces as a prompt,
+        # attributable failure instead of a hang (or a silent self-heal
+        # that could mask a real protocol bug). Inert on healthy runs (the
+        # overdue-with-frozen-sim streak stays far below the limit; measured
+        # high-water 0 across the full gate). Streak resets on any progress.
         #
         # after_fds is True when this iteration already ran _check_fds. Such an
         # iteration must still be COUNTED: fd readiness is not sim-time
@@ -447,10 +444,9 @@ class SelectReactor:
         # that) would otherwise reset the streak
         # forever and the guard could never fire - the livelock survives the
         # guard. It must not, however, ADVANCE on the healthy timeout > 0 path:
-        # that is deferred to the next iteration, so a forced advance can only
-        # happen after the link was drained (the TICK_PROTOCOL_DESIGN.md 2.5
-        # D-PRE precondition; advancing with the link undrained ratchets the
-        # bridge tx buffer to its cap and silently drops bytes).
+        # that is deferred to the next iteration, so the guard is only
+        # consulted after the link was drained (the TICK_PROTOCOL_DESIGN.md
+        # 2.5 D-PRE precondition).
         if timeout > 0.:
             self._tick_stall_iters = 0
             return not after_fds
@@ -473,14 +469,13 @@ class SelectReactor:
                     self._tick_stall_iters, self._TICK_STALL_LIMIT, eventtime)
         if self._tick_stall_iters < self._TICK_STALL_LIMIT:
             return False
-        self._tick_stall_iters = 0
-        self._tick_stall_forced += 1
-        if self._tick_stall_log:
-            logging.warning(
-                "reactor: tick livelock guard forcing +1-cycle advance at sim"
-                " %.6f (overdue timer %.6f never cleared; forced=%d)",
-                eventtime, self._next_timer, self._tick_stall_forced)
-        return True
+        raise ReactorError(
+            "Tick-mode livelock: timer overdue (waketime %.6f) for %d"
+            " consecutive iterations with sim time frozen at %.6f. A"
+            " firmware reply this timer needs is not being produced -"
+            " see TICK_PROTOCOL_DESIGN.md section 5.1 and rerun with"
+            " KLIPPY_TICK_STALL_LOG=1 for the streak trace."
+            % (self._next_timer, self._TICK_STALL_LIMIT, eventtime))
     def _tick_request_advance(self):
         # Ask all bridges to advance simulated time, in lockstep.
         # Returns the minimum reported actual (so klippy never thinks
@@ -535,10 +530,9 @@ class SelectReactor:
         if target >= self.NEVER or target > cap:
             target = cap
         if target < eventtime:
-            # The next timer is overdue (waketime <= eventtime) - either a
-            # normal "advance toward the timer" iteration or the livelock
-            # guard letting a frozen-sim advance through. Clamp to eventtime;
-            # the bridge's L1 +1-cycle guard then steps the MCU by one cycle,
+            # The next timer is overdue (waketime <= eventtime) on a normal
+            # "advance toward the timer" iteration. Clamp to eventtime; the
+            # bridge's L1 +1-cycle guard then steps the MCU by one cycle,
             # so sim_time moves forward minimally without overshooting any
             # queued step.
             target = eventtime
@@ -678,9 +672,8 @@ class SelectReactor:
             if self._tick_stall_log and self._tick_socket_paths:
                 logging.warning(
                     "reactor: tick livelock guard stats: max overdue"
-                    " streak=%d (limit=%d), forced advances=%d",
-                    self._tick_stall_max, self._TICK_STALL_LIMIT,
-                    self._tick_stall_forced)
+                    " streak=%d (limit=%d)",
+                    self._tick_stall_max, self._TICK_STALL_LIMIT)
     def end(self):
         self._process = False
     def finalize(self):
