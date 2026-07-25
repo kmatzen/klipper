@@ -1,5 +1,5 @@
 {
-    "_comment": "Drives eddy.test (probe_eddy_current / LDC1612) under the simavr bridge. 0x7e/0x7f are the manufacturer/device id the driver verifies at startup (TI 0x5449 / LDC1612 0x3055). The DATA0 (0x00/0x01) frequency count and the STATUS register (0x18) are served by the bridge's ldc1612_ramp instead of a static fixture value: eddy_probe_ramp hooks the Z step+dir pins and returns a 28-bit count = baseline_raw + free_per_step * net_descent (net_descent is the absolute, never-reset Z stepper position; descending edges +1, ascending -1). The count climbs as Z descends and crosses the threshold the driver computes from the calibrated descend_z, firing the virtual endstop for G28 homing, BED_MESH_CALIBRATE (default/scan/rapid_scan), and PROBE - which a constant sample can never do (homing 'No trigger on stepper_z'). The count is floored at the calibration's lowest frequency (3.0 MHz = raw 0x2000000) so settled reads at any height map to a valid in-range height rather than an out-of-range/zero (error) sample. descend_level=0 is the DIR level for descending on this cfg's [stepper_z] (PL3 step / PL1 dir). The bridge's uniform-period STATUS pacing + sub-step interpolation (lands DATA0 reads on exact period_cycles boundaries with the fractional count extrapolated from the most recent two same-direction step edges) and the eddy_probe_ramp contact_descent / depress_per_step piecewise knee (drops the per-step climb at a fixed bed contact so the firmware's diff_peak detector sees a clean slope change) carry the synthesized signal end-to-end. The remaining upstream gap (klippy/extras/probe_eddy_current.py _setup_tap had a 4th-order Butterworth lowpass with ~11% step-response overshoot on the derivative, which the noise-free emulator count surfaced as a premature diff_peak_gt trip) was closed by switching that lowpass to a 4th-order Bessel via trigger_analog.DigitalFilter.add_lowpass_bessel: phase-normalized Bessel has effectively no derivative overshoot at the descent-velocity ramps the toolhead actually drives, so the diff_peak peak tracker only updates on the real contact slope change. PROBE METHOD=tap therefore now runs end-to-end under the emulator. intb_pin (PK7) is held low so query_status_ldc1612 reports data-ready; auto_trsync_trigger_ticks fires the X/Y cartesian endstops on G28. tick_mode runs the bridge in tick-socket lockstep so the climb + trigger are deterministic regardless of host load.",
+    "_comment": "Drives eddy.test (probe_eddy_current / LDC1612) under the simavr bridge. 0x7e/0x7f are the manufacturer/device id the driver verifies at startup (TI 0x5449 / LDC1612 0x3055). The DATA0 (0x00/0x01) count and STATUS (0x18) are served by the bridge's ldc1612_ramp: a 28-bit count = baseline_raw + free_per_step * net_descent (net_descent = absolute Z stepper position; dir level 0 = descending on this cfg's [stepper_z] PL3/PL1, verified from the KLIPPY_LDC1612_RAMP_TRACE step trace). Geometry is derived from the cfg's calibration table and the current probe-helper descent: with freq_conv = 24MHz/2^28 = 0.089407 Hz/raw, the descend trigger height_to_freq(descend_z=0.4) = 2.875 MHz = raw 32156330. baseline_raw 31556000 (2.821 MHz, z~0.83 on the curve) sits below the trigger so the 'gt' trigger is not already satisfied at arm; free_per_step 500 crosses the trigger ~1200 steps (3 mm) into a descend probe, and keeps every settled read between the bridge floor (0x1CEA000 = 2.711 MHz, just above the calibration's furthest point 2.7 MHz @ z=5) and the curve top for all test heights up to z~9.5 - so G28, BED_MESH_CALIBRATE (default/scan/rapid_scan) and PROBE all cross the threshold with real signal dynamics instead of a pegged count. contact_descent/depress_per_step give the count a piecewise knee ~0.5 mm above the descend stop for the tap detector's slope-change. emulator_skip_gcode: PROBE METHOD=tap and PROBE_EDDY_CURRENT_TAP_CALIBRATE run only in fileoutput (matching the framework's historically validated scope): under the emulator, sustained sampling+motion load on the 250 kbaud AVR link degrades the clocksync frequency estimate (observed 16.00->15.65 MHz with 'Ignoring clock sample' storms during the scan phase), which warps the sample-time-to-stepper-position correlation the tap's pullback least-squares fit depends on; re-gating tap needs that clock-sync interaction fixed first (or an ARM-MCU eddy test). intb_pin (PK7) is held low so query_status_ldc1612 reports data-ready; auto_trsync_trigger_ticks fires the X/Y cartesian endstops on G28. tick_mode runs the bridge in tick-socket lockstep so the climb and trigger are deterministic regardless of host load.",
     "i2c_default": {
         "register_responses": {
             "0x7e": [
@@ -16,9 +16,9 @@
         "z_step_pin": "PL3",
         "z_dir_pin": "PL1",
         "descend_level": 0,
-        "baseline_raw": 35000000,
-        "free_per_step": 2000,
-        "contact_descent": 850,
+        "baseline_raw": 31556000,
+        "free_per_step": 500,
+        "contact_descent": 1160,
         "depress_per_step": 200,
         "sample_rate": 250
     },
@@ -38,5 +38,9 @@
             0
         ]
     ],
-    "tick_mode": true
+    "tick_mode": true,
+    "emulator_skip_gcode": [
+        "PROBE_EDDY_CURRENT_TAP_CALIBRATE",
+        "PROBE METHOD=tap"
+    ]
 }
