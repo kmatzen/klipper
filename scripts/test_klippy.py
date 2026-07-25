@@ -37,16 +37,6 @@ TEMP_EMU_CTL = "_test_emu.ctl"
 # exit on stdin EOF; we kill it after a timeout and rely on log checks.
 EMULATOR_KLIPPY_DEADLINE = 180.0
 SERIAL_PLACEHOLDER = "__EMULATOR_PTY__"
-# An emulated MCU occasionally never finishes the serial connect/identify
-# handshake under tick-mode lockstep - a transient race in the cold
-# bridge<->klippy startup (klippy logs the identify sync noise but never
-# reaches "Loaded MCU"). klippy's own connect retry reuses the same
-# bridge process and so cannot recover (the simavr/renode instance is
-# already in the desynced state); spawning a fresh bridge almost always
-# does. So a test whose only failure is that connect race is re-run from
-# scratch up to this many times. A real failure connects first ("Loaded
-# MCU") and is never retried.
-EMULATOR_CONNECT_RETRIES = 3
 
 
 ######################################################################
@@ -2021,50 +2011,6 @@ class TestCase:
 # Startup
 ######################################################################
 
-def _emulator_connect_flake(log_path, test_fname=None):
-    # True when a failed run's only problem is the cold-start serial
-    # connect/identify handshake never finishing (klippy logs the
-    # identify sync noise but never reaches "Loaded MCU"). klippy's own
-    # connect retry reuses the same bridge and so cannot recover - a
-    # fresh process almost always connects cleanly.
-    #
-    # A non-emulator (fileoutput) run never does a serial connect and a
-    # plain logic-error failure gets the MCU connected ("Loaded MCU")
-    # first - neither is retried.
-    #
-    # Multi-MCU tests EXPECT_LOG_CONTAINS "Loaded MCU 'X'" for each
-    # bridge they spawn; the cold-start race can hit any one of them,
-    # so we also flag a flake when a single-MCU loaded but a sibling
-    # is missing - the bare "Loaded MCU" substring check below would
-    # otherwise treat partial load as success.
-    try:
-        with open(log_path) as f:
-            log = f.read()
-    except OSError:
-        return False
-    if "Starting serial connect" not in log:
-        return False
-    if "Unable to connect" in log or "Timeout on connect" in log:
-        return True
-    if "Loaded MCU" not in log:
-        return True
-    if test_fname is not None:
-        try:
-            with open(test_fname) as tf:
-                for raw in tf:
-                    cpos = raw.find('#')
-                    line = raw[:cpos] if cpos >= 0 else raw
-                    parts = line.strip().split(None, 1)
-                    if len(parts) != 2 or parts[0] != "EXPECT_LOG_CONTAINS":
-                        continue
-                    pat = _parse_quoted(parts[1])
-                    if pat.startswith("Loaded MCU '") and pat not in log:
-                        return True
-        except OSError:
-            pass
-    return False
-
-
 def main():
     # Parse args
     usage = "%prog [options] <test cases>"
@@ -2096,19 +2042,11 @@ def main():
     # Run each test
     failures = []
     for fname in args:
-        for attempt in range(EMULATOR_CONNECT_RETRIES + 1):
-            tc = TestCase(fname, options.dictdir, options.tempdir,
-                          options.verbose, options.keepfiles,
-                          force_emulator=options.force_emulator,
-                          default_fixture=options.default_fixture)
-            res = tc.run()
-            if (res == 'success'
-                    or not _emulator_connect_flake(TEMP_LOG_FILE, fname)):
-                break
-            sys.stderr.write(
-                "    %s: emulated MCU connect race (attempt %d/%d) - "
-                "retrying with a fresh bridge\n"
-                % (fname, attempt + 1, EMULATOR_CONNECT_RETRIES + 1))
+        tc = TestCase(fname, options.dictdir, options.tempdir,
+                      options.verbose, options.keepfiles,
+                      force_emulator=options.force_emulator,
+                      default_fixture=options.default_fixture)
+        res = tc.run()
         if res != 'success':
             sys.stderr.write("\n\nTest case %s FAILED (%s)!\n\n"
                              % (fname, res))
