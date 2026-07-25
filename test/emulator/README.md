@@ -233,10 +233,8 @@ The framework's full env-knob surface, in summary:
 | `KLIPPY_TICK_TRACE` | klippy + bridge | Per-round-trip CSV (`.klippy` / bridge B-trace) — input to the §5.2 byte-identical proof procedure. |
 | `KLIPPY_TICK_STALL_LOG`, `KLIPPY_TICK_STALL_LIMIT` | klippy | Surface the reactor livelock guard (`§5.1` / `_tick_stall_log`). |
 | `BRIDGE_TICK_DIAG` | bridge | Log every advance read and `done` written (simavr + renode). |
-| `BRIDGE_FREERUN_SETUP`, `BRIDGE_HOST_PTY`, `BRIDGE_NO_STK_SWALLOW`, `KLIPPY_SUART_TRACE` | simavr bridge | A/B isolation knobs documented in `TICK_PROTOCOL_DESIGN.md §9.1`. |
 | `KLIPPY_LDC1612_RAMP_TRACE` | simavr bridge | Per-step-edge CSV `cycle dir_irq_value descend_level descending net_descent` for the `ldc1612_ramp` hook (PR8 eddy/load_cell follow-up). Off by default. |
 | `RENODE_PEEK_SHUTDOWN`, `RENODE_PEEK_DEBUG` | renode launcher | Optional firmware-shutdown reason surfacing (debug aid). |
-| `RENODE_EXP_QUANTUM`, `RENODE_EXP_MIPS`, `RENODE_EXP_BLOCKSIZE` | renode launcher | Experimental performance knobs (emulation quantum / CPU MIPS / block-translation size). Default off. |
 | `KLIPPER_W1_DEVICES_PATH` | firmware (linux MCU) | Overrides the `/sys/bus/w1/devices` prefix the DS18B20 driver scans. Used by `linuxtest.test` to point at a tempdir mock; unset on real hardware. |
 
 All ship disabled / inert by default.

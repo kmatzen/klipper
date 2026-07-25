@@ -555,8 +555,9 @@ Hence `S_{n+1}` is identical across runs. ∎ (modulo conditions C1–C7)
   made B *wait* for async pty delivery on every advance and regressed `load_cell`
   8 s → 180 s; the socket removes the asynchrony at the source rather than
   waiting it out. The transport is gated to tick mode (free-run still uses
-  `uart_pty`) and is byte-identical to real hardware off tick mode (C9). A
-  `BRIDGE_HOST_PTY` A/B knob restores the legacy pty for comparison, and the
+  `uart_pty`) and is byte-identical to real hardware off tick mode (C9). (A
+  `BRIDGE_HOST_PTY` A/B knob restored the legacy pty during this comparison;
+  it was removed once the comparison concluded.) The
   bridge writes the §5.2 `out_hash` B-trace under `KLIPPY_TICK_TRACE`.
   **Proof status (landed).** The reactor-driven receive, bounded quantum,
   barrier-pause setup and `PYTHONHASHSEED=0` are now in the tree alongside the
@@ -592,10 +593,9 @@ a concrete property to verify, not a hope.
 
 A steady-state stall — distinct from the cold-start identify race — could
 occasionally freeze a tick-mode run: sim_time stopped updating and the test
-eventually hit its wall deadline. The `EMULATOR_CONNECT_RETRIES` backstop only
-ever covered the *cold-start* connect race (`_emulator_connect_flake` returns
-False once "Loaded MCU" is logged), so it never actually re-ran a steady-state
-stall — the stall just had to be fixed. There were **two distinct mechanisms**,
+eventually hit its wall deadline. The whole-test connect retry the runner
+carried at the time only ever covered the *cold-start* connect race, so it
+never actually re-ran a steady-state stall — the stall just had to be fixed. There were **two distinct mechanisms**,
 distinguished by CPU profile; both are now fixed at the source.
 
 1. **Clock-sync timer livelock (klippy ~100 % CPU, sim_time frozen).**
@@ -621,15 +621,16 @@ distinguished by CPU profile; both are now fixed at the source.
    **Fix — reactor `_dispatch_loop` livelock guard (`_tick_decide_advance`,
    `_TICK_STALL_LIMIT`).** When a timer is overdue (`_next_timer <= eventtime`)
    yet sim_time is frozen for `_TICK_STALL_LIMIT` (64) consecutive iterations,
-   the loop lets one advance through. That advance clamps its target to
-   `eventtime`, so the bridge steps the MCU by **exactly one cycle** (its L1
-   `+1`-cycle guard) — the reactor analogue of that guard. A *minimal* step is
-   deliberate and load-bearing: the bridge drains its **entire** pending output
-   buffer after any advance, so a single cycle is enough to deliver the firmware
-   reply that unblocks the stuck timer, while **not** running the MCU past
-   klippy's queued steps. A larger forced jump (a full quantum, or even the 8 ms
-   wait-quantum) mid-move underruns the renode stepper queue and trips
-   "Timer too close"; the `+1`-cycle step does not.
+   the reactor raises `ReactorError` naming the overdue waketime and the
+   streak, so the wedge surfaces as a prompt, attributable failure instead of
+   a deadline-length hang. (As first shipped the guard instead *healed* the
+   wedge with a single `+1`-cycle forced advance — minimal so it never ran the
+   MCU past klippy's queued steps. That heal predated the synchronous renode
+   host link: once the link became an AF_UNIX socket, the only observed
+   trigger — the async pty's background reader — was gone at the source and
+   the measured streak high-water dropped to 0 across the full gate. The heal
+   was then replaced by fail-fast, since a silent self-heal can mask a real
+   protocol bug and never fires on a healthy run anyway.)
 
    **Guard reachability (TLA+, `tla/livelock/TickLivelock.tla`, config `MCGuardFd`).** The guard as
    first written was **not sufficient**, for a reason the CPU-profile analysis
@@ -645,19 +646,21 @@ distinguished by CPU profile; both are now fixed at the source.
    the guard sat in the `elif`, an fd-ready iteration skipped it entirely.
 
    The fix is an ordering, not a counter tweak: `_check_fds` runs first
-   (preserving §2.5 D-PRE — a forced advance must never bypass the drain), then
+   (preserving §2.5 D-PRE — the guard must never trip before the drain), then
    `_tick_decide_advance(timeout, eventtime, after_fds)` is consulted on *every*
-   tick iteration. On an fd-ready iteration it returns True only at the stall
-   limit, so healthy runs are unchanged. Verified in TLC: liveness holds with
-   fds arriving; the pre-fix shape violates it.
+   tick iteration. On an fd-ready iteration it trips only at the stall
+   limit, so healthy runs are unchanged. Verified in TLC: the wedge cannot
+   persist silently with fds arriving; the pre-fix shape lets it.
 
    The `64` limit sits an order
    of magnitude above the ≤ 3 healthy peak and far below the millions a real
    livelock reaches, so the guard is **inert** on healthy runs (verified:
    `temperature`/`load_cell` traces stay byte-identical, 174 / 490 advances/run;
-   max streak 1 / 2) and breaks the renode-multi-MCU livelock within a couple of
-   forced advances (verified: `multi_mcu_avr_stm32` / `…_xmcu` 16/16 pass, 0
-   "Timer too close", vs. intermittent ~370 s hangs with the guard disabled).
+   max streak 1 / 2). The renode-multi-MCU livelock it originally healed
+   (intermittent ~370 s hangs on `multi_mcu_avr_stm32` / `…_xmcu`; 16/16 pass
+   with the heal) is now prevented at the source by the synchronous renode
+   link; with that trigger gone, the guard's remaining job is to make any
+   future wedge fail loudly and diagnosably.
 
 2. **Bridge-stall (klippy ~0 % CPU, blocked in lockstep `recv`).** A bridge could
    stop replying `done` to an `advance`, blocking the reactor's `recv` until the
@@ -682,14 +685,17 @@ distinguished by CPU profile; both are now fixed at the source.
    runs); the two robustness fixes above are the structural safety net.
 
 **Diagnostics (ship disabled).** `KLIPPY_TICK_STALL_LOG=1` makes the reactor log
-the overdue-streak high-water mark, each forced advance, and a per-5 s
+the overdue-streak high-water mark and a per-5 s
 "awaiting `done` from socket N" line while a `recv` is blocked.
 `BRIDGE_TICK_DIAG=1` makes both bridges log every advance read and `done` written,
 so a stall localises to the side that stopped issuing work.
 
 **Result:** both mechanisms are fixed in the reactor / launcher (real hardware
-byte-identical — every change is under the tick guard), so the steady-state wedge
-no longer needs the `EMULATOR_CONNECT_RETRIES` whole-test re-run.
+byte-identical — every change is under the tick guard). The cold-start connect
+race itself was also fixed at the source by the barrier-pause setup + the
+synchronous AF_UNIX host link (measured: 0 races across 60 cold bridge starts,
+vs ~20% per start when the runner-level retry was introduced), so the
+whole-test connect retry has been removed from `test_klippy.py` entirely.
 
 ### 5.2 Empirical proof procedure (the decisive test)
 
@@ -707,9 +713,7 @@ A proof sketch is necessary but not sufficient; we also *measure* determinism:
    one failure mode §2.5's drop guard exists to catch: two runs that both dropped
    data still produced identical `out_total`/`out_hash`, so "byte-identical"
    could not distinguish a clean run from a corrupt one. Byte-identical traces
-   now mean identical *delivered* streams. *(Implemented;
-   the `KLIPPY_SUART_TRACE` per-byte host↔AVR trace added for the cold-start
-   investigation is a separate, finer diagnostic.)*
+   now mean identical *delivered* streams. *(Implemented.)*
 2. Run a target test (`temperature`, then `load_cell`, then a homing test)
    **N≥3** times under deliberately varied host load (`stress-ng`/parallel gate
    / CPU oversubscription).
@@ -944,15 +948,16 @@ So production and real-MCU regression are byte-identical to current `master`.
   identify framing — models the bootloader; this PR).
 - `PYTHONHASHSEED=0` for the klippy tick subprocess (`test_klippy.py`) —
   pins dict/set iteration order so timer ordering is run-to-run identical.
-- **Livelock guard + recv safety net** in `reactor.py` (§5.1): a `+1`-cycle
-  forced advance after `_TICK_STALL_LIMIT` overdue-with-frozen-sim iterations
+- **Livelock guard + recv safety net** in `reactor.py` (§5.1): a fail-fast
+  `ReactorError` after `_TICK_STALL_LIMIT` overdue-with-frozen-sim iterations
   (mechanism 1), and a `_TICK_RECV_TIMEOUT`-bounded lockstep recv that names a
   wedged bridge instead of hanging (mechanism 2). Plus the renode launcher's
   `_tick_serve_client` no longer dies silently. Both fix the steady-state wedge
   at the source, so it no longer needs the retry.
-- The retry loop / `_emulator_connect_flake` / `EMULATOR_CONNECT_RETRIES` now
-  only backstops the *cold-start* connect race; the §5.1 steady-state wedge is
-  fixed at the source (§5.1) and no longer relies on it.
+- The runner-level connect retry (`_emulator_connect_flake` /
+  `EMULATOR_CONNECT_RETRIES`) is removed: the cold-start race it patched is
+  fixed at the source by the barrier + synchronous host link (measured 0/60),
+  and the §5.1 steady-state wedge is fixed at the source too.
 
 (The `register_fd` receive callback + dispatch-next-iteration flow is correct
 as-is — no R5 await-drain is needed, see §2.5.)
@@ -965,18 +970,18 @@ as-is — no R5 await-drain is needed, see §2.5.)
 | `simavr_bridge.c` parse | Parse bare `advance T` (the `early` token + bridge-side E1 early-exit were **removed** — superseded by the reactor bounded quantum). |
 | `simavr_bridge.c` B1 loop | Run to target; **O1** output cap (stop at `g_suart_tx_len >= OUTPUT_CAP`). No output early-exit. |
 | `simavr_bridge.c` B2 | **KEEP-TAIL** drain: memmove unwritten remainder, never drop. |
-| `simavr_bridge.c` setup | Pre-tick **paused/barrier** loop (§4); `g_barrier_target`. (A/B knob `BRIDGE_FREERUN_SETUP`.) |
-| `simavr_bridge.c` suart | **stk500v2-leave swallow** (cold-start framing, models the bootloader). (A/B knob `BRIDGE_NO_STK_SWALLOW`; per-byte diag `KLIPPY_SUART_TRACE`.) |
+| `simavr_bridge.c` setup | Pre-tick **paused/barrier** loop (§4); `g_barrier_target`. |
+| `simavr_bridge.c` suart | **stk500v2-leave swallow** (cold-start framing, models the bootloader). |
 | `serialqueue.c` | `serialqueue_need_prompt()` → 0/1/2 = (streaming)/(un-acked sends)/(fast-readers). |
 | `chelper/__init__.py` | cdef for `serialqueue_need_prompt`. |
 | `serialhdl.py` | `_tick_need_prompt_cb` registration; reactor-driven `_tick_receive`; no bg/receiver thread in tick mode. |
 | `reactor.py` | `_tick_request_advance` ORs `need_prompt` across links → caps the advance at `_TICK_WAIT_QUANTUM` (≥1) else `_TICK_MAX_QUANTUM`; sends bare `advance T`. |
-| `reactor.py` | **§5.1 mechanism (1):** `_tick_decide_advance` livelock guard (`_TICK_STALL_LIMIT` overdue-with-frozen-sim iterations → one `+1`-cycle forced advance). |
+| `reactor.py` | **§5.1 mechanism (1):** `_tick_decide_advance` livelock guard (`_TICK_STALL_LIMIT` overdue-with-frozen-sim iterations → fail-fast `ReactorError`). |
 | `reactor.py` | **§5.1 mechanism (2):** `_TICK_RECV_TIMEOUT`-bounded lockstep `done` recv (names the wedged socket + ends, vs. silent hang). `KLIPPY_TICK_STALL_LOG` diag. |
 | `renode_launcher.py` | **§5.1 mechanism (2):** `_tick_serve_client` catches any RunFor exception, logs it, and still replies `done` (no silent thread death). `BRIDGE_TICK_DIAG` advance/done diag. |
 | `simavr_bridge.c` | `BRIDGE_TICK_DIAG` advance-read / done-written diag (§5.1). |
 | both sides | `KLIPPY_TICK_TRACE` per-round-trip CSV (§5.2), env-gated. |
-| `test_klippy.py` | `PYTHONHASHSEED=0` for the tick subprocess. `EMULATOR_CONNECT_RETRIES`/`_emulator_connect_flake` now backstops only the *cold-start* connect race (the §5.1 steady-state wedge is fixed at the source). |
+| `test_klippy.py` | `PYTHONHASHSEED=0` for the tick subprocess. (The one-time whole-test connect retry is gone - the cold-start race is fixed at the source by the barrier + synchronous host link.) |
 | (fixtures) | eddy ramped-sample fixture (§7.7) — separate. |
 
 ---
@@ -1000,8 +1005,9 @@ as-is — no R5 await-drain is needed, see §2.5.)
 identical over 3 runs — see the C2 "Proof status (landed)" note; both unchanged
 with the §5.1 livelock guard present, confirming it is inert off the wedge). The
 §5.1 steady-state wedge is now fixed at the source (the reactor livelock guard +
-bounded recv + the renode serve-thread hardening), so `EMULATOR_CONNECT_RETRIES`
-backstops only the cold-start connect race.
+bounded recv + the renode serve-thread hardening), and the cold-start connect
+race is fixed at the source as well (barrier + synchronous host link; measured
+0 races / 60 cold starts), so the runner carries no retry at all.
 
 > **Remaining (tracked, not protocol):** `load_cell.test` still fails
 > deterministically (collector `SAMPLES=0` at PROBE) — a per-test feature-timing
