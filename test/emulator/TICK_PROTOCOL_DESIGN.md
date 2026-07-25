@@ -632,6 +632,19 @@ distinguished by CPU profile; both are now fixed at the source.
    was then replaced by fail-fast, since a silent self-heal can mask a real
    protocol bug and never fires on a healthy run anyway.)
 
+   The switch to fail-fast paid for itself on its first gate run: the guard
+   fired deterministically on `multi_mcu_avr`, and the parked-frame diagnosis
+   named `motion_queuing.py drip_update_time` - the homing drip loop computed
+   a positive `wait_time` below half an ulp of `curtime`
+   (`1.4155343563970746e-15` at `curtime=23.5929159375`), so
+   `curtime + wait_time` rounded to exactly `curtime` and the greenlet parked
+   at an already-due waketime, re-deriving the identical wait from the frozen
+   clock forever. Unobservable on real hardware (wall time advances between
+   iterations); a hard spin under any frozen-clock regime. The heal had been
+   silently papering over this on every run; it is now fixed at the source in
+   `motion_queuing.py` (skip the pause when the wake time does not land
+   strictly in the future).
+
    **Guard reachability (TLA+, `tla/livelock/TickLivelock.tla`, config `MCGuardFd`).** The guard as
    first written was **not sufficient**, for a reason the CPU-profile analysis
    above misses. `_check_fds` ran in the `if` branch and the guard in the
