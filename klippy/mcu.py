@@ -294,6 +294,16 @@ class MCU_trsync:
 
 TRSYNC_TIMEOUT = 0.025
 TRSYNC_SINGLE_MCU_TIMEOUT = 0.250
+if os.environ.get('KLIPPY_TICK_SOCKET'):
+    # Tick-mode lockstep (test emulator only): the reactor's per-advance
+    # wait quantum must stay below the multi-MCU trsync watchdog or homing
+    # keep-alives arrive late by construction. Enforce the cross-file
+    # invariant the two constants encode instead of relying on comments.
+    import reactor as _reactor
+    assert _reactor.SelectReactor._TICK_WAIT_QUANTUM < TRSYNC_TIMEOUT, (
+        "reactor._TICK_WAIT_QUANTUM (%.3f) must stay below mcu"
+        " TRSYNC_TIMEOUT (%.3f)" % (
+            _reactor.SelectReactor._TICK_WAIT_QUANTUM, TRSYNC_TIMEOUT))
 
 class TriggerDispatch:
     def __init__(self, mcu):

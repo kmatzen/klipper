@@ -812,7 +812,7 @@ static void ldc1612_ramp_hook(struct avr_irq_t *irq, uint32_t value,
                               void *param);
 
 /* Optional per-step-edge diagnostic trace for the ldc1612_ramp hook,
- * matched on the KLIPPY_TICK_TRACE / KLIPPY_SUART_TRACE pattern. When
+ * matched on the KLIPPY_TICK_TRACE pattern. When
  * KLIPPY_LDC1612_RAMP_TRACE=<path> is set, every step-rising-edge
  * appends one line:
  *   cycle dir_irq_value descend_level descending net_descent_after
@@ -3396,43 +3396,20 @@ suart_xoff_hook(struct avr_irq_t *irq, uint32_t value, void *param)
  * (static buffer) for write_slave_link(). The socket path is derived
  * from the slave-link path so it lands in the same per-test tempdir.
  * A socket (not a pty) is what makes the byte stream deterministic -
- * see the block comment above on slave->master async pty delivery.
- * BRIDGE_HOST_PTY restores the legacy pty for A/B comparison. */
+ * see the block comment above on slave->master async pty delivery. */
 static const char *
 suart_setup(avr_t *avr, const char *link_path)
 {
     static char hostpath[256];
-    if (getenv("BRIDGE_HOST_PTY")) {
-        /* A/B knob (mirrors BRIDGE_FREERUN_SETUP / BRIDGE_NO_STK_SWALLOW):
-         * restore the legacy pty host link so the socket transport can be
-         * compared against it (run the KLIPPY_TICK_TRACE proof both ways).
-         * The pty's slave->master delivery is asynchronous - this is the
-         * C2 non-determinism the socket default removes. */
-        int sfd = -1;
-        if (openpty(&g_suart_master, &sfd, hostpath, NULL, NULL) < 0) {
-            fprintf(stderr, "simavr_bridge: openpty: %s\n", strerror(errno));
-            return NULL;
-        }
-        struct termios tio;
-        if (tcgetattr(g_suart_master, &tio) == 0) {
-            cfmakeraw(&tio);
-            tcsetattr(g_suart_master, TCSANOW, &tio);
-        }
-        close(sfd);
-        int fl = fcntl(g_suart_master, F_GETFL, 0);
-        if (fl >= 0)
-            fcntl(g_suart_master, F_SETFL, fl | O_NONBLOCK);
-    } else {
-        snprintf(hostpath, sizeof(hostpath), "%s.sock", link_path);
-        g_suart_listen = unix_listen_socket(hostpath);
-        if (g_suart_listen < 0)
-            return NULL;
-        /* g_suart_master stays -1 until klippy connects and the main loop
-         * accept()s it; suart_refill_input/suart_drain_output no-op until
-         * then. No termios: a socket has no line discipline to configure
-         * (that is precisely why klipper's binary framing passes untouched
-         * and synchronously). */
-    }
+    snprintf(hostpath, sizeof(hostpath), "%s.sock", link_path);
+    g_suart_listen = unix_listen_socket(hostpath);
+    if (g_suart_listen < 0)
+        return NULL;
+    /* g_suart_master stays -1 until klippy connects and the main loop
+     * accept()s it; suart_refill_input/suart_drain_output no-op until
+     * then. No termios: a socket has no line discipline to configure
+     * (that is precisely why klipper's binary framing passes untouched
+     * and synchronously). */
     /* Disable simavr's built-in stdio echo so UART output reaches our
      * IRQ hook rather than the bridge's stdout. */
     uint32_t f = 0;
@@ -3804,10 +3781,6 @@ main(int argc, char *argv[])
     int state = cpu_Running;
     uint64_t throttle_check_interval = avr->frequency / 1000;
     uint64_t next_throttle_cycle = throttle_check_interval;
-    /* A/B isolation knob: BRIDGE_FREERUN_SETUP=1 reverts to the old pre-tick
-     * wall-clock free-run setup (no barrier-pause), so the TICK_PROTOCOL_DESIGN
-     * 5.1 trace can be compared with vs without the deterministic setup. */
-    int freerun_setup = (getenv("BRIDGE_FREERUN_SETUP") != NULL);
     /* Stall diagnostic (BRIDGE_TICK_DIAG): log every advance the bridge reads
      * and every `done` it writes, so when a tick run wedges (mechanism (2),
      * TICK_PROTOCOL_DESIGN.md 4.1) the per-bridge log shows whether this
@@ -4036,7 +4009,7 @@ main(int argc, char *argv[])
                         (unsigned long long)avr->cycle);
             continue;
         }
-        if (tick_listen_fd >= 0 && !freerun_setup) {
+        if (tick_listen_fd >= 0) {
             /* Tick mode, klippy not yet connected: deterministic setup
              * (TICK_PROTOCOL_DESIGN.md 4). Advance the AVR ONLY toward a
              * pending fixture-setup barrier; pause otherwise. This makes

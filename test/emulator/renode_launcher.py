@@ -703,31 +703,6 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
                           'sysbus LoadELF @{elf}\n').format(elf=elf_path)
     else:
         elf_load_block = 'sysbus LoadELF @{elf}\n'.format(elf=elf_path)
-    # EXPERIMENT knobs (env-driven so they can be toggled without a
-    # rebuild): RENODE_EXP_QUANTUM sets the emulation global sync
-    # quantum in seconds (smaller = finer host/virtual interleaving =
-    # less bursty clock, at the cost of speed); RENODE_EXP_MIPS pins
-    # the CPU's reported MIPS. Both are no-ops when unset.
-    timing_block = ''
-    _exp_quantum = os.environ.get('RENODE_EXP_QUANTUM')
-    if _exp_quantum:
-        timing_block += 'emulation SetGlobalQuantum "%s"\n' % _exp_quantum
-    _exp_mips = os.environ.get('RENODE_EXP_MIPS')
-    if _exp_mips:
-        timing_block += 'cpu PerformanceInMips %s\n' % _exp_mips
-    # RENODE_EXP_BLOCKSIZE caps the CPU's translation-block size so the
-    # CPU services a pending IRQ (e.g. SysTick) after fewer instructions.
-    # The hypothesis was that a large block lets DWT->CYCCNT run past a
-    # due timer deadline before SysTick_Handler fires, tripping
-    # armcm_timer.c's ">1ms in the past" shutdown (reason 56). Empirically
-    # this is NOT the cause for the SAME70 USB build: a sweep from 1..1024
-    # left the reason-56 shutdown unchanged (the overshoot is not
-    # IRQ-servicing-granularity-bound; it comes from the wall-clock vs
-    # virtual-time drift that only deterministic tick-mode removes). Kept
-    # as a diagnostic knob alongside MIPS/QUANTUM. No-op when unset.
-    _exp_blocksize = os.environ.get('RENODE_EXP_BLOCKSIZE')
-    if _exp_blocksize:
-        timing_block += 'cpu MaximumBlockSize %s\n' % _exp_blocksize
     usart = _host_link_peripheral(chip)
     if tick_mode:
         # Tick mode: skip Renode's pty terminal entirely. The launcher
@@ -746,7 +721,6 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
         'mach create "klipper-{chip}"\n'
         '{cs_include_block}'
         'machine LoadPlatformDescription {platform}\n'
-        '{timing_block}'
         '{rcc_block}'
         '{afec_block}'
         '{extra_block}'
@@ -778,7 +752,7 @@ def _render_resc(chip, elf_path, pty_path, monitor_port, log_path,
              afec_block=afec_block, extra_block=extra_block,
              cs_include_block=cs_include_block,
              elf_load_block=elf_load_block,
-             uart_block=uart_block, timing_block=timing_block,
+             uart_block=uart_block,
              adc_bases=repr(_adc_poke_bases(chip)),
              hooks_dir=os.path.dirname(_HOOKS_PY))
 
