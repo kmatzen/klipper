@@ -284,39 +284,20 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # upstream master. A mis-routed endstop still fails the test (homing
 # just stops later), so no homing bug is masked. Both tests gate.
 #
-# eddy.test and load_cell.test are NOT in the default gate post-rebase
-# onto upstream master (see the PR body "Known limitations" entry):
-# upstream `d2aa4bd7e ldc1612: Increase sample rate to 400 samples per
-# second (up from 250)` bumped the default data_rate and the AVR atmega2560
-# at 250 kbaud serial cannot sustain the resulting bulk_sensor frame load -
-# samples drop and the eddy gather trips "Eddy: Gaps in the data". The
-# upstream probe-helper refactor (b13ae529a / c92b1f73a / 21ad5d820) lands
-# in the same range and the eddy fixture's count-ramp + calibration knobs
-# need joint retuning against the new probe-session flow. A clean fix is
-# either a per-board `data_rate` config option on `[ldc1612]` (so the
-# emulator AVR cfg can pin 250) plus end-to-end fixture/bridge retune, or
-# an ARM-MCU eddy test (the rate bump is fine on STM32). The pre-rebase
-# fixture + helper combination passed cleanly; tracked as the next item
-# in the PR's "Next steps".
-#
-# Earlier framework rationale (kept for reference even though both tests
-# are temporarily out of the default gate): the deterministic tick path
-# (reactor-driven receive + bounded quantum + barrier-pause) exposed both
-# as false-passes the old non-deterministic background-thread + connect-
-# retry path had masked: with a constant sensor sample the eddy virtual
-# endstop never crossed threshold and the load-cell collector saw
-# SAMPLES=0. Both got a Z-ramped sensor fixture: the simavr bridge
-# synthesizes a probe sample that tracks the Z stepper position
-# (ldc1612_ramp for the eddy LDC1612 I2C DATA0 count; probe_step for the
-# load_cell ADS1220), so the virtual endstop crosses threshold on descent
-# and the collector gets real samples. The one operation NOT gated is
-# eddy `PROBE METHOD=tap`: its diff_peak detector differentiates the
-# sample stream and needs a continuously-sampled oscillator, but the
-# firmware reads the synthetic count on a jittery ~2ms
-# poll grid, so the per-sample derivative carries timing noise above the tap
-# threshold; that one line is skipped under the emulator (eddy.fixture.json
-# emulator_skip_gcode) and runs only in fileoutput. A mis-routed endstop
-# still fails the test (homing stops later), so no homing bug is masked.
+# eddy.test and load_cell.test gate here. Both were re-tuned against the
+# current probe-helper stack: eddy's ldc1612_ramp geometry is derived from
+# the cfg calibration table (see eddy.fixture.json for the math) and the
+# bridge floor was corrected to sit below the descend-trigger frequency
+# (it previously pegged the whole ramp, which made the descend probes
+# trigger vacuously and starved the tap detector); load_cell needed the
+# bridge to model the ADS131M02 init protocol that upstream added to
+# load_cell.cfg (init-only; see spi_ads131_chip). PROBE METHOD=tap and
+# PROBE_EDDY_CURRENT_TAP_CALIBRATE stay fileoutput-only via
+# emulator_skip_gcode - the framework's historically validated scope -
+# because sustained sampling+motion load on the 250 kbaud AVR link
+# degrades the clocksync frequency estimate and warps the sample-time-to-
+# position correlation the tap fit depends on (tracked; an ARM-MCU eddy
+# test avoids the link ceiling entirely).
 #
 # delta_calibrate.test gates here. The cfg's rotation_distance was rescaled
 # from the original fileoutput-only 0.32 (contrived for clean integer
@@ -373,6 +354,8 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/multi_mcu_stm32_stm32.test", \
      "test/klippy/multi_mcu_linuxprocess_avr.test", \
      "test/klippy/temperature.test", \
+     "test/klippy/eddy.test", \
+     "test/klippy/load_cell.test", \
      "test/klippy/delta.test", \
      "test/klippy/delta_calibrate.test", \
      "test/klippy/bltouch.test", \

@@ -1,8 +1,7 @@
 # Nightly byte-identical determinism proof for the MCU emulator's
 # deterministic tick-mode protocol. Builds the emulator-test Docker
 # image and runs test/emulator/proof.sh against the validated tick-mode
-# regression traces (currently temperature.test; load_cell.test joins
-# the proof set once it re-gates per the PR8 known limitation).
+# regression traces (temperature.test + load_cell.test).
 #
 # Proof: run the test N=3 times under KLIPPY_TICK_TRACE; every
 # klippy-side R-trace and bridge-side B-trace must hash identical across
@@ -47,6 +46,11 @@ jobs:
           docker build \
               -t klipper-emu \
               -f scripts/Dockerfile.emulator-test .
+
+      - name: Proof - load_cell.test (N=3)
+        run: |
+          docker run --rm klipper-emu \
+              bash test/emulator/proof.sh load_cell 3
 
       - name: Proof - temperature.test (N=3)
         run: |
