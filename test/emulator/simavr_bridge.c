@@ -3487,7 +3487,8 @@ suart_feed_one(uint64_t cycle)
          * delay if a stride stays in lockstep with the mask. Real strides do
          * not sustain that, so this is a latency hazard rather than a live
          * defect, and it is left alone deliberately: changing the gate shifts
-         * host->AVR byte timing on every test to close a hole nobody has hit. */
+         * host->AVR byte timing on every test to close a hole nobody has
+         * hit. */
         if (cycle & 0x1FF)
             return;
         suart_refill_input();
