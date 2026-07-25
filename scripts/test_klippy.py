@@ -1026,6 +1026,50 @@ class TestCase:
             chips.append((cs, drdy, rate))
         return chips
 
+    _ADS131_SENSOR_TYPE_RE = re.compile(
+        r'^\s*sensor_type\s*:\s*(ads131m0[24])\s*(?:#.*)?$')
+
+    @classmethod
+    def _parse_ads131_chips(cls, config_fname):
+        # Yield (cs_pin, id_hi) for every [load_cell ...] /
+        # [load_cell_probe] section whose sensor_type is ads131m02 /
+        # ads131m04. The bridge only needs the CS pin (init-only
+        # protocol model - no DRDY pacing); id_hi is the ID register
+        # high byte klippy verifies (0x22 = M02, 0x24 = M04).
+        chips = []
+        in_section = False
+        cs = None
+        id_hi = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return chips
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    if in_section and id_hi is not None and cs is not None:
+                        chips.append((cs, id_hi))
+                    in_section = bool(
+                        cls._LOAD_CELL_SECTION_RE.match(stripped))
+                    cs = id_hi = None
+                    continue
+                if not in_section:
+                    continue
+                m = cls._ADS131_SENSOR_TYPE_RE.match(line)
+                if m:
+                    id_hi = 0x22 if m.group(1) == 'ads131m02' else 0x24
+                    continue
+                m = cls._ADS1220_CS_PIN_RE.match(line)
+                if m:
+                    cs = m.group(2)
+                    continue
+        finally:
+            f.close()
+        if in_section and id_hi is not None and cs is not None:
+            chips.append((cs, id_hi))
+        return chips
+
     @classmethod
     def _parse_sw_i2c_pin_pairs(cls, config_fname):
         # Yield (scl_pin, sda_pin) for each section that has matching
@@ -1403,6 +1447,16 @@ class TestCase:
                                 cs[1], int(cs[2:]),
                                 drdy[1], int(drdy[2:]),
                                 rate))
+                # ADS131M0x sections share the SPI bus but speak a
+                # different (3-byte-word framed) protocol; register
+                # their CS pins so the bridge serves their init
+                # sequence and keeps their frames out of the ADS1220
+                # decoder.
+                for cs, id_hi in self._parse_ads131_chips(config_fname):
+                    if (len(cs) >= 3 and cs[0] == 'P'
+                            and cs[1].isalpha()):
+                        lines.append("spi_ads131_chip %s %d %d" % (
+                            cs[1], int(cs[2:]), id_hi))
         # load_cell_probe_trigger: hook the configured Z step pin and
         # synthesize a ramped ADC sample = (steps_in_burst *
         # force_per_step) raw counts. A step burst starts on the

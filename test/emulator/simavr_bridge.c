@@ -341,6 +341,46 @@ static int ads1220_chips_count = 0;
 
 static int ads1220_active_chip = -1; /* index of chip whose CS is low */
 
+/* ADS131M0x (init-only model). klippy's ads131m0x.py runs an ID read,
+ * RESET + ack readback, and four register write-verifies at connect
+ * for every [load_cell] section with an ads131m02/m04 sensor. The
+ * test suite uses those sections for parse+init coverage only (no
+ * client ever subscribes), so the bridge models just the init
+ * protocol: 3-byte words, >=4-word frames, a 16-bit command in word0,
+ * and the response to a frame served in word0 of the NEXT frame (the
+ * chip is full-duplex one-frame-delayed). No DRDY pacing and no
+ * sample streaming - the DRDY pin is never asserted, which is fine
+ * because the firmware only watches it after a query the test never
+ * issues. Registering the chip's CS pin also keeps its frames out of
+ * the ADS1220 byte decoder, which shares the SPI bus. */
+#define ADS131_CHIP_MAX 4
+#define ADS131_REG_MAX 16
+struct ads131_chip {
+    char cs_port;              /* 'A'..'L' */
+    int cs_pin;                /* 0..7 */
+    uint8_t id_hi;             /* ID register high byte (0x22 = M02) */
+    uint16_t regs[ADS131_REG_MAX];
+    uint16_t next_resp;        /* word0 of the next frame's MISO */
+    uint8_t frame_pos;         /* byte index within current frame */
+    uint8_t cmd_hi, cmd_lo;    /* word0 = command */
+    uint8_t d0_hi, d0_lo;      /* word1 = first data word (WREG) */
+};
+static struct ads131_chip ads131_chips[ADS131_CHIP_MAX];
+static int ads131_chips_count = 0;
+static int ads131_active_chip = -1;  /* index of chip whose CS is low */
+
+/* Reset-default register file: ID (klippy verifies the high byte),
+ * STATUS with the WORD24 bit set (klippy's post-init check masks with
+ * 0xBFFC and expects 0x0100), MODE reset default. */
+static void
+ads131_reset_regs(struct ads131_chip *c)
+{
+    memset(c->regs, 0, sizeof(c->regs));
+    c->regs[0x00] = (uint16_t)(((uint16_t)c->id_hi << 8) | 0x02);
+    c->regs[0x01] = 0x0100;
+    c->regs[0x02] = 0x0100;
+}
+
 /* Global I2C (TWI) read response queue. Klippy talks to I2C
  * peripherals (SHT3X, LDC1612, MAX31865, ...) by writing a command
  * byte sequence then reading N bytes per measurement; tests script
@@ -641,6 +681,7 @@ static avr_cycle_count_t sw_uart_tx_bit(struct avr_t *avr,
 /* Forward decl - definition lives further down with the SPI hook. */
 static void tmc_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static void ads1220_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param);
+static void ads131_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param);
 static avr_cycle_count_t ads1220_drdy_assert(struct avr_t *avr,
                                              avr_cycle_count_t when,
                                              void *param);
@@ -2370,6 +2411,49 @@ ads1220_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     pthread_mutex_unlock(&spi_state.lock);
 }
 
+/* CS-pin hook for a registered ADS131M0x chip. Falling edge selects
+ * the chip and resets the frame position; rising edge closes the
+ * frame - decode word0 (and word1 for WREG) and stage word0 of the
+ * NEXT frame's MISO, which is how the real chip's one-frame-delayed
+ * full-duplex response behaves. klippy's driver reads a response by
+ * sending the command frame (response discarded) followed by a NULL
+ * frame (response = staged value). */
+static void
+ads131_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq;
+    int idx = (int)(intptr_t)param;
+    if (idx < 0 || idx >= ads131_chips_count)
+        return;
+    pthread_mutex_lock(&spi_state.lock);
+    if (value == 0) {
+        ads131_active_chip = idx;
+        ads131_chips[idx].frame_pos = 0;
+    } else if (ads131_active_chip == idx) {
+        struct ads131_chip *c = &ads131_chips[idx];
+        if (c->frame_pos >= 2) {
+            uint16_t cmd = ((uint16_t)c->cmd_hi << 8) | c->cmd_lo;
+            if ((cmd & 0xE000) == 0xA000) {          /* RREG */
+                uint8_t reg = (cmd >> 7) & 0x3F;
+                c->next_resp = reg < ADS131_REG_MAX ? c->regs[reg] : 0;
+            } else if ((cmd & 0xE000) == 0x6000) {   /* WREG, 1 reg */
+                uint8_t reg = (cmd >> 7) & 0x3F;
+                uint16_t v = ((uint16_t)c->d0_hi << 8) | c->d0_lo;
+                if (reg < ADS131_REG_MAX && reg != 0x00 && reg != 0x01)
+                    c->regs[reg] = v;
+                c->next_resp = (uint16_t)(0x4000 | (cmd & 0x1FFF));
+            } else if (cmd == 0x0011) {              /* RESET */
+                ads131_reset_regs(c);
+                c->next_resp = 0xFF22;               /* RESET_ACK */
+            } else {                                 /* NULL / other */
+                c->next_resp = c->regs[0x01];        /* STATUS */
+            }
+        }
+        ads131_active_chip = -1;
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+}
+
 /* simavr cycle timer callback: assert this chip's DRDY low to signal
  * "sample ready", then re-arm one period out. The firmware's poll
  * loop sees DRDY low and schedules a wake task that does the 3-byte
@@ -2392,6 +2476,55 @@ ads1220_drdy_assert(struct avr_t *avr, avr_cycle_count_t when, void *param)
         pthread_mutex_unlock(&spi_state.lock);
     }
     return when + c->period_cycles;
+}
+
+/* spi_ads131_chip <cs_port> <cs_pin> <id_hi>
+ * Register an ADS131M0x chip's CS pin so the bridge serves its
+ * init-sequence protocol (ID / RESET-ack / register write-verify).
+ * id_hi is the ID register's high byte (0x22 = ADS131M02, 0x24 =
+ * ADS131M04). */
+static void
+apply_spi_ads131_chip(struct control_ctx *ctx,
+                      int cs_port_ord, int cs_pin, int id_hi)
+{
+    if (cs_port_ord < 'A' || cs_port_ord > 'L')
+        return;
+    if (cs_pin < 0 || cs_pin > 7)
+        return;
+    char cs_port = (char)cs_port_ord;
+    pthread_mutex_lock(&spi_state.lock);
+    int existing = -1;
+    for (int i = 0; i < ads131_chips_count; i++) {
+        if (ads131_chips[i].cs_port == cs_port
+                && ads131_chips[i].cs_pin == cs_pin) {
+            existing = i;
+            break;
+        }
+    }
+    int slot = existing;
+    if (slot < 0 && ads131_chips_count < ADS131_CHIP_MAX) {
+        slot = ads131_chips_count++;
+        ads131_chips[slot].cs_port = cs_port;
+        ads131_chips[slot].cs_pin = cs_pin;
+        ads131_chips[slot].id_hi = (uint8_t)id_hi;
+        ads131_reset_regs(&ads131_chips[slot]);
+        ads131_chips[slot].next_resp = ads131_chips[slot].regs[0x01];
+        ads131_chips[slot].frame_pos = 0;
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+    if (slot < 0)
+        return;
+    if (existing < 0) {
+        avr_irq_t *cs_irq = avr_io_getirq(
+            ctx->avr, AVR_IOCTL_IOPORT_GETIRQ(cs_port), cs_pin);
+        if (cs_irq) {
+            avr_irq_register_notify(
+                cs_irq, ads131_cs_hook, (void *)(intptr_t)slot);
+        }
+        fprintf(stderr,
+                "simavr_bridge: spi_ads131_chip cs=%c%d id=%02x\n",
+                cs_port, cs_pin, id_hi & 0xff);
+    }
 }
 
 /* spi_ads1220_chip <cs_port> <cs_pin> <drdy_port> <drdy_pin> <sample_rate_hz>
@@ -2539,7 +2672,28 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     uint8_t mosi = (uint8_t)(value & 0xff);
     uint8_t resp = 0x00;
     pthread_mutex_lock(&spi_state.lock);
-    if (spi_state.ads_mode) {
+    if (ads131_active_chip >= 0 && ads131_active_chip < ads131_chips_count) {
+        /* A registered ADS131M0x chip's CS is low: serve its staged
+         * response word in bytes 0..1 of the frame and capture the
+         * command/data words; never let these bytes reach the ADS1220
+         * decoder below (shared bus, different framing). The frame is
+         * finalized in ads131_cs_hook on the CS rising edge. */
+        struct ads131_chip *c = &ads131_chips[ads131_active_chip];
+        uint8_t pos = c->frame_pos;
+        if (pos == 0) {
+            c->cmd_hi = mosi;
+            resp = (uint8_t)(c->next_resp >> 8);
+        } else if (pos == 1) {
+            c->cmd_lo = mosi;
+            resp = (uint8_t)(c->next_resp & 0xff);
+        } else if (pos == 3) {
+            c->d0_hi = mosi;
+        } else if (pos == 4) {
+            c->d0_lo = mosi;
+        }
+        if (pos < 255)
+            c->frame_pos = (uint8_t)(pos + 1);
+    } else if (spi_state.ads_mode) {
         /* ADS1220 SPI: variable-length commands.
          * Byte 0 is the command:
          *   0x40|(reg<<2)|(n-1) WREG  : write n bytes (1..4) to reg
@@ -3084,6 +3238,15 @@ apply_control_line(struct control_ctx *ctx, char *line)
             if (known)
                 apply_spi_tmc_chip(ctx,
                                    (int)(unsigned char)port, pin, p);
+        }
+        return;
+    }
+    if (strncmp(line, "spi_ads131_chip ", 16) == 0) {
+        int csp = 0, cspin = -1, idhi = 0;
+        char cs_port_ch = 0;
+        if (sscanf(line + 16, " %c %d %i", &cs_port_ch, &cspin, &idhi) == 3) {
+            csp = (int)cs_port_ch;
+            apply_spi_ads131_chip(ctx, csp, cspin, idhi);
         }
         return;
     }
