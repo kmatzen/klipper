@@ -469,13 +469,32 @@ class SelectReactor:
                     self._tick_stall_iters, self._TICK_STALL_LIMIT, eventtime)
         if self._tick_stall_iters < self._TICK_STALL_LIMIT:
             return False
+        def _timer_id(t):
+            # For a parked greenlet's wake timer, name the first frames
+            # outside reactor.py - the pause() site that is spinning.
+            name = getattr(t.callback, '__qualname__', repr(t.callback))
+            frame = getattr(getattr(t.callback, '__self__', None),
+                            'gr_frame', None)
+            stack = []
+            while frame is not None and len(stack) < 3:
+                if not frame.f_code.co_filename.endswith('reactor.py'):
+                    stack.append('%s:%d:%s' % (
+                        os.path.basename(frame.f_code.co_filename),
+                        frame.f_lineno, frame.f_code.co_name))
+                frame = frame.f_back
+            if stack:
+                name += ' parked at [%s]' % ' < '.join(stack)
+            return '%s@%.6f' % (name, t.waketime)
+        overdue = ', '.join(_timer_id(t) for t in self._timers
+                            if t.waketime <= eventtime) or '<none>'
         raise ReactorError(
             "Tick-mode livelock: timer overdue (waketime %.6f) for %d"
             " consecutive iterations with sim time frozen at %.6f. A"
             " firmware reply this timer needs is not being produced -"
             " see TICK_PROTOCOL_DESIGN.md section 5.1 and rerun with"
             " KLIPPY_TICK_STALL_LOG=1 for the streak trace."
-            % (self._next_timer, self._TICK_STALL_LIMIT, eventtime))
+            " Overdue timers: %s"
+            % (self._next_timer, self._TICK_STALL_LIMIT, eventtime, overdue))
     def _tick_request_advance(self):
         # Ask all bridges to advance simulated time, in lockstep.
         # Returns the minimum reported actual (so klippy never thinks
