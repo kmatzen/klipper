@@ -344,3 +344,25 @@ Design rationale for each per-chip wiring decision (register stubs, repl
 trade-offs, validation results) lives in the corresponding commit message;
 `git log master..HEAD --oneline --grep test/emulator -- test/emulator/` is
 the index.
+
+## Tracked future work
+
+Two coverage gaps are scoped but not yet implemented (neither reduces
+any existing coverage - they are backends/links that have never existed
+here):
+
+- **CAN-bus host link.** Every current host link is serial (plus the
+  SAME70 native USB-CDC). Plan: a `vcan` interface inside the test
+  container (`CAP_NET_ADMIN` + `modprobe vcan` on the runner), Renode's
+  SocketCAN bridge connecting the MCU's CAN controller model to it, and
+  klippy connecting via `canbus_uuid` through python-can - giving
+  end-to-end coverage of `canserial.c` framing, node assignment, and
+  the CAN bootloader query path. Gated on: Renode CAN controller model
+  coverage for a klipper-supported chip (STM32 bxCAN / FDCAN), and CI
+  runners permitting privileged containers.
+- **AR100 (Allwinner or1k) backend.** No third-party or1k emulator
+  models the sunxi AR100 co-processor's peripherals. Plan: a host build
+  in the `src/pru/host_pru.c` pattern - reimplement the R_UART, R_PIO
+  and timer MMIO blocks against host gcc and run through the
+  linuxprocess backend - which fits the existing `ar100` gate the same
+  way `linuxpru.test` fits the PRU.
