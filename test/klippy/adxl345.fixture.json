@@ -1,0 +1,10 @@
+{
+    "_comment": "Drives adxl345.test under the simavr bridge in tick-mode lockstep. The adxl345 key registers the bridge's ADXL345 streaming model on the cfg's CS pin (PK7): the bridge serves klippy's DEVID probe and register write-verifies, then accrues samples in a modeled 32-deep FIFO at the BW_RATE klippy programs (800 SPS from the cfg) paced by AVR sim cycles, serving the firmware's 9-byte DATAX0 bursts with 13-bit sign-extended samples, the FIFO_CTL echo the firmware validates, and a live FIFO_STATUS count. Sample values are a synthetic vibration - x = amp_raw * sin(2*pi * vib_freq_hz * t), z = base_z_raw (~1 g at 3.9 mg/LSB) - with t derived from the sample INDEX so the waveform is exact and deterministic regardless of when the firmware drains the FIFO. vib_freq_hz 45 sits inside the test's TEST_RESONANCES 30-60 Hz sweep, giving the resonance analysis a clean spectral line; amp 256 (~1 g peak) is far above the analysis noise floor. auto_trsync_trigger_ticks fires the XYZ endstops on G28 (plain GPIO endstops, no probe).",
+    "tick_mode": true,
+    "auto_trsync_trigger_ticks": 160000,
+    "adxl345": {
+        "vib_freq_hz": 45,
+        "amp_raw": 256,
+        "base_z_raw": 256
+    }
+}

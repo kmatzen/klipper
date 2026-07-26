@@ -111,6 +111,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -379,6 +380,105 @@ ads131_reset_regs(struct ads131_chip *c)
     c->regs[0x00] = (uint16_t)(((uint16_t)c->id_hi << 8) | 0x02);
     c->regs[0x01] = 0x0100;
     c->regs[0x02] = 0x0100;
+}
+
+/* ADXL345 accelerometer (full streaming model). klippy's adxl345.py
+ * verifies DEVID (0xe5), write-verifies BW_RATE / POWER_CTL /
+ * DATA_FORMAT / FIFO_CTL, then the firmware's sensor_adxl345.c reads
+ * one 9-byte burst per wake: [0x32|READ|MULTI] followed by DATAX0..
+ * DATAZ1 (six bytes), FIFO_CTL (address auto-increment reaches 0x38;
+ * firmware validates it still reads SET_FIFO_CTL=0x90), and
+ * FIFO_STATUS (0x39, entries remaining). Samples accrue in a modeled
+ * 32-deep FIFO at the rate klippy programmed into BW_RATE, paced by
+ * avr->cycle so tick-mode runs are deterministic. Sample values are a
+ * synthetic vibration: x = amp_raw * sin(2*pi * vib_freq_hz * t),
+ * y = 0, z = base_z_raw (~1 g), with t taken from the SAMPLE INDEX
+ * (served / rate) rather than the read cycle, so the waveform is
+ * exact regardless of when the firmware drains the FIFO. That gives
+ * ACCELEROMETER_MEASURE real 13-bit data and TEST_RESONANCES a
+ * clean spectral line to find, while staying independent of host
+ * scheduling. */
+#define ADXL_CHIP_MAX 2
+#define ADXL_REG_MAX 0x40
+struct adxl_chip {
+    char cs_port;              /* 'A'..'L' */
+    int cs_pin;                /* 0..7 */
+    struct avr_t *avr;
+    uint8_t regs[ADXL_REG_MAX];
+    /* transaction state (valid while CS low) */
+    uint8_t addr;              /* current register (auto-inc if MULTI) */
+    int multi, is_read;
+    int pos;                   /* byte index in transaction */
+    /* streaming state */
+    int powered;               /* POWER_CTL measure bit */
+    uint64_t start_cycle;      /* cycle of the 0->1 measure transition */
+    uint64_t served;           /* samples consumed since start */
+    uint8_t sample[6];         /* latched burst data (x0x1 y0y1 z0z1) */
+    uint8_t fifo_after;        /* FIFO entries left after this burst */
+    /* synthesis knobs (spi_adxl345_chip command) */
+    int vib_freq_hz;
+    int amp_raw;
+    int base_z_raw;
+};
+static struct adxl_chip adxl_chips[ADXL_CHIP_MAX];
+static int adxl_chips_count = 0;
+static int adxl_active_chip = -1;    /* index of chip whose CS is low */
+
+static void
+adxl_reset_regs(struct adxl_chip *c)
+{
+    memset(c->regs, 0, sizeof(c->regs));
+    c->regs[0x00] = 0xe5;             /* DEVID */
+}
+
+/* Data rate from the BW_RATE code klippy wrote (adxl345.py
+ * QUERY_RATES: 0x8=25 ... 0xf=3200). */
+static int
+adxl_rate_hz(const struct adxl_chip *c)
+{
+    int code = c->regs[0x2C] & 0x0f;
+    if (code < 0x8)
+        code = 0x8;
+    if (code > 0xf)
+        code = 0xf;
+    return 3200 >> (0xf - code);
+}
+
+/* Latch one burst worth of data: pick the next FIFO sample (indexed
+ * time base), encode 13-bit sign-extended little-endian pairs, and
+ * compute the post-read FIFO count. */
+static void
+adxl_latch_burst(struct adxl_chip *c)
+{
+    int rate = adxl_rate_hz(c);
+    uint64_t now = c->avr ? c->avr->cycle : 0;
+    uint64_t produced = 0;
+    if (c->powered && c->avr && now > c->start_cycle)
+        produced = (now - c->start_cycle) * (uint64_t)rate
+            / c->avr->frequency;
+    if (produced > c->served + 32) {
+        /* FIFO overflow: drop the oldest (real chip keeps newest 32;
+         * exact indices matter less than keeping time monotonic). */
+        c->served = produced - 32;
+    }
+    uint64_t avail = produced > c->served ? produced - c->served : 0;
+    int16_t vx = 0, vy = 0, vz = (int16_t)c->base_z_raw;
+    if (avail > 0) {
+        double t = (double)c->served / (double)rate;
+        vx = (int16_t)(c->amp_raw
+                       * sin(2.0 * M_PI * (double)c->vib_freq_hz * t));
+        c->served++;
+        avail--;
+    }
+    /* 13-bit two's complement, low byte first; high nibble must be
+     * 0x0 or 0xf (sign extension) for the firmware's glitch check. */
+    c->sample[0] = (uint8_t)(vx & 0xff);
+    c->sample[1] = (uint8_t)((vx >> 8) & 0xff);
+    c->sample[2] = (uint8_t)(vy & 0xff);
+    c->sample[3] = (uint8_t)((vy >> 8) & 0xff);
+    c->sample[4] = (uint8_t)(vz & 0xff);
+    c->sample[5] = (uint8_t)((vz >> 8) & 0xff);
+    c->fifo_after = (uint8_t)(avail > 31 ? 31 : avail);
 }
 
 /* Global I2C (TWI) read response queue. Klippy talks to I2C
@@ -2454,6 +2554,80 @@ ads131_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     pthread_mutex_unlock(&spi_state.lock);
 }
 
+static void
+adxl_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq;
+    int idx = (int)(intptr_t)param;
+    if (idx < 0 || idx >= adxl_chips_count)
+        return;
+    pthread_mutex_lock(&spi_state.lock);
+    if (value == 0) {
+        adxl_active_chip = idx;
+        adxl_chips[idx].pos = 0;
+        adxl_chips[idx].multi = 0;
+        adxl_chips[idx].is_read = 0;
+    } else if (adxl_active_chip == idx) {
+        adxl_active_chip = -1;
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+}
+
+/* spi_adxl345_chip <cs_port> <cs_pin> <vib_freq_hz> <amp_raw> <base_z_raw>
+ * Register an ADXL345 chip's CS pin. vib_freq_hz / amp_raw give the
+ * synthetic x-axis vibration (a pure tone TEST_RESONANCES can find);
+ * base_z_raw is the constant z reading (256 = 1 g at the 3.9 mg/LSB
+ * full-resolution mode klippy always configures). */
+static void
+apply_spi_adxl345_chip(struct control_ctx *ctx,
+                       int cs_port_ord, int cs_pin,
+                       int vib_freq_hz, int amp_raw, int base_z_raw)
+{
+    if (cs_port_ord < 'A' || cs_port_ord > 'L')
+        return;
+    if (cs_pin < 0 || cs_pin > 7)
+        return;
+    char cs_port = (char)cs_port_ord;
+    pthread_mutex_lock(&spi_state.lock);
+    int existing = -1;
+    for (int i = 0; i < adxl_chips_count; i++) {
+        if (adxl_chips[i].cs_port == cs_port
+                && adxl_chips[i].cs_pin == cs_pin) {
+            existing = i;
+            break;
+        }
+    }
+    int slot = existing;
+    if (slot < 0 && adxl_chips_count < ADXL_CHIP_MAX) {
+        slot = adxl_chips_count++;
+        struct adxl_chip *c = &adxl_chips[slot];
+        memset(c, 0, sizeof(*c));
+        c->cs_port = cs_port;
+        c->cs_pin = cs_pin;
+        c->avr = ctx->avr;
+        c->vib_freq_hz = vib_freq_hz > 0 ? vib_freq_hz : 45;
+        c->amp_raw = amp_raw > 0 ? amp_raw : 256;
+        c->base_z_raw = base_z_raw > 0 ? base_z_raw : 256;
+        adxl_reset_regs(c);
+    }
+    pthread_mutex_unlock(&spi_state.lock);
+    if (slot < 0)
+        return;
+    if (existing < 0) {
+        avr_irq_t *cs_irq = avr_io_getirq(
+            ctx->avr, AVR_IOCTL_IOPORT_GETIRQ(cs_port), cs_pin);
+        if (cs_irq) {
+            avr_irq_register_notify(
+                cs_irq, adxl_cs_hook, (void *)(intptr_t)slot);
+        }
+        fprintf(stderr,
+                "simavr_bridge: spi_adxl345_chip cs=%c%d vib=%dHz "
+                "amp=%d base_z=%d\n",
+                cs_port, cs_pin, adxl_chips[slot].vib_freq_hz,
+                adxl_chips[slot].amp_raw, adxl_chips[slot].base_z_raw);
+    }
+}
+
 /* simavr cycle timer callback: assert this chip's DRDY low to signal
  * "sample ready", then re-arm one period out. The firmware's poll
  * loop sees DRDY low and schedules a wake task that does the 3-byte
@@ -2672,7 +2846,52 @@ spi_out_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     uint8_t mosi = (uint8_t)(value & 0xff);
     uint8_t resp = 0x00;
     pthread_mutex_lock(&spi_state.lock);
-    if (ads131_active_chip >= 0 && ads131_active_chip < ads131_chips_count) {
+    if (adxl_active_chip >= 0 && adxl_active_chip < adxl_chips_count) {
+        /* A registered ADXL345's CS is low: byte 0 is the address +
+         * READ/MULTI flags; subsequent bytes serve the register file,
+         * the latched burst sample (0x32..0x37), or FIFO_STATUS
+         * (0x39), with address auto-increment in MULTI mode. Writes
+         * store into the register file; the POWER_CTL measure bit
+         * transition arms/disarms FIFO accrual. Never let these bytes
+         * reach the ADS1220 decoder below (shared bus). */
+        struct adxl_chip *c = &adxl_chips[adxl_active_chip];
+        if (c->pos == 0) {
+            c->addr = mosi & 0x3f;
+            c->is_read = (mosi & 0x80) != 0;
+            c->multi = (mosi & 0x40) != 0;
+            if (c->is_read && c->multi && c->addr == 0x32)
+                adxl_latch_burst(c);
+        } else if (c->is_read) {
+            uint8_t a = c->addr;
+            if (a >= 0x32 && a <= 0x37)
+                resp = c->sample[a - 0x32];
+            else if (a == 0x39)
+                resp = c->fifo_after;
+            else if (a < ADXL_REG_MAX)
+                resp = c->regs[a];
+            if (c->multi && c->addr < 0x3f)
+                c->addr++;
+        } else {
+            uint8_t a = c->addr;
+            if (a < ADXL_REG_MAX && a != 0x00) {
+                c->regs[a] = mosi;
+                if (a == 0x2D) {
+                    int on = (mosi & 0x08) != 0;
+                    if (on && !c->powered) {
+                        c->powered = 1;
+                        c->start_cycle = c->avr ? c->avr->cycle : 0;
+                        c->served = 0;
+                    } else if (!on) {
+                        c->powered = 0;
+                    }
+                }
+            }
+            if (c->multi && c->addr < 0x3f)
+                c->addr++;
+        }
+        c->pos++;
+    } else if (ads131_active_chip >= 0
+               && ads131_active_chip < ads131_chips_count) {
         /* A registered ADS131M0x chip's CS is low: serve its staged
          * response word in bytes 0..1 of the frame and capture the
          * command/data words; never let these bytes reach the ADS1220
@@ -3247,6 +3466,16 @@ apply_control_line(struct control_ctx *ctx, char *line)
         if (sscanf(line + 16, " %c %d %i", &cs_port_ch, &cspin, &idhi) == 3) {
             csp = (int)cs_port_ch;
             apply_spi_ads131_chip(ctx, csp, cspin, idhi);
+        }
+        return;
+    }
+    if (strncmp(line, "spi_adxl345_chip ", 17) == 0) {
+        char cs_port_ch = 0;
+        int cspin = -1, vib = 0, amp = 0, base = 0;
+        if (sscanf(line + 17, " %c %d %d %d %d",
+                   &cs_port_ch, &cspin, &vib, &amp, &base) == 5) {
+            apply_spi_adxl345_chip(ctx, (int)cs_port_ch, cspin,
+                                   vib, amp, base);
         }
         return;
     }

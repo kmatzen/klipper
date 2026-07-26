@@ -128,6 +128,7 @@ backend-specific (noted below). Lines that don't parse are silently dropped.
 | `bltouch <ctrl_p> <ctrl_pin> <sensor_p> <sensor_pin> <invert>` | all | BLTouch state machine on the named pins (decodes PWM commands by pulse duration, drives the sensor pin to match) |
 | `spi_ads1220_chip <cs_p> <cs_pin> <drdy_p> <drdy_pin> <rate_hz>` | simavr | Register an ADS1220 chip (CS + DRDY pins); bridge pulses DRDY active-low at `<rate_hz>` SPS via a simavr cycle timer and de-asserts on each 3-byte continuous-mode read. Multi-chip configs receive a staggered phase to keep both chips' DRDY assertions out of the same poll tick |
 | `eddy_probe_ramp …` | simavr | LDC1612 frequency-count ramp tied to Z stepper position (drives the eddy virtual endstop) |
+| `spi_adxl345_chip <cs_p> <cs_pin> <vib_hz> <amp> <base_z>` | simavr | ADXL345 streaming model: register file + DEVID, 32-deep FIFO paced at the BW_RATE klippy programs, synthetic x-axis tone at `<vib_hz>` (index-based time, deterministic) |
 | `probe_step <step_p> <step_pin> <…>` | simavr | ADS1220 force ramp tied to step position (drives the load-cell `trigger_analog` detector) |
 | `ldc1612_ramp …` | simavr + renode | LDC1612 register-aware I2C responder + ramped DATA0 count (renode: `renode_hooks.ldc1612_ramp`, a DummyI2CSlave with STATUS period gating in the 64 MHz timer domain) |
 | `sw_uart <port> <pin> <…>` | renode | Software-UART responder on a GPIO RX pin (single-wire or multi-drop TMC2208/TMC2209) |
@@ -155,6 +156,10 @@ emulator startup:
   BLTouch state machine on the named pins.
 - `auto_trigger_after_steps` — paired with `bltouch`: drives the bltouch
   sensor pin to triggered after N stepper edges on the Z step pin.
+- `adxl345` — `{vib_freq_hz, amp_raw, base_z_raw}`: register the bridge's
+  ADXL345 streaming model on every `[adxl345*]` section's CS pin. Gives
+  `ACCELEROMETER_MEASURE` real 13-bit samples and `TEST_RESONANCES` a
+  clean spectral line to find (see `adxl345.fixture.json`).
 - `config_overrides` — `{section: {option: value}}` rewrites applied to the
   emulator's materialized cfg copy only (regular sections and the `#*#`
   SAVE_CONFIG autosave block; an option absent from the cfg is inserted).

@@ -240,7 +240,7 @@ RUN gcc -O2 -Wall -Wextra \
         -o ci_build/simavr_bridge \
         test/emulator/simavr_bridge.c \
         /usr/local/include/simavr/parts/uart_pty.c \
-        -lsimavr -lpthread -lutil -lelf
+        -lsimavr -lpthread -lutil -lelf -lm
 
 RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi()"
 
@@ -306,6 +306,15 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # codes alone can't). The fixture's contact model adds the tap-specific
 # hysteresis knee (see eddy_arm.fixture.json).
 #
+# adxl345.test gates here: real ADXL345 FIFO streaming (sensor_adxl345.c
+# 9-byte SPI bursts, 13-bit decode, FIFO_CTL echo validation) against
+# the bridge's modeled 32-deep FIFO, plus TEST_RESONANCES finding the
+# fixture's synthetic 45 Hz tone. REQUIRES_EMULATOR - fileoutput cannot
+# produce accelerometer samples and upstream has no such test, so
+# nothing degrades on stock CI. The cfg's rate 800 keeps the bulk
+# stream at ~17% of the AVR's 250 kbaud link (stock 3200 would sit at
+# ~70% during motion - the same ceiling class the eddy tap hit).
+#
 # delta_calibrate.test gates here. Its fixture's config_overrides rescale
 # rotation_distance from the fileoutput-symbolic 0.32 (contrived for clean
 # integer heightN_pos values) to a real-printer 40 mm/rev on the emulator's
@@ -363,6 +372,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/temperature.test", \
      "test/klippy/eddy.test", \
      "test/klippy/eddy_arm.test", \
+     "test/klippy/adxl345.test", \
      "test/klippy/load_cell.test", \
      "test/klippy/delta.test", \
      "test/klippy/delta_calibrate.test", \

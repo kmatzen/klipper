@@ -1054,6 +1054,41 @@ class TestCase:
     _ADS131_SENSOR_TYPE_RE = re.compile(
         r'^\s*sensor_type\s*:\s*(ads131m0[24])\s*(?:#.*)?$')
 
+    _ADXL345_SECTION_RE = re.compile(r'^\[adxl345(?:\s+[^\]]+)?\]\s*$')
+
+    @classmethod
+    def _parse_adxl345_chips(cls, config_fname):
+        # Yield the cs_pin for every [adxl345] / [adxl345 name]
+        # section. The bridge's streaming model needs only the CS pin;
+        # data rate comes from the BW_RATE register klippy writes.
+        chips = []
+        in_section = False
+        cs = None
+        try:
+            f = open(config_fname)
+        except OSError:
+            return chips
+        try:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('['):
+                    if in_section and cs is not None:
+                        chips.append(cs)
+                    in_section = bool(
+                        cls._ADXL345_SECTION_RE.match(stripped))
+                    cs = None
+                    continue
+                if not in_section:
+                    continue
+                m = re.match(r'^cs_pin\s*:\s*([!^~]*)(P[A-L]\d+)', stripped)
+                if m:
+                    cs = m.group(2)
+            if in_section and cs is not None:
+                chips.append(cs)
+        finally:
+            f.close()
+        return chips
+
     @classmethod
     def _parse_ads131_chips(cls, config_fname):
         # Yield (cs_pin, id_hi) for every [load_cell ...] /
@@ -1482,6 +1517,21 @@ class TestCase:
                             and cs[1].isalpha()):
                         lines.append("spi_ads131_chip %s %d %d" % (
                             cs[1], int(cs[2:]), id_hi))
+        # adxl345: register the bridge's ADXL345 streaming model on
+        # every [adxl345*] section's CS pin. The bridge serves the
+        # DEVID probe + register write-verifies and streams 13-bit
+        # samples from a modeled 32-deep FIFO at the BW_RATE klippy
+        # programs, so ACCELEROMETER_MEASURE gets real data and
+        # TEST_RESONANCES finds the synthetic vibration tone.
+        adxl = raw.get('adxl345')
+        if adxl:
+            vib = int(adxl.get('vib_freq_hz', 45))
+            amp = int(adxl.get('amp_raw', 256))
+            base = int(adxl.get('base_z_raw', 256))
+            for cs in self._parse_adxl345_chips(config_fname):
+                if len(cs) >= 3 and cs[0] == 'P' and cs[1].isalpha():
+                    lines.append("spi_adxl345_chip %s %d %d %d %d" % (
+                        cs[1], int(cs[2:]), vib, amp, base))
         # load_cell_probe_trigger: hook the configured Z step pin and
         # synthesize a ramped ADC sample = (steps_in_burst *
         # force_per_step) raw counts. A step burst starts on the

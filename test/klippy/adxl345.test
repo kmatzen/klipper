@@ -1,0 +1,35 @@
+# Test case for ADXL345 accelerometer streaming + resonance testing
+# with real firmware sample traffic (sensor_adxl345.c FIFO bursts over
+# SPI, 13-bit decode, sensor_bulk reports). REQUIRES_EMULATOR: under
+# fileoutput the chip produces no samples, so ACCELEROMETER_QUERY and
+# TEST_RESONANCES error by design - there is no upstream fileoutput
+# equivalent of this test, so nothing degrades. The bridge streams a
+# synthetic 45 Hz x-axis tone (see adxl345.fixture.json), so the
+# resonance sweep has a real spectral line to find; the assertions pin
+# that samples actually flowed (ACCELEROMETER_QUERY errors with "No
+# accelerometer measurements found" and TEST_RESONANCES with
+# "measured no data" when they don't).
+CONFIG adxl345.cfg
+DICTIONARY atmega2560.dict
+EMULATOR adxl345.fixture.json
+REQUIRES_EMULATOR
+EXPECT_LOG_CONTAINS "accelerometer values"
+EXPECT_LOG_CONTAINS "Resonances data written to"
+EXPECT_LOG_NOT_CONTAINS "measured no data"
+EXPECT_LOG_NOT_CONTAINS "No accelerometer measurements found"
+
+# Home the printer
+G28
+G1 F6000
+G1 X10 Y10 Z10
+
+# Stream raw accelerometer data
+ACCELEROMETER_MEASURE CHIP=adxl345 NAME=emu
+G4 P1000
+ACCELEROMETER_MEASURE CHIP=adxl345 NAME=emu
+
+# Live query (errors if no samples arrived)
+ACCELEROMETER_QUERY CHIP=adxl345
+
+# Resonance sweep across the synthetic 45 Hz tone
+TEST_RESONANCES AXIS=X FREQ_START=30 FREQ_END=60
