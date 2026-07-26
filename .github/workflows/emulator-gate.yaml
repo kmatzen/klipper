@@ -37,6 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Standalone and dependency-free (it stubs chelper/greenlet), so it
+      # runs directly on the runner ahead of the heavy image build.
+      - name: Tick-mode reactor guard unit tests
+        run: python3 test/emulator/test_reactor_guard.py
+
       - name: Build emulator-test image
         run: |
           docker build \
