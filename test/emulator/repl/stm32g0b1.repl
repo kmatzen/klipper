@@ -172,54 +172,64 @@ spi2: SPI.STM32SPI @ sysbus 0x40003800
 spi3: SPI.STM32SPI @ sysbus 0x40003C00
     IRQ -> nvic@26
 
+// Timer frequencies match the firmware's configured CLOCK_FREQ
+// (64 MHz): klipper's G0 timebase is TIM2 (stm32f0_timer.c), and
+// klippy converts fixed intervals to ticks with the dict's static
+// CLOCK_FREQ (mcu.py seconds_to_clock) - e.g. the LDC1612 bulk
+// sensor's rest_ticks = 0.5/data_rate. With the previous 10 MHz
+// model clock those firmware-side intervals ran 6.4x slower than
+// every klippy-side assumption (an 8 ms poll grid instead of
+// 1.25 ms), which starves bulk-sensor streams and trips
+// probe_eddy_current's sample-time validator; klippy logged
+// "configured for 64Mhz but running at 10Mhz!" on every boot.
 timer1: Timers.STM32_Timer @ sysbus 0x40012C00
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     [BreakInterrupt, UpdateInterrupt, TriggerInterrupt, CommutationInterrupt] -> nvic@[13, 13, 13, 13]
     CaptureCompareInterrupt -> nvic@14
 
 timer2: Timers.STM32_Timer @ sysbus 0x40000000
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFFFFFF
     -> nvic@15
 
 timer3: Timers.STM32_Timer @ sysbus 0x40000400
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@16
 
 timer4: Timers.STM32_Timer @ sysbus 0x40000800
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@16
 
 timer6: Timers.STM32_Timer @ sysbus 0x40001000
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@17
 
 timer7: Timers.STM32_Timer @ sysbus 0x40001400
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@18
 
 timer14: Timers.STM32_Timer @ sysbus 0x40002000
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@19
 
 timer15: Timers.STM32_Timer @ sysbus 0x40014000
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@20
 
 timer16: Timers.STM32_Timer @ sysbus 0x40014400
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@21
 
 timer17: Timers.STM32_Timer @ sysbus 0x40014800
-    frequency: 10000000
+    frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@22
 
