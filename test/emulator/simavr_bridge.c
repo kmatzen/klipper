@@ -4007,11 +4007,11 @@ suart_feed_one(uint64_t cycle)
     if (g_suart_in_pos >= g_suart_in_len) {
         /* NB: this is a phase test, not an elapsed-cycle one - avr_run
          * strides 1-4 cycles and fast-forwards across SLEEP, so a stride can
-         * step over the multiple of 512 and wait another full period. A TLA+
-         * model of this path (tla/drain, DrainB) shows an unbounded refill
-         * delay if a stride stays in lockstep with the mask. Real strides do
-         * not sustain that, so this is a latency hazard rather than a live
-         * defect, and it is left alone deliberately: changing the gate shifts
+         * step over the multiple of 512 and wait another full period. In
+         * principle a stride that stays in lockstep with the mask gives an
+         * unbounded refill delay. Real strides do not sustain that, so this
+         * is a latency hazard rather than a live defect, and it is left
+         * alone deliberately: changing the gate shifts
          * host->AVR byte timing on every test to close a hole nobody has
          * hit. */
         if (cycle & 0x1FF)
