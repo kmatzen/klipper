@@ -358,6 +358,18 @@ try:
 except ImportError:
     _HAVE_DUMMY_I2C = False
 
+from System import Array, Byte
+
+
+def _byte_array(vals):
+    # EnqueueResponseBytes takes IEnumerable<byte>. Handing it a plain
+    # IronPython list of ints type-checks at call time but explodes
+    # inside DummyI2CSlave.Read when the enumerator's Current is cast
+    # ("Unable to cast object of type 'System.Int32' to type
+    # 'System.Byte'") - which kills the whole Renode process from the
+    # CPU thread. Build a typed byte[] so the enumeration is sound.
+    return Array[Byte]([v & 0xff for v in vals])
+
 _i2c_slaves = {}  # (bus_name, addr) -> (slave, last_reg_box, responses)
 
 
@@ -396,12 +408,205 @@ def i2c_register_response(bus, addr, register_responses):
         payload = responses.get(reg)
         if payload is None:
             return  # leave queue empty -> DummyI2CSlave returns zeros
-        slave.EnqueueResponseBytes(list(payload[:int(count)]))
+        slave.EnqueueResponseBytes(_byte_array(payload[:int(count)]))
 
     slave.DataReceived += on_data_received
     slave.ReadRequested += on_read_requested
     bus_obj.Register(slave, addr_int)
     _i2c_slaves[key] = (slave, last_reg_box, responses)
+
+
+# --------------------------------------------------------------------
+# LDC1612 eddy-probe ramp (probe_eddy_current) - the renode counterpart
+# of simavr_bridge.c's ldc1612_ramp, invoked through the launcher's
+# _xlat_passthrough with the same positional command vocabulary:
+#
+#   ldc1612_ramp <step_port> <step_pin> <dir_port> <dir_pin>
+#                <descend_level> <baseline_raw> <free_per_step>
+#                <sample_rate> [<contact_descent> <depress_per_step>]
+#
+# A register-aware I2C slave (LDC1612 default address 0x2a on i2c1)
+# serves the driver's startup probe (manufacturer/device IDs), absorbs
+# its register writes into a register file, and answers DATA0 with a
+# 28-bit count that is a pure function of the Z stepper's absolute
+# position: raw(N) = baseline_raw + free_per_step * min(N,
+# contact_descent) + depress_per_step * max(0, N - contact_descent),
+# floored at _LDC1612_FLOOR_RAW. N (net_descent) counts rising step
+# edges signed by the DIR pin level (== descend_level -> +1), NEVER
+# reset, mirroring the bridge's absolute-position model.
+#
+# Sampling is paced by STATUS gating on the virtual clock, matching the
+# bridge's uniform-period model: UNREADCONV0 reports ready only once
+# per 1/sample_rate of virtual time, and the sample latched then is
+# interpolated to the exact period boundary using the last two step
+# timestamps (fraction (t_boundary - t_last_step) / step interval,
+# reset on direction reversal). Without the gating the firmware's
+# rest_ticks poll grid (0.5 / data_rate) would double the sample rate
+# and trip klippy's sample-timing validator; without the interpolation
+# the +/-1-step quantization of the poll-grid/step-grid beat adds
+# derivative noise on the scale of free_per_step per sample, which the
+# tap detector's diff_peak filter would see as signal. The cfg omits
+# intb_pin, so the firmware timer polls unconditionally
+# (sensor_ldc1612.c ldc1612_event) and STATUS is the only pacing.
+
+_LDC1612_FLOOR_RAW = 0x1CEA000   # keep the settled/idle count above the
+                                 # driver's amplitude-error region but
+                                 # below every trigger threshold the
+                                 # eddy tests arm (see simavr_bridge.c)
+_LDC1612_ADDR = 0x2a
+_ldc1612_ramp_state = {}         # singleton keyed 'ramp'
+
+
+def _now_us():
+    # Probed against Renode 1.16.1 (same API the launcher's tick
+    # driver uses): LocalTimeSource.ElapsedVirtualTime advances only
+    # inside RunFor windows, so under tick mode this is deterministic.
+    return _M.Machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds \
+        * 1000000.0
+
+
+def ldc1612_ramp(step_port, step_pin, dir_port, dir_pin, descend_level,
+                 baseline_raw, free_per_step, sample_rate,
+                 contact_descent='0', depress_per_step='0'):
+    if not _HAVE_DUMMY_I2C:
+        _log("ldc1612_ramp: DummyI2CSlave unavailable, ramp disabled")
+        return
+    sp, spi = step_port.upper(), int(step_pin)
+    dp, dpi = dir_port.upper(), int(dir_pin)
+    st = {
+        'descend_level': int(descend_level),
+        'baseline': int(baseline_raw),
+        'free': int(free_per_step),
+        'period_us': 1000000.0 / max(1, int(sample_rate)),
+        'contact': int(contact_descent),
+        'depress': int(depress_per_step),
+        'net': 0,               # signed absolute step position
+        'dir': 0,               # last observed DIR level
+        'sign': 1,              # +1 descending, -1 retracting
+        'last_step_us': None,   # newest step edge timestamp
+        'prev_step_us': None,   # the one before (same direction)
+        'next_period_us': None,
+        'pending': False,
+        'latched': 0,
+        'reg_ptr': 0,
+        'regfile': {0x7e: 0x5449, 0x7f: 0x3055},
+        'steps': 0,             # lifetime rising edges (diagnostics)
+    }
+    _ldc1612_ramp_state['ramp'] = st
+
+    def on_dir(state):
+        st['dir'] = 1 if state else 0
+
+    def on_step(state):
+        if not state:
+            return  # rising edges only
+        sign = 1 if st['dir'] == st['descend_level'] else -1
+        if sign != st['sign']:
+            # Direction reversal: the previous interval no longer
+            # predicts the next step, so restart interpolation (both
+            # timestamps - the old direction's last edge must not seed
+            # the new direction's interval).
+            st['prev_step_us'] = None
+            st['last_step_us'] = None
+            st['sign'] = sign
+        st['net'] += sign
+        st['steps'] += 1
+        st['prev_step_us'], st['last_step_us'] = \
+            st['last_step_us'], _now_us()
+
+    def pos_at(t_us):
+        # Continuous stepper position at t_us: integer count plus a
+        # sub-step fraction linearly inter/extrapolated from the last
+        # step interval (t may fall slightly before the newest step
+        # when the period boundary predates it - the negative fraction
+        # walks the position back, matching the bridge's model).
+        last, prev = st['last_step_us'], st['prev_step_us']
+        if last is None or prev is None or last <= prev:
+            return float(st['net'])
+        frac = (t_us - last) / (last - prev)
+        return st['net'] + st['sign'] * frac
+
+    def raw_at(pos):
+        c, free, dep = st['contact'], st['free'], st['depress']
+        if c > 0 and pos > c:
+            v = st['baseline'] + free * c + dep * (pos - c)
+        else:
+            v = st['baseline'] + free * pos
+        v = int(v + 0.5)
+        if v < _LDC1612_FLOOR_RAW:
+            v = _LDC1612_FLOOR_RAW
+        if v > 0x0FFFFFFF:
+            v = 0x0FFFFFFF
+        return v
+
+    def on_data_received(data):
+        if data is None or len(data) == 0:
+            return
+        reg = int(data[0]) & 0xff
+        st['reg_ptr'] = reg
+        if len(data) >= 3:
+            st['regfile'][reg] = ((int(data[1]) & 0xff) << 8) \
+                | (int(data[2]) & 0xff)
+
+    def on_read_requested(count):
+        reg = st['reg_ptr']
+        if reg == 0x18:            # STATUS
+            now = _now_us()
+            if st['next_period_us'] is None:
+                st['next_period_us'] = now + st['period_us']
+            if not st['pending'] and now >= st['next_period_us']:
+                st['latched'] = raw_at(pos_at(st['next_period_us']))
+                st['pending'] = True
+                last = st.get('last_latch_us')
+                if last is not None:
+                    gap = st['next_period_us'] - last
+                    if gap < 0.8 * st['period_us'] \
+                            or gap > 1.2 * st['period_us']:
+                        _log("ldc1612_ramp: latch gap %.1fus (period "
+                             "%.1fus) at now=%.1f next=%.1f"
+                             % (gap, st['period_us'], now,
+                                st['next_period_us']))
+                st['last_latch_us'] = st['next_period_us']
+                st['latch_count'] = st.get('latch_count', 0) + 1
+                if st['latch_count'] % 4000 == 0:
+                    _log("ldc1612_ramp: %d latches, net=%d now=%.1f"
+                         % (st['latch_count'], st['net'], now))
+                while st['next_period_us'] <= now:
+                    st['next_period_us'] += st['period_us']
+            val = 0x0008 if st['pending'] else 0x0000
+        elif reg == 0x00:          # DATA0_MSB (consumes the sample)
+            st['pending'] = False
+            val = (st['latched'] >> 16) & 0x0FFF
+        elif reg == 0x01:          # DATA0_LSB
+            val = st['latched'] & 0xFFFF
+        else:
+            val = st['regfile'].get(reg, 0) & 0xFFFF
+        slave.EnqueueResponseBytes(_byte_array(
+            [(val >> 8) & 0xff, val & 0xff][:int(count)]))
+
+    slave = DummyI2CSlave()
+    slave.DataReceived += on_data_received
+    slave.ReadRequested += on_read_requested
+    _bus(1).Register(slave, _LDC1612_ADDR)
+    _pin(sp, spi).AddStateChangedHook(Action[bool](on_step))
+    _pin(dp, dpi).AddStateChangedHook(Action[bool](on_dir))
+    _log("ldc1612_ramp: armed on %s%d/%s%d descend_level=%d baseline=%d "
+         "free=%d period_us=%.1f contact=%d depress=%d"
+         % (sp, spi, dp, dpi, st['descend_level'], st['baseline'],
+            st['free'], st['period_us'], st['contact'], st['depress']))
+
+
+def ldc1612_ramp_status():
+    # Diagnostic: dump the ramp state (invoked manually or from a
+    # fixture debug command while chasing geometry mismatches).
+    st = _ldc1612_ramp_state.get('ramp')
+    if st is None:
+        _log("ldc1612_ramp_status: not armed")
+        return
+    _log("ldc1612_ramp_status: net=%d steps=%d dir=%d sign=%d "
+         "latched=%d pending=%s"
+         % (st['net'], st['steps'], st['dir'], st['sign'],
+            st['latched'], st['pending']))
 
 
 # --------------------------------------------------------------------

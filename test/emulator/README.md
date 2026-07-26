@@ -129,7 +129,7 @@ backend-specific (noted below). Lines that don't parse are silently dropped.
 | `spi_ads1220_chip <cs_p> <cs_pin> <drdy_p> <drdy_pin> <rate_hz>` | simavr | Register an ADS1220 chip (CS + DRDY pins); bridge pulses DRDY active-low at `<rate_hz>` SPS via a simavr cycle timer and de-asserts on each 3-byte continuous-mode read. Multi-chip configs receive a staggered phase to keep both chips' DRDY assertions out of the same poll tick |
 | `eddy_probe_ramp …` | simavr | LDC1612 frequency-count ramp tied to Z stepper position (drives the eddy virtual endstop) |
 | `probe_step <step_p> <step_pin> <…>` | simavr | ADS1220 force ramp tied to step position (drives the load-cell `trigger_analog` detector) |
-| `ldc1612_ramp …` | simavr | LDC1612 register-aware I2C responder + ramped DATA0 count |
+| `ldc1612_ramp …` | simavr + renode | LDC1612 register-aware I2C responder + ramped DATA0 count (renode: `renode_hooks.ldc1612_ramp`, a DummyI2CSlave with STATUS period gating in the 64 MHz timer domain) |
 | `sw_uart <port> <pin> <…>` | renode | Software-UART responder on a GPIO RX pin (single-wire or multi-drop TMC2208/TMC2209) |
 | `barrier <usec>` | all | Tick-mode setup: advance to a deterministic sim-cycle target, then pause until tick-connect (see `TICK_PROTOCOL_DESIGN.md §4`) |
 
@@ -173,7 +173,16 @@ emulator startup:
 - `i2c_default.register_responses` — chip-id register payloads klippy probes
   once at startup.
 - `eddy_probe_ramp` — LDC1612 frequency-count ramp tied to Z (see commit
-  `b0a456b5f`).
+  `b0a456b5f`). On renode the same fixture key drives the
+  `renode_hooks.ldc1612_ramp` model; `eddy_arm.fixture.json` documents the
+  tap-specific contact-hysteresis geometry (near-plateau `depress_per_step`,
+  knee below the G28 trigger crossing).
+- `klippy_deadline` — per-test wall-clock deadline override (seconds,
+  default 180). For tests whose firmware wakes at bulk-sensor rates under
+  renode tick mode (each advance costs ~ms of RunFor overhead), e.g.
+  `eddy_arm`. Pair with `EXPECT_LOG_CONTAINS` completion assertions - the
+  emulator path treats deadline-without-crash as success, so only log
+  assertions prove the gcode actually finished.
 - `probe_step` — ADS1220 force ramp tied to Z step edges.
 - `sim_time` — drive klippy on the MCU's clock (advisory free-run; the bridge
   publishes `cycle / freq` into the `KLIPPY_SIM_TIME_FILE` mmap so

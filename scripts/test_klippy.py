@@ -436,6 +436,16 @@ class TestCase:
         sim_time_enabled = False
         tick_mode_enabled = False
         config_overrides = {}
+        # Per-test wall-clock deadline override. The default suits the
+        # simavr tests; renode tick-mode advances cost ~ms of RunFor
+        # overhead each, so a test whose firmware wakes at bulk-sensor
+        # rates (e.g. eddy_arm's 400 SPS LDC1612 poll) burns wall time
+        # ~2x faster than sim time and a long probing sequence
+        # genuinely needs more than 180 s. Only raises the ceiling -
+        # a hung run still fails at the (higher) deadline, and the
+        # test's EXPECT_LOG_CONTAINS assertions are what prove the
+        # gcode actually completed rather than idling to the deadline.
+        klippy_deadline = EMULATOR_KLIPPY_DEADLINE
         try:
             if fixture_path is not None:
                 with open(fixture_path) as ff:
@@ -443,10 +453,13 @@ class TestCase:
                 sim_time_enabled = bool(fx.get('sim_time'))
                 tick_mode_enabled = bool(fx.get('tick_mode'))
                 config_overrides = fx.get('config_overrides') or {}
+                klippy_deadline = float(
+                    fx.get('klippy_deadline', EMULATOR_KLIPPY_DEADLINE))
         except (OSError, ValueError):
             sim_time_enabled = False
             tick_mode_enabled = False
             config_overrides = {}
+            klippy_deadline = EMULATOR_KLIPPY_DEADLINE
         # tick_mode implies sim_time (klippy reads the MCU's cycle as
         # its monotonic clock); the bridge then drives klippy in
         # lockstep over the tick socket so the two clocks can't drift.
@@ -493,7 +506,7 @@ class TestCase:
                     '--slave-link', b['slave_link'],
                     '--control-socket', b['ctl_socket'],
                     '--duration',
-                    str(EMULATOR_KLIPPY_DEADLINE + 5),
+                    str(klippy_deadline + 5),
                 ]
                 if fixture_path is not None:
                     renode_args += ['--fixture-file', fixture_path]
@@ -522,7 +535,7 @@ class TestCase:
                 '--elf', b['elf'],
                 '--slave-link', b['slave_link'],
                 '--control-socket', b['ctl_socket'],
-                '--duration', str(EMULATOR_KLIPPY_DEADLINE + 5),
+                '--duration', str(klippy_deadline + 5),
             ]
             if sim_time_enabled:
                 stf = os.path.join(self.tempdir, 'sim_time' + sfx)
@@ -635,7 +648,8 @@ class TestCase:
                     # Real hardware is unaffected (no tick socket). setdefault
                     # so proof.sh can sweep other seeds to probe determinism.
                     klippy_env.setdefault('PYTHONHASHSEED', '0')
-            res = self._run_klippy_with_deadline(klippy_args, env=klippy_env)
+            res = self._run_klippy_with_deadline(klippy_args, env=klippy_env,
+                                                deadline=klippy_deadline)
         finally:
             for p in emu_procs:
                 self._terminate(p)
@@ -2086,10 +2100,11 @@ class TestCase:
             out = inserted_out
         return ''.join(out)
 
-    def _run_klippy_with_deadline(self, args, env=None):
+    def _run_klippy_with_deadline(self, args, env=None,
+                                  deadline=EMULATOR_KLIPPY_DEADLINE):
         proc = subprocess.Popen(args, env=env)
         try:
-            return proc.wait(timeout=EMULATOR_KLIPPY_DEADLINE)
+            return proc.wait(timeout=deadline)
         except subprocess.TimeoutExpired:
             # Klippy in real-mcu mode does not exit on gcode EOF. We
             # treat reaching the deadline without a crash as success;
