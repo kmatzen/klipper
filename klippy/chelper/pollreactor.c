@@ -7,7 +7,6 @@
 #include <fcntl.h> // fcntl
 #include <math.h> // ceil
 #include <poll.h> // poll
-#include <pthread.h> // pthread_mutex_lock
 #include <stdlib.h> // malloc
 #include <string.h> // memset
 #include "pollreactor.h" // pollreactor_alloc
@@ -18,18 +17,10 @@ struct pollreactor_timer {
     double (*callback)(void *data, double eventtime);
 };
 
-// timer_lock protects next_timer and the waketime field of each timer.
-// It exists so the timer plane is safe to update from a thread other
-// than the one running pollreactor_run() - the only caller that
-// currently does that is serialqueue_flush_ready() (tick-mode lockstep
-// only). The lock is dropped across timer callback invocations so
-// callbacks remain free to take their own (potentially heavier) locks
-// without inverting against timer_lock.
 struct pollreactor {
     int num_fds, num_timers, must_exit;
     void *callback_data;
     double next_timer;
-    pthread_mutex_t timer_lock;
     struct pollfd *fds;
     void (**fd_callbacks)(void *data, double eventtime);
     struct pollreactor_timer *timers;
@@ -55,9 +46,6 @@ pollreactor_alloc(int num_fds, int num_timers, void *callback_data)
     int i;
     for (i=0; i<num_timers; i++)
         pr->timers[i].waketime = PR_NEVER;
-    int ret = pthread_mutex_init(&pr->timer_lock, NULL);
-    if (ret)
-        report_errno("pollreactor_alloc pthread_mutex_init", ret);
     return pr;
 }
 
@@ -71,7 +59,6 @@ pollreactor_free(struct pollreactor *pr)
     pr->fd_callbacks = NULL;
     free(pr->timers);
     pr->timers = NULL;
-    pthread_mutex_destroy(&pr->timer_lock);
     free(pr);
 }
 
@@ -98,34 +85,22 @@ pollreactor_add_timer(struct pollreactor *pr, int pos, void *callback)
 double
 pollreactor_get_timer(struct pollreactor *pr, int pos)
 {
-    pthread_mutex_lock(&pr->timer_lock);
-    double waketime = pr->timers[pos].waketime;
-    pthread_mutex_unlock(&pr->timer_lock);
-    return waketime;
+    return pr->timers[pos].waketime;
 }
 
-// Set the wake-up time for a given timer.  Safe to call from any
-// thread; pollreactor_check_timers() reads the same fields under
-// timer_lock so cross-thread updates (e.g. serialqueue_flush_ready in
-// tick-mode lockstep) do not race with the bg poll loop.
+// Set the wake-up time for a given timer
 void
 pollreactor_update_timer(struct pollreactor *pr, int pos, double waketime)
 {
-    pthread_mutex_lock(&pr->timer_lock);
     pr->timers[pos].waketime = waketime;
     if (waketime < pr->next_timer)
         pr->next_timer = waketime;
-    pthread_mutex_unlock(&pr->timer_lock);
 }
 
-// Internal code to invoke timer callbacks.  timer_lock is held while
-// reading/writing the timer plane (waketime + next_timer) but released
-// across the callback invocation so the callback is free to take its
-// own lock (e.g. serialqueue's sq->lock).
+// Internal code to invoke timer callbacks
 static int
 pollreactor_check_timers(struct pollreactor *pr, double eventtime, int busy)
 {
-    pthread_mutex_lock(&pr->timer_lock);
     if (eventtime >= pr->next_timer) {
         // Find and run pending timers
         pr->next_timer = PR_NEVER;
@@ -134,22 +109,18 @@ pollreactor_check_timers(struct pollreactor *pr, double eventtime, int busy)
             struct pollreactor_timer *timer = &pr->timers[i];
             double t = timer->waketime;
             if (eventtime >= t) {
-                pthread_mutex_unlock(&pr->timer_lock);
                 busy = 1;
                 t = timer->callback(pr->callback_data, eventtime);
-                pthread_mutex_lock(&pr->timer_lock);
                 timer->waketime = t;
             }
             if (t < pr->next_timer)
                 pr->next_timer = t;
         }
     }
-    double next_timer = pr->next_timer;
-    pthread_mutex_unlock(&pr->timer_lock);
     if (busy)
         return 0;
     // Calculate sleep duration
-    double timeout = ceil((next_timer - eventtime) * 1000.);
+    double timeout = ceil((pr->next_timer - eventtime) * 1000.);
     return timeout < 1. ? 1 : (timeout > 1000. ? 1000 : (int)timeout);
 }
 
