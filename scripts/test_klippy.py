@@ -431,8 +431,11 @@ class TestCase:
         # throttling. This eliminates the "rescheduled timer in past"
         # class of host-load flakiness, but disables the wall-clock
         # safety net that previously masked heater_verify timeouts in
-        # tests that set heater targets, so it must be opt-in until
-        # the bridge models heater PWM -> ADC heat-up.
+        # tests that set heater targets, so it stays opt-in. Tests
+        # that need a live heater use the bridge's heater_model
+        # fixture key (first-order PWM -> ADC plant; see heater.test),
+        # which un-masks the closed-loop path instead of relying on
+        # that safety net.
         sim_time_enabled = False
         tick_mode_enabled = False
         config_overrides = {}
