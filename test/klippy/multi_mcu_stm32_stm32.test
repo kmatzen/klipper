@@ -8,13 +8,10 @@ DICTIONARY stm32f103.dict other=stm32f407.dict
 CONFIG multi_mcu_stm32_stm32.cfg
 EMULATOR multi_mcu_stm32_stm32.fixture.json
 
-# Harmless gcode to drive klippy past klippy:ready and exercise
-# motion against the stm32f103 main (where the steppers live).
 G28
 M114
 M105
 
-# klippy successfully identified each renode-backed MCU.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"

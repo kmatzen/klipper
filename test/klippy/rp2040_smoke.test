@@ -16,14 +16,11 @@ DICTIONARY rp2040.dict
 CONFIG rp2040_smoke.cfg
 EMULATOR rp2040_smoke.fixture.json
 
-# A few harmless gcode lines so klippy gets past klippy:ready.
 M114
 M105
 M105
 M105
 
-# klippy connected and stayed connected long enough to do the
-# clocksync handshake against the RP2040_Timer-driven firmware clock.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

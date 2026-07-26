@@ -18,18 +18,14 @@ EXPECT_LOG_CONTAINS "Resonances data written to"
 EXPECT_LOG_NOT_CONTAINS "measured no data"
 EXPECT_LOG_NOT_CONTAINS "No accelerometer measurements found"
 
-# Home the printer
 G28
 G1 F6000
 G1 X10 Y10 Z10
 
-# Stream raw accelerometer data
 ACCELEROMETER_MEASURE CHIP=adxl345 NAME=emu
 G4 P1000
 ACCELEROMETER_MEASURE CHIP=adxl345 NAME=emu
 
-# Live query (errors if no samples arrived)
 ACCELEROMETER_QUERY CHIP=adxl345
 
-# Resonance sweep across the synthetic 45 Hz tone
 TEST_RESONANCES AXIS=X FREQ_START=30 FREQ_END=60

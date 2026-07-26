@@ -1,46 +1,22 @@
-# End-to-end EMULATOR test for the BIGTREETECH Octopus Pro v1.0
-# (STM32H723) in DETERMINISTIC TICK MODE. Boots klipper firmware under
-# Renode against the Octopus Pro (H723) pin map, completes klippy
-# identify + clocksync, brings up the full MCU config (4 TMC5160s on a
-# software SPI bus, software-PWM heaters, fan, endstops, 2 thermistors),
-# reads the thermistors through ADC1, round-trips the four TMC5160
-# register files over SPI, and exercises interactive gcode (M114/M105)
-# against real firmware.
+# End-to-end EMULATOR test: BIGTREETECH Octopus Pro v1.0 (STM32H723)
+# under Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC5160s on software SPI,
+# software-PWM heaters, fan, endstops, 2 thermistors) and round-trips
+# M114/M105. See "Per-printer tests" in test/emulator/README.md for the
+# shared conventions.
 #
-# This is the STM32H7 per-printer test. It is the SPI sibling of
-# duet3_6hc (SAME70 TMC5160) - same renode_hooks TMC SPI chain responder
-# (CPU-PC hook on spidev_transfer: read MOSI from the firmware buffer,
-# synthesise the MISO datagram with the one-transaction-delay model, then
-# PC-skip the real transfer) - but driven over klipper SOFTWARE SPI
-# rather than hardware USART-SPI. klipper's src/stm32/spi.c has no
-# hardware-SPI bus for MACH_STM32H7, so H7 boards bit-bang SPI in
-# firmware; both paths funnel through spidev_transfer (src/spicmds.c),
-# which the responder hooks, so it serves the software path unchanged.
-# DUMP_TMC reads back the live register file for stepper_x and extruder,
-# IOIN version=0x30 proving the SPI read path round-tripped.
-#
-# The other new ground is the H7 ADC: thermistors on ADC1 channel 10
-# (PC0, extruder) and channel 13 (PC3, bed), read end to end by M105 via
-# test/emulator/stm32h7_adc_stub.py - a Python.PythonPeripheral that
-# completes klipper's H7 ISR/CR/SQR1/DR ADC handshake
-# (src/stm32/stm32h7_adc.c). Upstream Renode models the H7 ADC at
-# 0x40022000 with the F0-family Analog model, which neither matches that
-# handshake nor returns controllable values (and would spin the firmware
-# calibration loop), so the vendored stm32h723.repl omits it and the
-# launcher maps this stub there instead (0x400 window also covers the
-# ADC12 common CCR at +0x308).
-#
-# As with the other per-printer tests, the gated path is MOTION-FREE:
-# tick mode resolves the renode wall-clock-vs-virtual-time drift (a full
-# SPI + ADC config free-running on the 520 MHz H7 drifts the clocksync
-# and drops the connection mid-init), but motion commands (homing) are
-# delivered by klippy's wall-clock-paced serialqueue background thread,
-# which under shared-host CPU contention can deliver a tightly-scheduled
-# stepper command late and trip "Timer too close". The boot / config /
-# TMC-init / ADC / DUMP_TMC / M114 / M105 path schedules no such
-# tight-lead commands and is deterministically green. The firmware is the
-# generic serial-mode stm32h723 build (stm32h723.dict); the real board is
-# USB+CAN, which the STM32H7 Renode platform does not model.
+# Ground specific to this board:
+#   - SOFTWARE SPI TMC5160s. klipper's src/stm32/spi.c has no hardware
+#     SPI bus for MACH_STM32H7, so H7 boards bit-bang it. Both paths
+#     funnel through spidev_transfer (src/spicmds.c), which the
+#     renode_hooks TMC SPI chain responder hooks, so it serves the
+#     software path unchanged. IOIN version=0x30 proves the round trip.
+#   - H7 ADC via stm32h7_adc_stub.py, completing the ISR/CR/SQR1/DR
+#     handshake of src/stm32/stm32h7_adc.c. Upstream Renode models the
+#     H7 ADC with the F0-family Analog model, which neither matches that
+#     handshake nor returns controllable values, so stm32h723.repl omits
+#     it and the launcher maps this stub at 0x40022000 instead (the
+#     0x400 window also covers the ADC12 common CCR at +0x308).
 DICTIONARY stm32h723.dict
 CONFIG octopus_pro_h723.cfg
 EMULATOR octopus_pro_h723.fixture.json
@@ -53,8 +29,6 @@ DUMP_TMC STEPPER=extruder
 
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
-# DUMP_TMC dumped two drivers; IOIN version=0x30 proves the software-SPI
-# read path round-tripped through the responder.
 EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
 EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
 EXPECT_LOG_CONTAINS "version=0x30"
@@ -63,7 +37,6 @@ EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
 EXPECT_LOG_NOT_CONTAINS "failed to init"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
-# A broken ADC stub surfaces as a flat-zero / out-of-range thermistor.
 EXPECT_LOG_NOT_CONTAINS "ADC out of range"
 EXPECT_LOG_NOT_CONTAINS "Timer too close"
 EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"

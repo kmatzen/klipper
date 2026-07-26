@@ -14,19 +14,11 @@ EMULATOR tmc_spi_divergence.fixture.json
 CONFIG tmc_spi.cfg
 REQUIRES_EMULATOR
 
-# Set distinct toff values on stepper_x (tmc2130) and stepper_y
-# (tmc5160). klippy writes its full local CHOPCONF cache (with the
-# requested toff) to each chip in turn; without per-chip tables the
-# second write would overwrite the first in a single shared CHOPCONF
-# slot, and both DUMP_TMCs below would read back toff=8. With
-# per-chip tables each chip retains its own value.
 SET_TMC_FIELD STEPPER=stepper_x FIELD=toff VALUE=3
 SET_TMC_FIELD STEPPER=stepper_y FIELD=toff VALUE=8
 DUMP_TMC STEPPER=stepper_x
 DUMP_TMC STEPPER=stepper_y
 
-# pretty_format prints each non-zero CHOPCONF field as " toff=N" -
-# both values must appear in the log (each from its own chip's dump).
 EXPECT_LOG_CONTAINS "toff=3"
 EXPECT_LOG_CONTAINS "toff=8"
 EXPECT_LOG_NOT_CONTAINS "TMC stepper_x failed to init"

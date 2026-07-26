@@ -11,14 +11,11 @@ DICTIONARY lpc176x.dict
 CONFIG lpc176x_smoke.cfg
 EMULATOR lpc176x_smoke.fixture.json
 
-# A few harmless gcode lines so klippy gets past klippy:ready.
 M114
 M105
 M105
 M105
 
-# klippy connected and stayed connected long enough to do the
-# clocksync handshake against the firmware's generic/armcm_timer view.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

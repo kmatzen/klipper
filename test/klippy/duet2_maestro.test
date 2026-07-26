@@ -1,91 +1,35 @@
-# End-to-end EMULATOR test for the Duet2 Maestro printer config on
-# the SAM4S backend, in DETERMINISTIC TICK MODE. Boots klipper
-# firmware under Renode against the duet2-maestro pin map, completes
-# klippy identify + clocksync, brings up the full MCU config (4
-# TMC2208s, 2 software-PWM heaters, fan, endstops, adc_scaled), reads
-# thermistors through adc_scaled (vref_scaled), and round-trips
-# interactive gcode (M114/M105) against real firmware. Exercises the
-# full chain of changes this config requires that smoke tests don't:
+# End-to-end EMULATOR test: Duet2 Maestro (SAM4S) under Renode in tick
+# mode. Boots real firmware, completes identify + clocksync, brings up
+# the full config (4 TMC2208s, 2 software-PWM heaters, fan, endstops,
+# adc_scaled) and round-trips M114/M105. See "Per-printer tests" in
+# test/emulator/README.md for the conventions shared by these tests.
 #
-#   - sw_uart driving PA9 RX from CPU PC hooks on tmcuart_read_event
-#     (firmware uses separate uart_pin/tx_pin, not single-wire AVR)
-#   - test/emulator/sam4s_adc_stub.py replacing Renode's read-only
-#     Analog.SAM4S_ADC (vref/vssa per-channel overrides land so
-#     adc_scaled doesn't divide by zero)
-#   - local sam4s8c.repl pinning DWT.frequency to CONFIG_CLOCK_FREQ
-#   - control-socket early-bind in renode_launcher so the fixture
-#     pusher hits a listening socket while Renode is still booting
-#
-# SAM4S clock drift - RESOLVED via deterministic tick mode. Renode's
-# free-running JIT executes the SAM4S CPU at a wall-clock-bound rate
-# that drifts from the configured 120 MHz CONFIG_CLOCK_FREQ (klippy
-# logged "MCU 'mcu' configured for ~120Mhz but running at ~80Mhz");
-# klippy's clocksync adapted to that mean rate, but the drift meant the
-# firmware clock was never trustworthy, so the test had to stay
-# motion-free and (during development) needed ALLOW_SHUTDOWN.
-# tick_mode (duet2_maestro.fixture.json) removes the drift at the root:
-# klippy and Renode advance in lockstep over the tick socket (one
-# `emulation RunFor` per klippy `advance T`), so the firmware's
-# DWT->CYCCNT clock is exactly CONFIG_CLOCK_FREQ - the log now shows a
-# flat freq=120000000 with no "running at NMhz" warning. (Same
-# single-MCU renode lockstep mechanism stm32f103_tick / same70_usb_smoke
-# use.) This config's software-PWM heaters queue their first cycle only
-# ~0.2s ahead. At connect the tick-mode clock estimate is still
-# converging, so that 0.2s lead can map the first heater queue_digital_out
-# into the firmware's past and trip "Timer too close" during config. The
-# fix lives in klippy core: MCU_pwm / MCU_queued_pwm / MCU_pwm_cycle
-# defer their first queue_pwm_out send out of `_build_config` into a
-# `register_post_init_callback` that fires after MCU._send_get_config
-# confirms config-finalize, so the PWM_START_LEAD (0.200 s) bound is
-# measured against the firmware's just-finalized state instead of an
-# implicit config-flush-latency budget. See the PR body's PWM-deferral
-# bundled fix for the full real-hardware byte-identical argument.
-#
-# Separately, the reactor's tick lockstep now flushes ready serial
-# commands at each advance target before the mcu runs forward
-# (serialqueue_flush_ready), which fixes the renode-tick *motion*
-# underrun: a tightly-scheduled stepper command is no longer delivered a
-# whole advance quantum late, so the multi-mcu renode-tick homing tests
-# (multi_mcu_stm32_stm32, multi_mcu_avr_stm32_xmcu) now gate. This
-# single-MCU test still intentionally exercises only the no-motion
-# boot/config/TMC/adc path, which is deterministically green.
+# Ground specific to this board:
+#   - sw_uart drives PA9 RX from CPU-PC hooks on tmcuart_read_event
+#     (the firmware uses separate uart_pin/tx_pin, not single-wire).
+#   - sam4s_adc_stub.py replaces Renode's read-only Analog.SAM4S_ADC so
+#     per-channel vref/vssa overrides land and adc_scaled has a divisor.
+#   - The local sam4s8c.repl pins DWT.frequency to CONFIG_CLOCK_FREQ.
+#   - renode_launcher early-binds the control socket so the fixture
+#     pusher hits a listening socket while Renode is still booting.
 DICTIONARY sam4s8c.dict
 CONFIG duet2_maestro.cfg
 EMULATOR duet2_maestro.fixture.json
 REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
 
-# Interactive gcode round-trip against real firmware in tick mode:
-# M114 (report toolhead position) and M105 (report temperatures, which
-# reads the adc_scaled-compensated thermistors end to end). Neither
-# drives a stepper, so neither schedules a tight-lead motion command.
 M114
 M105
 
-# klippy auto-runs TMC chip init (per-stepper GSTAT clear + register
-# probe) as part of mcu_identify, before any gcode. Positive checks
-# scoped to klippy-side mcu_identify + config-build state machines plus
-# the TMC virtual-enable path, all of which run deterministically off
-# the dictionary load and the (now exact) clock estimate.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'stepper_x'"
 EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'extruder'"
-# adc_scaled requires (vref - vssa) != 0; without the SAM4S ADC stub
-# both come back as 0 and klippy raises ZeroDivisionError in
-# extras/adc_scaled.py handle_callback.
 EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
 EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
-# A renode-side crash (wrong sysbus peripheral name, hook callback
-# error) kills serial; klippy then gets EOF, TMC init times out, and
-# none of the EXPECT_LOG_CONTAINS checks above fire. Catch those
-# failure modes too.
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
 EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
-# The point of tick mode: with the deterministic clock the config /
-# TMC / adc path no longer pushes any deadline into the firmware's
-# past, so it completes with no firmware shutdown.
 EXPECT_LOG_NOT_CONTAINS "Timer too close"
 EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -25,33 +25,25 @@ EXPECT_LOG_CONTAINS "estimate contact at z="
 EXPECT_LOG_NOT_CONTAINS "Unable to detect tap"
 EXPECT_LOG_NOT_CONTAINS "Last tap did not succeed"
 
-# Start by homing the printer.
 G28
 G1 F6000
 
-# Z / X / Y moves
 G1 Z1
 G1 X1
 G1 Y1
 
-# Run a scan-mode bed_mesh_calibrate
 G1 Z2
 BED_MESH_CALIBRATE METHOD=rapid_scan
 
-# Move again
 G1 Z5 X0 Y0
 
-# Test PROBE_EDDY_CURRENT_TAP_CALIBRATE
 PROBE_EDDY_CURRENT_TAP_CALIBRATE
 
-# Do "tap" probe
 PROBE METHOD=tap
 
 PROBE_EDDY_CURRENT_TAP_CALIBRATE
 
-# Do regular probe
 G1 Z5
 PROBE
 
-# Move again
 G1 Z9
