@@ -1,0 +1,57 @@
+# Test case for probe_eddy_current support on an ARM MCU (renode
+# STM32G0B1) - the tap-family commands run end-to-end here (no
+# emulator_skip_gcode): the fast host link keeps clocksync clean, which
+# the AVR eddy.test's 250 kbaud link cannot (see eddy.fixture.json).
+# The gcode is tap-focused: the default-method BED_MESH_CALIBRATE and
+# METHOD=scan variants stay covered end-to-end by the AVR eddy.test;
+# repeating them here would roughly double the test's wall cost
+# (renode tick advances cost ~ms each and the 400 SPS LDC poll wakes
+# the firmware ~800x per sim second) without adding coverage.
+#
+# The log assertions prove the tap sequence actually completed AND
+# succeeded - without them a deadline-truncated run would pass
+# silently (the emulator path treats deadline-without-crash as
+# success and relies on log assertions for completion). The CONTAINS
+# lines print in both emulator and fileoutput mode (verified); the
+# NOT_CONTAINS lines are the tap-success discriminators: TAP_CALIBRATE
+# tolerates a failed final tap with a "Warning! Last tap did not
+# succeed." instead of an error, so without them a tap that fires but
+# fails pullback analysis would still pass the exit-code check.
+CONFIG eddy_arm.cfg
+DICTIONARY stm32g0b1.dict
+EMULATOR eddy_arm.fixture.json
+EXPECT_LOG_CONTAINS "bed will contact at z="
+EXPECT_LOG_CONTAINS "estimate contact at z="
+EXPECT_LOG_NOT_CONTAINS "Unable to detect tap"
+EXPECT_LOG_NOT_CONTAINS "Last tap did not succeed"
+
+# Start by homing the printer.
+G28
+G1 F6000
+
+# Z / X / Y moves
+G1 Z1
+G1 X1
+G1 Y1
+
+# Run a scan-mode bed_mesh_calibrate
+G1 Z2
+BED_MESH_CALIBRATE METHOD=rapid_scan
+
+# Move again
+G1 Z5 X0 Y0
+
+# Test PROBE_EDDY_CURRENT_TAP_CALIBRATE
+PROBE_EDDY_CURRENT_TAP_CALIBRATE
+
+# Do "tap" probe
+PROBE METHOD=tap
+
+PROBE_EDDY_CURRENT_TAP_CALIBRATE
+
+# Do regular probe
+G1 Z5
+PROBE
+
+# Move again
+G1 Z9

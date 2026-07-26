@@ -1,0 +1,34 @@
+{
+    "_comment": "Drives eddy_arm.test (probe_eddy_current / LDC1612 on STM32G0B1) under renode in tick-mode lockstep. The renode_hooks ldc1612_ramp model registers a register-aware I2C slave at the LDC1612 default address 0x2a on i2c1 (PB6/PB7): it serves the driver's manufacturer/device ID probe itself (so no i2c_default key - a second slave at 0x2a would collide), absorbs register writes, and answers DATA0 with the same absolute-position ramp as the simavr bridge: raw = baseline_raw + free_per_step * min(net_descent, contact_descent) + depress_per_step * max(0, net_descent - contact_descent), floored, where net_descent counts Z step edges signed by DIR (descend_level 0 = descending, matching the non-inverted dir_pin, same polarity the AVR eddy fixture proved out). The ramp knobs derive from eddy.fixture.json with a tap-specific contact model - the cfg's mm-domain geometry is identical (400 steps/mm Z, descend_z 0.4, speed 10) so the same knobs produce the same frequency-vs-Z curve; only sample_rate differs (400 = the LDC1612 driver's stock default, which the fast ARM link sustains - the whole point of this test: the AVR's 250 kbaud ceiling is what blocks tap there, so tap runs WITHOUT skips here). STATUS gating paces samples to one per 1/400 s of virtual time with sub-step interpolation at period boundaries, keeping step-quantization noise out of the tap detector's filtered derivative. auto_trsync_trigger_ticks fires the X/Y endstops on G28 (Z homes via the eddy virtual endstop crossing the descend trigger). analog_in supplies plausible EPCOS readings on the G0 ADC stub channels (PA0=0 extruder, PC4=17 bed, same values as skr_mini_e3_v3.fixture.json); the M105 / G4 prepend gives the ADC stub a settling window before any heater range check. Tap-specific geometry: the contact knee sits at absolute step 1260 (z ~= 0.25, BELOW the G28 descend-trigger crossing at step ~1201 / z=0.4) and depress_per_step is a near-plateau 10: physically, once the nozzle presses the bed the coil stops approaching, so frequency saturates - which is exactly what the pullback least-squares fit requires (its post-contact segment must have slope2 >= 0, and contact_slope_delta = |free slope| - |plateau slope| must exceed tap_threshold). The knee must stay below the G28 trigger frequency or the plateau would cap the count under the homing threshold and G28 would never halt. The firmware-side diff_peak trigger sees the same knee as a ~450 -> ~4 Hz/sample derivative drop, far above its scaled threshold (tap_threshold * speed / sps = 37.5 Hz), so it fires within the filter's group delay past contact.",
+    "tick_mode": true,
+    "klippy_deadline": 420,
+    "auto_trsync_trigger_ticks": 160000,
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {
+            "default_value": 7600,
+            "channel": 0
+        },
+        "_bed": {
+            "default_value": 7600,
+            "channel": 17
+        }
+    },
+    "prepend_gcode": [
+        "M105",
+        "G4 P2000",
+        "M105"
+    ],
+    "eddy_probe_ramp": {
+        "z_step_pin": "PB0",
+        "z_dir_pin": "PC5",
+        "descend_level": 0,
+        "baseline_raw": 31556000,
+        "free_per_step": 500,
+        "contact_descent": 1260,
+        "depress_per_step": 10,
+        "sample_rate": 400
+    }
+}

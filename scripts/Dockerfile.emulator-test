@@ -291,13 +291,20 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # (it previously pegged the whole ramp, which made the descend probes
 # trigger vacuously and starved the tap detector); load_cell needed the
 # bridge to model the ADS131M02 init protocol that upstream added to
-# load_cell.cfg (init-only; see spi_ads131_chip). PROBE METHOD=tap and
-# PROBE_EDDY_CURRENT_TAP_CALIBRATE stay fileoutput-only via
-# emulator_skip_gcode - the framework's historically validated scope -
-# because sustained sampling+motion load on the 250 kbaud AVR link
-# degrades the clocksync frequency estimate and warps the sample-time-to-
-# position correlation the tap fit depends on (tracked; an ARM-MCU eddy
-# test avoids the link ceiling entirely).
+# load_cell.cfg (init-only; see spi_ads131_chip). On the AVR test, PROBE
+# METHOD=tap and PROBE_EDDY_CURRENT_TAP_CALIBRATE stay fileoutput-only
+# via emulator_skip_gcode because sustained sampling+motion load on the
+# 250 kbaud AVR link degrades the clocksync frequency estimate and warps
+# the sample-time-to-position correlation the tap fit depends on - a
+# real AVR link ceiling, faithfully reproduced.
+#
+# eddy_arm.test closes that gap: the same probe_eddy_current stack on a
+# renode STM32G0B1 (LDC1612 on hardware I2C1 at the stock 400 SPS
+# data_rate - the fast ARM link never saturates), with the tap-family
+# commands running end-to-end and EXPECT_LOG assertions pinning tap
+# success (TAP_CALIBRATE downgrades a failed tap to a warning, so exit
+# codes alone can't). The fixture's contact model adds the tap-specific
+# hysteresis knee (see eddy_arm.fixture.json).
 #
 # delta_calibrate.test gates here. Its fixture's config_overrides rescale
 # rotation_distance from the fileoutput-symbolic 0.32 (contrived for clean
@@ -355,6 +362,7 @@ CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/multi_mcu_linuxprocess_avr.test", \
      "test/klippy/temperature.test", \
      "test/klippy/eddy.test", \
+     "test/klippy/eddy_arm.test", \
      "test/klippy/load_cell.test", \
      "test/klippy/delta.test", \
      "test/klippy/delta_calibrate.test", \
