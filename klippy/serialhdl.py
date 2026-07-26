@@ -319,9 +319,9 @@ class SerialReader:
             self.ffi_lib.serialqueue_alloc(self.serial_dev.fileno(), b'f', 0,
                                            self.sq_name),
             self.ffi_lib.serialqueue_free)
-    def set_clock_est(self, freq, conv_time, conv_clock, last_clock):
+    def set_clock_est(self, freq, conv_time, conv_clock):
         self.ffi_lib.serialqueue_set_clock_est(
-            self.serialqueue, freq, conv_time, conv_clock, last_clock)
+            self.serialqueue, freq, conv_time, conv_clock)
     def disconnect(self):
         if self._tick_flush_cb is not None:
             # Drop the reactor's references before the serialqueue is freed
