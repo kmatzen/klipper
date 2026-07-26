@@ -17,16 +17,11 @@ REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
 
 M114
 M105
-# Dwell so the ADC's periodic query fires and the adc_scaled
-# extruder thermistor reads a live value before the test exits (no
-# TMC init here to otherwise consume sim-time).
 G4 P1500
 M105
 
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
-# adc_scaled requires (vref - vssa) != 0; without the AFEC stub feeding
-# the reference channels both read 0 and klippy raises ZeroDivisionError.
 EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"

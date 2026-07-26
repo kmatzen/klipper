@@ -26,8 +26,6 @@ M114
 M105
 M105
 
-# klippy connected and stayed connected through identify + clocksync +
-# config under tick lockstep over the synthetic USBHS bulk endpoints.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"

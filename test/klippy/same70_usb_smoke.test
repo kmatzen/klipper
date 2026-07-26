@@ -1,50 +1,35 @@
 # SAME70Q20B USB-CDC boot/connect smoke test. Exercises the
-# CONFIG_ATSAM_USB firmware variant (duet3-6hc / duet3-6xd printer
-# configs are USB+CAN-only on real hardware, no serial-mode firmware
-# variant exists) against the local USBHS Renode peripheral
-# (test/emulator/repl/same70_usbhs.cs). The peripheral uses a
-# "skip-enum cheat" - inject a SET_CONFIGURATION SETUP packet on EP0
-# so klipper's CDC stack reaches bulk-active without a full USB host
-# emulation - then exposes BULK_IN/BULK_OUT as a UART pipe to the
-# host pty via UARTBase. The companion same70_smoke.test covers the
-# CONFIG_ATSAM_SERIAL path; both share the same .repl (USBHS is
-# resident unconditionally and stays idle when the firmware never
-# touches it).
+# CONFIG_ATSAM_USB firmware variant (the duet3-6hc / duet3-6xd printer
+# configs are USB+CAN-only on real hardware; no serial-mode variant
+# exists) against the local USBHS Renode peripheral
+# (repl/same70_usbhs.cs), which injects a synthetic SET_CONFIGURATION
+# SETUP on EP0 so klipper's CDC stack reaches bulk-active without a full
+# USB host emulation, then exposes BULK_IN/BULK_OUT as a UART pipe.
+# same70_smoke.test covers the CONFIG_ATSAM_SERIAL path; both share the
+# same .repl (USBHS is resident and idle when unused).
 #
-# This was the PR's long-standing known-blocked test; it now passes
-# (3/3 on a clean host) after fixing a two-sided SysTick-vs-DWT tension:
-#   * The upstream platforms/cpus/sam_e70.repl declares the NVIC SysTick
-#     at 450MHz, but klipper drives SysTick with CLKSOURCE=processor (the
-#     300MHz core clock / CONFIG_CLOCK_FREQ) and reads DWT->CYCCNT (also
-#     300MHz). At 450MHz the SysTick fires ~1.5x early, so
-#     timer_dispatch_many busy-waits a far deadline while OTHER timers fall
-#     >1ms behind DWT -> static_string_id 56 "Rescheduled timer in the
-#     past" shutdown. same70q20b.repl now pins systickFrequency to 300MHz.
-#   * At 300MHz the reason-56 shutdown is gone, but enumeration used to
-#     break: the USBHS model only injected its synthetic SET_CONFIGURATION
-#     SETUP on a *spontaneous* DEVEPTISR[0] read, which the firmware only
-#     did at the (wrong) 450MHz rate. same70_usbhs.cs now injects the SETUP
-#     the moment the firmware arms RXSTPES on the allocated EP0
-#     (handle_end_reset writes DEVEPTCFG[0]|ALLOC then DEVEPTIER[0]=RXSTPES
-#     back to back), so enumeration self-starts independent of SysTick rate.
-# Confirmed not the cause and not needed: MaximumBlockSize /
-# SetGlobalQuantum / MIPS knobs. This test stays free-run; its
-# deterministic-tick sibling same70_usb_tick.test drives the same USB-CDC
-# host link under tick lockstep (the renode ARM tick byte-shuttle now
-# survives identify over USB-CDC - see that test's header).
+# Two SAME70-specific details this pins down:
+#   - same70q20b.repl pins systickFrequency to 300MHz. Upstream
+#     platforms/cpus/sam_e70.repl declares SysTick at 450MHz, but klipper
+#     drives it with CLKSOURCE=processor (the 300MHz core clock) and
+#     reads DWT->CYCCNT at 300MHz. At 450MHz SysTick fires ~1.5x early,
+#     so timer_dispatch_many busy-waits a far deadline while other timers
+#     fall >1ms behind DWT -> "Rescheduled timer in the past" shutdown.
+#   - same70_usbhs.cs injects the SETUP as soon as the firmware arms
+#     RXSTPES on the allocated EP0, so enumeration self-starts
+#     independent of the SysTick rate.
+#
+# This test stays free-run; same70_usb_tick.test drives the same USB-CDC
+# link under tick lockstep.
 DICTIONARY same70q20b-usb.dict
 CONFIG same70_usb_smoke.cfg
 EMULATOR same70_usb_smoke.fixture.json
 
-# A few harmless gcode lines so klippy gets past klippy:ready.
 M114
 M105
 M105
 M105
 
-# klippy connected and stayed connected long enough to do the
-# clocksync handshake against the firmware's generic/armcm_timer view
-# transported over the synthetic USBHS bulk endpoints.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

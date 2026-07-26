@@ -12,16 +12,12 @@ CONFIG emulator_smoke.cfg
 DICTIONARY atmega2560.dict
 EMULATOR emulator_smoke.fixture.json
 REQUIRES_EMULATOR  # assertions depend on real MCU responses;
-# skipped (not degraded to fileoutput) when the emulator backend isn't built
 
-# A few harmless gcode lines so klippy gets past klippy:ready.
 M114
 M105
 M105
 M105
 
-# klippy connected and stayed connected long enough to do periodic
-# sht3x reads against the scripted fixture.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
 EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,67 +1,35 @@
-# End-to-end EMULATOR test for the Anycubic Kobra Go (HDSC HC32F460)
-# in DETERMINISTIC TICK MODE. Boots klipper firmware under Renode
-# against the kobra-go pin map,
-# completes klippy identify + clocksync, brings up the full MCU config
-# (4 plain step/dir steppers, 2 software-PWM heaters, fans, endstops,
-# 2 thermistors), and reads both thermistors through the HC32 ADC.
+# End-to-end EMULATOR test: Anycubic Kobra Go (HDSC HC32F460) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 plain step/dir steppers, 2
+# software-PWM heaters, fans, endstops, 2 thermistors) and reads both
+# thermistors. See "Per-printer tests" in test/emulator/README.md for
+# the shared conventions.
 #
-# This is the HC32F460 per-printer test, the counterpart to
-# hc32f460_smoke (boot only). Unlike the other per-printer tests
-# (skr_v1_4, duet2_maestro, ...), the Kobra Go has no Trinamic drivers,
-# so there is no TMC UART/SPI round-trip - the new infrastructure this
-# exercises is the HC32 ADC:
-#
-#   - test/emulator/hc32f460_adc_stub.py serves M4_ADC1 @ 0x40040000.
-#     klipper's src/hc32f460/adc.c kicks a conversion by writing STR=1,
-#     polls ISR.EOCAF for completion, then reads the 16-bit DRn result
-#     register (DR0 @ 0x50, channel index = (off-0x50)/2). The HC32
-#     ADC register layout matches no upstream Renode model and the
-#     hc32f460.repl maps no ADC, so the stub is the only thing at that
-#     base. With a broken ADC the burst never completes, no
-#     analog_in_state reaches klippy, and both heaters silently sit at
-#     temp=0.0 with no shutdown - so the "temp=3" assertion below (both
-#     thermistors read ~36 C) is the positive proof the ADC stub
-#     delivered samples. The hotend reads through channel 13 (PC3, ATC
-#     Semitec 104GT-2) and the bed through channel 11 (PC1, EPCOS 100K).
-#
-# The real Kobra Go is USB-CDC (CH340); the firmware here is the
-# generic serial-mode hc32f460-serial-PA3PA2 build (USART1 host link on
-# PA3/PA2, the same build hc32f460_smoke uses) and the test exercises
-# the pin map, which is independent of the host link. The gated path is
-# motion-free.
+# The Kobra Go has no Trinamic drivers, so there is no TMC round-trip
+# here; the new ground (hc32f460_smoke covers boot only) is the HC32 ADC:
+# hc32f460_adc_stub.py serves M4_ADC1 @ 0x40040000. klipper's
+# src/hc32f460/adc.c kicks a conversion by writing STR=1, polls
+# ISR.EOCAF, then reads the 16-bit DRn result (DR0 @ 0x50, channel index
+# = (off-0x50)/2). The HC32 ADC layout matches no upstream Renode model
+# and hc32f460.repl maps no ADC, so the stub is the only thing at that
+# base. A broken ADC sits at temp=0.0 with no shutdown, so the temp=3
+# assertion below is the positive proof samples arrived. Hotend reads
+# channel 13 (PC3, ATC Semitec 104GT-2), bed channel 11 (PC1, EPCOS).
 DICTIONARY hc32f460-serial-PA3PA2.dict
 CONFIG anycubic_kobra_go.cfg
 EMULATOR anycubic_kobra_go.fixture.json
 REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
 
-# A few interactive gcode lines against real firmware: M105 reports the
-# thermistor temperatures (the ADC read path end to end); M114 reports
-# toolhead position. Neither drives a stepper.
 M114
 M105
-# Dwell so the ADC's periodic query fires and both thermistors read a
-# live value before the test exits. The Kobra Go has no TMC init to
-# otherwise consume sim-time (the other per-printer tests' DUMP_TMC
-# advances the clock), so without the dwell the temp reading can miss
-# the stats-line window - same pattern as duet3_6xd.
 G4 P2000
 M105
 
-# klippy connected, loaded the dictionary, and built the full config
-# against real firmware.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
-# Positive proof the HC32 ADC stub delivered samples: both thermistors
-# read ~36 C, so a periodic Stats line carries "temp=36.x" / "temp=3x".
-# A broken ADC leaves them at temp=0.0, which this catches where the
-# no-error assertions below cannot.
 EXPECT_LOG_CONTAINS "temp=3"
-# A renode-side crash (wrong sysbus peripheral, hook callback error)
-# kills serial; klippy then gets EOF and identify times out.
 EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
 EXPECT_LOG_NOT_CONTAINS "Internal error"
-# A broken ADC handshake (channel never completes, value out of range)
-# would surface as an out-of-range shutdown rather than a clean read.
 EXPECT_LOG_NOT_CONTAINS "ADC out of range"
 EXPECT_LOG_NOT_CONTAINS "Timer too close"
 EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"

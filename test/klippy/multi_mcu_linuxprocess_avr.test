@@ -10,12 +10,10 @@ DICTIONARY atmega2560.dict host=linuxprocess.dict
 CONFIG multi_mcu_linuxprocess_avr.cfg
 EMULATOR multi_mcu_linuxprocess_avr.fixture.json
 
-# Harmless gcode to drive klippy past klippy:ready.
 G28
 M114
 M105
 
-# klippy successfully identified both backends' MCUs.
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Loaded MCU 'host'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"

@@ -12,8 +12,6 @@ DICTIONARY atmega2560.dict other=atmega2560.dict
 CONFIG multi_mcu_avr_xmcu.cfg
 EMULATOR multi_mcu_avr_xmcu.fixture.json
 
-# G28 must home all three axes; if Z's step_trigger landed on the
-# wrong bridge (or got skipped entirely), the home would hang.
 G28
 M114
 

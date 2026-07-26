@@ -106,7 +106,7 @@ is `<chip>_<peripheral>_stub.py`.
 
 - `README.md` — this file.
 - `TICK_PROTOCOL_DESIGN.md` — full design + correctness argument for the
-  deterministic tick-mode protocol (state machine spec, the conditions C1–C9
+  deterministic tick-mode protocol (state machine spec, the conditions C1–C11
   the implementation satisfies, throughput analysis, and the §5.2 byte-
   identical empirical-proof procedure).
 
@@ -344,6 +344,32 @@ Design rationale for each per-chip wiring decision (register stubs, repl
 trade-offs, validation results) lives in the corresponding commit message;
 `git log master..HEAD --oneline --grep test/emulator -- test/emulator/` is
 the index.
+
+### Per-printer tests
+
+These conventions are shared by every per-printer test listed above; each
+test's header documents only the ground specific to its board.
+
+- **Tick mode.** They run under `tick_mode` and carry
+  `REQUIRES_EMULATOR`. Free-running Renode executes the CPU at a
+  wall-clock-bound rate that drifts from the configured
+  `CONFIG_CLOCK_FREQ` — enough, on a full TMC + ADC config, to make
+  clocksync drop the connection mid-init. Lockstep removes the drift at
+  the root, so the firmware clock sits flat at `CONFIG_CLOCK_FREQ`.
+- **Motion-free.** The gated path covers boot / config / TMC init / ADC /
+  `DUMP_TMC` / `M114` / `M105`, and issues no motion. Motion commands are
+  delivered by klippy's wall-clock-paced serialqueue background thread,
+  which under shared-host CPU contention can deliver a tightly-scheduled
+  stepper command late and trip "Timer too close". Homing under renode
+  tick is covered by the `multi_mcu_*` tests instead.
+- **Host link.** Most of these boards are USB-only in reality, but the
+  Renode platforms model no USB device (the SAME70 is the exception — see
+  `same70_usb_smoke.test`). They therefore run the generic serial-mode
+  build for the chip and exercise the printer pin map, which is
+  independent of the host link.
+- **Positive ADC proof.** A broken ADC path reads a flat `temp=0.0`
+  *without* shutting down, so these tests assert on an expected
+  temperature rather than only on the absence of errors.
 
 ## Tracked future work
 

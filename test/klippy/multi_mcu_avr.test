@@ -11,16 +11,11 @@ DICTIONARY atmega2560.dict other=atmega2560.dict
 CONFIG multi_mcu_avr.cfg
 EMULATOR multi_mcu_avr.fixture.json
 REQUIRES_EMULATOR  # assertions depend on real MCU responses;
-# skipped (not degraded to fileoutput) when the emulator backend isn't built
 
-# A few harmless gcode lines to get past klippy:ready and exercise
-# motion / heater paths.
 G28
 M114
 M105
 
-# Each MCU loaded successfully (klippy logs one "Loaded MCU 'name'"
-# per MCU it identifies on startup).
 EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
 EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
 EXPECT_LOG_NOT_CONTAINS "Internal error"

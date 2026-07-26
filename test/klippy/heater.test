@@ -19,13 +19,10 @@ REQUIRES_EMULATOR
 EXPECT_LOG_CONTAINS "target=50 temp=(4[5-9]|5[0-9])\."
 EXPECT_LOG_CONTAINS "target=0 temp=(3[0-9])\."
 
-# Heat the extruder and wait for the plant to respond
 M104 S50
 TEMPERATURE_WAIT SENSOR=extruder MINIMUM=45
 
-# Drop the target and wait for decay
 M104 S0
 TEMPERATURE_WAIT SENSOR=extruder MAXIMUM=40
 
-# Give the stats loop a beat to record the cooled state
 G4 P2000
