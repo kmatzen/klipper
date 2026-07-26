@@ -78,6 +78,24 @@ A1 is what buys determinism: there is no parallel reader to race the advance.
 Any transport that keeps a background reader thread violates A1 — this is why
 both backends had to move off the pty.
 
+A1 is enforced structurally rather than by convention, in three places that all
+key off the same condition (`KLIPPY_TICK_SOCKET` set *and* the host link being
+the AF_UNIX socket, `serial_fd_type == 'p'`, which both bridges bind
+unconditionally in tick mode):
+
+- `serialqueue.c` sets `sq->tick_mode` on that condition, and skips
+  `pthread_create` for the background thread when it is set.
+- `serialhdl.py` gates every reactor-side tick path (`register_tick_flush`,
+  `register_tick_need_prompt`, the receive `register_fd`) on the same
+  `reactor_driven` condition.
+- `serialqueue_flush_ready` and `serialqueue_tick_input` refuse to run — with a
+  diagnostic — if `sq->tick_mode` is clear, so a widened gate fails loudly
+  instead of silently racing the timer plane.
+
+Because A1 holds by construction, the timer plane needs no cross-thread lock:
+`pollreactor.c` is unchanged from upstream. `test_reactor_guard.py` pins the
+`serialhdl.py` half of the gate so it cannot be widened by accident.
+
 ---
 
 ## 2. The protocol state machine — test body

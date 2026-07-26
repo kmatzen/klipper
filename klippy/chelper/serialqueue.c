@@ -736,16 +736,25 @@ command_event(struct serialqueue *sq, double eventtime)
 // quanta, so it would not transmit until after the mcu had already run
 // past the command's clock, starving the step queue ("Timer too close").
 // Passing the real sendtime (not horizon) keeps the stored sent_time
-// honest so clock sync is unaffected. Cross-thread safety: do_command_event()
-// takes sq->lock to serialize against the background thread's command_event
-// path, and any pollreactor_update_timer() reached via build_and_send_command
-// is itself serialized against pollreactor_check_timers() by pollreactor's
-// own timer_lock (see klippy/chelper/pollreactor.c) - so the timer plane is
-// not raced on either. Never invoked on real hardware (no reactor tick mode
-// there).
+// honest so clock sync is unaffected.
+//
+// Single-threaded by construction, so the timer plane needs no lock: this
+// is reached only from the reactor thread, and only when sq->tick_mode is
+// set - which is the same condition under which no background thread was
+// ever created. klippy/serialhdl.py gates the reactor-side registration on
+// exactly that condition (serial_fd_type 'p' plus KLIPPY_TICK_SOCKET), and
+// both bridges bind that AF_UNIX link unconditionally in tick mode. Never
+// invoked on real hardware (no reactor tick mode there).
 void __visible
 serialqueue_flush_ready(struct serialqueue *sq, double sendtime, double horizon)
 {
+    if (!sq->tick_mode) {
+        // The no-lock argument above holds only while tick_mode is set, so
+        // refuse rather than race the background thread's timer plane. Only
+        // reachable if the serialhdl.py gate is widened past 'p' links.
+        errorf("serialqueue_flush_ready called on a non-tick serialqueue");
+        return;
+    }
     do_command_event(sq, horizon, sendtime);
 }
 
@@ -763,6 +772,13 @@ serialqueue_flush_ready(struct serialqueue *sq, double sendtime, double horizon)
 void __visible
 serialqueue_tick_input(struct serialqueue *sq, double eventtime)
 {
+    if (!sq->tick_mode) {
+        // Same gate as serialqueue_flush_ready: off tick mode the background
+        // thread owns input_event, so driving it from the reactor thread
+        // would race the input buffer.
+        errorf("serialqueue_tick_input called on a non-tick serialqueue");
+        return;
+    }
     input_event(sq, eventtime);
 }
 
@@ -1038,13 +1054,7 @@ serialqueue_rm_fastreader(struct serialqueue *sq, struct fastreader *fr)
     list_del(&fr->node);
     pthread_mutex_unlock(&sq->lock);
 
-    // Unlinking fr above does not stop a dispatch already in progress: the
-    // background thread drops sq->lock but holds fast_reader_dispatch_lock
-    // across the fr->func() callback (see handle_message). Acquire and
-    // immediately release that lock here as a barrier - it blocks until any
-    // in-flight callback for this fastreader has returned, so the caller can
-    // safely free fr afterward without its callback running on freed memory.
-    pthread_mutex_lock(&sq->fast_reader_dispatch_lock);
+    pthread_mutex_lock(&sq->fast_reader_dispatch_lock); // XXX - goofy locking
     pthread_mutex_unlock(&sq->fast_reader_dispatch_lock);
 }
 

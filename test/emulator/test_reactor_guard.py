@@ -133,6 +133,23 @@ def test_guard_raise_is_diagnosable():
         raise AssertionError("guard did not raise at the limit")
 
 
+def test_tick_paths_gated_on_the_socket_link():
+    # Invariant A1 (TICK_PROTOCOL_DESIGN.md 1.4): tick mode must never have a
+    # second thread. serialqueue.c suppresses its background thread only when
+    # serial_fd_type is 'p', so every reactor-side tick path must be gated on
+    # the same condition - otherwise the reactor calls serialqueue_flush_ready
+    # while the background thread runs pollreactor_check_timers and races the
+    # timer plane. That race is why an earlier revision carried a mutex in
+    # pollreactor.c; the gate replaces it, so pin the gate.
+    src = open(os.path.join(_KLIPPY, 'serialhdl.py')).read()
+    assert re.search(r"reactor_driven\s*=\s*tick_socket\s+and\s+"
+                     r"serial_fd_type\s*==\s*b'p'", src), \
+        "serialhdl.reactor_driven must require serial_fd_type == b'p'"
+    assert 'if tick_socket:' not in src, (
+        "tick paths must be gated on reactor_driven, not bare tick_socket -"
+        " see klippy/chelper/serialqueue.c serialqueue_flush_ready")
+
+
 def test_wait_quantum_below_trsync_timeout():
     # Cross-file invariant: the reactor's per-advance wait quantum must stay
     # below the multi-MCU trsync watchdog or homing keep-alives arrive late by

@@ -116,10 +116,19 @@ class SerialReader:
             self.ffi_lib.serialqueue_free)
         # Deterministic tick-mode lockstep (KLIPPY_TICK_SOCKET set).
         # All paths below are no-ops without the env. See
-        # TICK_PROTOCOL_DESIGN.md section 2 for the protocol. Reactor-driven
-        # receive only applies to the synchronous AF_UNIX socket link
-        # (simavr, serial_fd_type 'p'); a renode pty ('u') is async and
-        # keeps the background thread, gaining only the flush below.
+        # TICK_PROTOCOL_DESIGN.md section 2 for the protocol.
+        #
+        # Every tick-mode path is gated on `reactor_driven`, i.e. on the
+        # host link being the synchronous AF_UNIX socket (serial_fd_type
+        # 'p'), which both backends bind unconditionally in tick mode
+        # (simavr suart_setup, renode _TickHostLink). That is what makes
+        # invariant A1 (section 1.4) structural rather than incidental: the
+        # C serialqueue suppresses its background thread on exactly the
+        # same condition, so tick mode never has a second thread, and
+        # serialqueue_flush_ready is therefore only ever called from the
+        # reactor thread. Do not widen this to bare `tick_socket` - that
+        # would let the reactor call flush_ready while the background
+        # thread runs pollreactor_check_timers, racing the timer plane.
         tick_socket = bool(os.environ.get('KLIPPY_TICK_SOCKET'))
         reactor_driven = tick_socket and serial_fd_type == b'p'
         if reactor_driven:
@@ -128,7 +137,7 @@ class SerialReader:
         else:
             self.background_thread = threading.Thread(target=self._bg_thread)
             self.background_thread.start()
-        if tick_socket:
+        if reactor_driven:
             sq = self.serialqueue
             ffi_lib = self.ffi_lib
             self._tick_flush_cb = (
@@ -139,15 +148,13 @@ class SerialReader:
             # _tick_request_advance and serialqueue_need_prompt). The
             # reactor caps the advance at QWAIT (8 ms) when any tick MCU
             # is blocked on a specific reply/trigger, else runs QMAX
-            # (100 ms) so streaming samples coalesce. Latency-only knob;
-            # rides the existing receive path on both socket and pty.
+            # (100 ms) so streaming samples coalesce. Latency-only knob.
             self._tick_need_prompt_cb = (
                 lambda sq=sq: int(ffi_lib.serialqueue_need_prompt(sq)))
             self.reactor.register_tick_need_prompt(
                 self._tick_need_prompt_cb)
-            if reactor_driven:
-                self._tick_fd_hdl = self.reactor.register_fd(
-                    serial_dev.fileno(), self._tick_receive)
+            self._tick_fd_hdl = self.reactor.register_fd(
+                serial_dev.fileno(), self._tick_receive)
         # Obtain and load the data dictionary from the firmware.
         # Tick-mode advances sim time only per tick-socket round trip
         # (~50 round trips per 5 sim-sec at the 100 ms cap), so the
