@@ -155,6 +155,14 @@ emulator startup:
   BLTouch state machine on the named pins.
 - `auto_trigger_after_steps` — paired with `bltouch`: drives the bltouch
   sensor pin to triggered after N stepper edges on the Z step pin.
+- `config_overrides` — `{section: {option: value}}` rewrites applied to the
+  emulator's materialized cfg copy only (regular sections and the `#*#`
+  SAVE_CONFIG autosave block; an option absent from the cfg is inserted).
+  Lets a test carry emulator-only tunings — e.g. `delta_calibrate`'s
+  real-printer `rotation_distance`, or `load_cell` pinning a second bulk
+  sensor below the AVR link ceiling — while the shared `test/klippy` cfg
+  stays byte-identical to upstream for fileoutput CI. The runner's cfg
+  parsers (ADS1220 sample rates, endstop pins, …) read the overridden copy.
 - `spi_response` — hex byte stream the bridge round-robins back as SPI MISO
   data. Used by tests with thermocouples or other SPI-resident sensors that
   need plausible (in-range) read responses.

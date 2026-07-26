@@ -1,6 +1,20 @@
 {
-    "_comment": "Drives test/klippy/delta_calibrate.test under the simavr bridge in tick-mode lockstep, mirroring delta.fixture.json. Same throughput-bound exclusion delta hit in free-run sim_time; tick_mode pins simavr's advance to klippy's reactor cycle so the per-step UART traffic always lands inside the simulated moment it was sent. delta_calibrate.cfg has no thermistors / heaters / sensors past the three towers' endstops, so only auto_trsync_trigger_ticks is needed; analog_in_default is harmless-but-unused. The cfg's rotation_distance was also rescaled from 0.32 to a real-printer 40 mm/rev so the AVR atmega2560 can sustain the step pulse train (the original 0.32 was a fileoutput-only contrivance for clean integer heightN_pos values; see the cfg header comment) - that rescale is what actually unblocks the test under the real-MCU bridge.",
+    "_comment": "Drives test/klippy/delta_calibrate.test under the simavr bridge in tick-mode lockstep, mirroring delta.fixture.json. Same throughput-bound exclusion delta hit in free-run sim_time; tick_mode pins simavr's advance to klippy's reactor cycle so the per-step UART traffic always lands inside the simulated moment it was sent. delta_calibrate.cfg has no thermistors / heaters / sensors past the three towers' endstops, so only auto_trsync_trigger_ticks is needed; analog_in_default is harmless-but-unused. config_overrides rescales rotation_distance from the upstream cfg's fileoutput-symbolic 0.32 to a real-printer 40 mm/rev (GT2 belt, 20-tooth pulley) on the emulator's materialized copy only: at 0.32 with microsteps=16 and homing_speed=50 each tower would need ~500 kHz step pulses, beyond what an atmega2560 can sustain (the AVR correctly trips its stepper-overload shutdown), while the shared cfg that fileoutput CI parses stays byte-identical to upstream. The saved heightN_pos autosave values are rescaled by the same 0.32/40 = 1/125 factor so DELTA_ANALYZE's stable-position math stays self-consistent at config load; the DELTA_CALIBRATE METHOD=manual run the .test drives later overwrites them with fresh probe positions before the extended calibration.",
     "tick_mode": true,
     "auto_trsync_trigger_ticks": 100,
-    "analog_in_default": {"default_value": 5000}
+    "analog_in_default": {"default_value": 5000},
+    "config_overrides": {
+        "stepper_a": {"rotation_distance": "40"},
+        "stepper_b": {"rotation_distance": "40"},
+        "stepper_c": {"rotation_distance": "40"},
+        "delta_calibrate": {
+            "height0_pos": "23764.000,23764.000,23764.000",
+            "height1_pos": "25306.136,25306.136,21822.832",
+            "height2_pos": "22954.528,26425.240,22954.528",
+            "height3_pos": "21992.072,25106.648,25106.648",
+            "height4_pos": "23083.984,23083.984,25749.976",
+            "height5_pos": "24916.448,22169.080,24916.448",
+            "height6_pos": "26080.880,23015.752,23015.752"
+        }
+    }
 }

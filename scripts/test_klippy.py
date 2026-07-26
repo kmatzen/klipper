@@ -435,15 +435,18 @@ class TestCase:
         # the bridge models heater PWM -> ADC heat-up.
         sim_time_enabled = False
         tick_mode_enabled = False
+        config_overrides = {}
         try:
             if fixture_path is not None:
                 with open(fixture_path) as ff:
                     fx = json.load(ff)
                 sim_time_enabled = bool(fx.get('sim_time'))
                 tick_mode_enabled = bool(fx.get('tick_mode'))
+                config_overrides = fx.get('config_overrides') or {}
         except (OSError, ValueError):
             sim_time_enabled = False
             tick_mode_enabled = False
+            config_overrides = {}
         # tick_mode implies sim_time (klippy reads the MCU's cycle as
         # its monotonic clock); the bridge then drives klippy in
         # lockstep over the tick socket so the two clocks can't drift.
@@ -591,16 +594,24 @@ class TestCase:
                 b['slave_path'] = self._wait_for_slave_link(
                     b['slave_link'], p, timeout=wait_timeout,
                     is_symlink=use_symlink)
-                if is_lp:
+            # Materialize the klippy-side config (serial: rewrite plus
+            # the fixture's config_overrides) before pushing fixture
+            # state, so the cfg parsers the push relies on (ADS1220
+            # sample rates, endstop pins, TMC chips, ...) read the
+            # same config klippy will load rather than the pristine
+            # source cfg. Requires every bridge's slave_path, hence
+            # the loop split.
+            self._materialize_emulator_config(config_fname, cfg_path,
+                                              bridges, config_overrides)
+            for b in bridges:
+                if b['backend'] == 'linuxprocess':
                     # No control socket for linuxprocess - peripheral
                     # state is staged via filesystem mocks before spawn.
                     continue
                 self._push_fixture_to_control_socket(
-                    b['ctl_socket'], fixture_path, config_fname,
+                    b['ctl_socket'], fixture_path, cfg_path,
                     sim_time_enabled=sim_time_enabled,
                     mcu_name=b['mcu'], backend=b['backend'])
-            self._materialize_emulator_config(config_fname, cfg_path,
-                                              bridges)
             klippy_args = [sys.executable, './klippy/klippy.py', cfg_path,
                            '-i', gcode_fname, '-l', TEMP_LOG_FILE, '-v']
             for df in dict_fnames:
@@ -1955,7 +1966,8 @@ class TestCase:
         raise error("emulator did not publish slave link within %.1fs"
                     % (timeout,))
 
-    def _materialize_emulator_config(self, src_path, dest_path, bridges):
+    def _materialize_emulator_config(self, src_path, dest_path, bridges,
+                                     config_overrides=None):
         # `bridges` is a list of dicts with 'mcu' (section name) and
         # 'slave_path' (resolved pty). For single-MCU configs (one
         # entry, mcu=='mcu') we keep the legacy behavior: rewrite
@@ -2003,8 +2015,76 @@ class TestCase:
                     "EMULATOR config %r missing serial: line for "
                     "[mcu %s]" % (src_path, ', '.join(sorted(missing))))
             cfg = ''.join(out_lines)
+        if config_overrides:
+            cfg = self._apply_config_overrides(cfg, config_overrides,
+                                               src_path)
         with open(dest_path, 'w') as f:
             f.write(cfg)
+
+    @staticmethod
+    def _apply_config_overrides(cfg, overrides, src_path):
+        # Fixture `config_overrides` ({section: {option: value}}) are
+        # applied only to this materialized emulator copy, so the
+        # shared test/klippy cfgs stay byte-identical to upstream
+        # (fileoutput CI parses the pristine cfg) while the emulator
+        # run carries its throughput tunings - e.g. delta_calibrate's
+        # real-printer rotation_distance, which the fileoutput-symbolic
+        # 0.32 would push past the atmega2560's step-rate ceiling.
+        # Options are matched both in regular `[section]` blocks and in
+        # the SAVE_CONFIG autosave block (`#*# [section]` headers with
+        # `#*# option = value` lines - autosave values override the
+        # main body at config load, so they must be rewritten too);
+        # every occurrence is replaced, preserving the matched line's
+        # prefix and separator style. An option present nowhere is
+        # inserted right after its regular section's header line.
+        section_re = re.compile(r'^(#\*#\s+)?\[([^\]]+)\]\s*$')
+        option_re = re.compile(r'^(#\*#\s+|)([a-zA-Z0-9_]+)(\s*[:=]\s*)')
+        replaced = set()
+        seen_sections = set()
+        out = []
+        cur = None
+        for line in cfg.splitlines(True):
+            m = section_re.match(line)
+            if m:
+                cur = m.group(2)
+                seen_sections.add(cur)
+            elif cur in overrides:
+                om = option_re.match(line)
+                if om and om.group(2) in overrides[cur]:
+                    opt = om.group(2)
+                    line = (om.group(1) + opt + om.group(3)
+                            + str(overrides[cur][opt]) + '\n')
+                    replaced.add((cur, opt))
+            out.append(line)
+        missing = [(s, o) for s, opts in overrides.items()
+                   for o in opts if (s, o) not in replaced]
+        if missing:
+            bad = sorted({s for s, o in missing if s not in seen_sections})
+            if bad:
+                raise error(
+                    "EMULATOR config_overrides: section(s) %s not found "
+                    "in %r" % (', '.join('[%s]' % s for s in bad),
+                               src_path))
+            insertions = {}
+            for s, o in missing:
+                insertions.setdefault(s, []).append(o)
+            inserted_out = []
+            for line in out:
+                inserted_out.append(line)
+                m = section_re.match(line)
+                if m and not m.group(1) and m.group(2) in insertions:
+                    for o in insertions.pop(m.group(2)):
+                        inserted_out.append(
+                            '%s: %s\n' % (o, overrides[m.group(2)][o]))
+            if insertions:
+                raise error(
+                    "EMULATOR config_overrides: option(s) %s have no "
+                    "regular [section] header to be inserted after in %r"
+                    % (', '.join(sorted(
+                        '%s.%s' % (s, o) for s, opts in insertions.items()
+                        for o in opts)), src_path))
+            out = inserted_out
+        return ''.join(out)
 
     def _run_klippy_with_deadline(self, args, env=None):
         proc = subprocess.Popen(args, env=env)

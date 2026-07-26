@@ -299,17 +299,17 @@ RUN /venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelpe
 # position correlation the tap fit depends on (tracked; an ARM-MCU eddy
 # test avoids the link ceiling entirely).
 #
-# delta_calibrate.test gates here. The cfg's rotation_distance was rescaled
-# from the original fileoutput-only 0.32 (contrived for clean integer
-# heightN_pos values) to a real-printer 40 mm/rev: at 0.32 the homing /
-# probe step rate exceeds what an AVR atmega2560 can sustain, so the test
-# always shut down with "Rescheduled timer in the past" under the real-MCU
-# bridge. The saved heightN_pos values were rescaled by the same factor
-# (1/125) so DELTA_ANALYZE's stable-position math stays self-consistent at
-# config-load; the manual DELTA_CALIBRATE the test runs first overwrites
-# them with fresh probe positions before extended calibration runs. The
-# .test gcode and DELTA_ANALYZE assertions are untouched; fileoutput still
-# passes since it only checks for a clean exit.
+# delta_calibrate.test gates here. Its fixture's config_overrides rescale
+# rotation_distance from the fileoutput-symbolic 0.32 (contrived for clean
+# integer heightN_pos values) to a real-printer 40 mm/rev on the emulator's
+# materialized cfg copy only: at 0.32 the homing / probe step rate exceeds
+# what an AVR atmega2560 can sustain, so the test always shut down with
+# "Rescheduled timer in the past" under the real-MCU bridge. The shared
+# test/klippy cfgs stay byte-identical to upstream (fileoutput CI parses
+# them pristine); the .test gcode and DELTA_ANALYZE assertions are
+# untouched. load_cell.test's fixture likewise pins its parse-coverage
+# second ADS1220 to 20 SPS via config_overrides (two 660 SPS bulk streams
+# exceed the AVR's 96-byte UART TX buffer; production runs one per AVR).
 CMD ["/venv/bin/python", "scripts/test_klippy.py", "-d", "ci_build/dict", \
      "test/klippy/emulator_smoke.test", \
      "test/klippy/sht3x_crc_regression.test", \
