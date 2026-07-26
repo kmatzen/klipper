@@ -1517,6 +1517,21 @@ class TestCase:
                             and cs[1].isalpha()):
                         lines.append("spi_ads131_chip %s %d %d" % (
                             cs[1], int(cs[2:]), id_hi))
+        # heater_model: first-order heater-PWM -> ADC thermal plant in
+        # the bridge, un-masking the closed-loop heater path (M104 +
+        # TEMPERATURE_WAIT + verify_heater). Values are raw 13-bit ADC
+        # units like every other analog fixture key.
+        for hm in raw.get('heater_model') or ():
+            hp = hm.get('heater_pin', '')
+            ch = self._adc_channel_for_pin(hm.get('sensor_pin', ''))
+            if (ch is None or len(hp) < 3 or hp[0] != 'P'
+                    or not hp[1].isalpha()):
+                continue
+            lines.append("heater_model %s %d %d %d %d %d" % (
+                hp[1], int(hp[2:]), ch,
+                _raw_to_mv(int(hm.get('ambient_raw', 7817))),
+                _raw_to_mv(int(hm.get('full_power_raw', 954))),
+                int(float(hm.get('tau_s', 4.0)) * 1000)))
         # adxl345: register the bridge's ADXL345 streaming model on
         # every [adxl345*] section's CS pin. The bridge serves the
         # DEVID probe + register write-verifies and streams 13-bit

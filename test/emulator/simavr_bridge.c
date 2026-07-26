@@ -431,6 +431,90 @@ adxl_reset_regs(struct adxl_chip *c)
     c->regs[0x00] = 0xe5;             /* DEVID */
 }
 
+/* Heater thermal model (closed-loop heater PWM -> ADC heat-up). The
+ * firmware drives the heater pin (software PWM GPIO); the model
+ * integrates a first-order plant toward ambient_mv (pin low) or
+ * full_mv (pin high) with time constant tau, and republishes the
+ * evolving temperature onto the sensor's ADC channel via a cycle
+ * timer. All timing is avr->cycle, so tick-mode runs are
+ * deterministic. With a PWM period much shorter than tau the
+ * exponential integration averages the duty cycle naturally, so
+ * klippy's PID sees a plausible plant: full duty ramps toward
+ * full_mv, zero duty decays toward ambient_mv, and a settled duty d
+ * approaches ambient + d * (full - ambient). This un-masks the
+ * closed-loop heater path (M104 + TEMPERATURE_WAIT + verify_heater)
+ * that static fixture ADC values could never exercise. */
+#define HEATER_MODEL_MAX 4
+struct heater_model {
+    char port;                 /* heater pin port 'A'..'L' */
+    int pin;
+    int adc_ch;                /* sensor ADC channel 0..15 */
+    double ambient_mv;
+    double full_mv;
+    double tau_s;
+    struct avr_t *avr;
+    int level;                 /* current heater pin level */
+    double temp_mv;            /* modeled sensor voltage */
+    uint64_t last_cycle;       /* cycle of last integration step */
+    int timer_armed;
+};
+static struct heater_model heater_models[HEATER_MODEL_MAX];
+static int heater_models_count = 0;
+static pthread_mutex_t heater_model_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Advance the plant to `now` under the current pin level. */
+static void
+heater_model_advance(struct heater_model *h, uint64_t now)
+{
+    if (!h->avr || now <= h->last_cycle) {
+        h->last_cycle = now;
+        return;
+    }
+    double dt = (double)(now - h->last_cycle) / (double)h->avr->frequency;
+    h->last_cycle = now;
+    double target = h->level ? h->full_mv : h->ambient_mv;
+    h->temp_mv += (target - h->temp_mv) * (1.0 - exp(-dt / h->tau_s));
+}
+
+static void
+heater_model_publish(struct heater_model *h)
+{
+    avr_irq_t *irq = avr_io_getirq(
+        h->avr, AVR_IOCTL_ADC_GETIRQ, ADC_IRQ_ADC0 + h->adc_ch);
+    if (irq)
+        avr_raise_irq(irq, (uint32_t)(h->temp_mv + 0.5));
+}
+
+static void
+heater_model_pin_hook(struct avr_irq_t *irq, uint32_t value, void *param)
+{
+    (void)irq;
+    int idx = (int)(intptr_t)param;
+    if (idx < 0 || idx >= heater_models_count)
+        return;
+    pthread_mutex_lock(&heater_model_lock);
+    struct heater_model *h = &heater_models[idx];
+    heater_model_advance(h, h->avr ? h->avr->cycle : 0);
+    h->level = value ? 1 : 0;
+    pthread_mutex_unlock(&heater_model_lock);
+}
+
+/* Cycle timer: integrate + republish every ~5 ms of sim time - well
+ * inside klippy's ADC sample cadence, far above the plant's tau. */
+static avr_cycle_count_t
+heater_model_tick(struct avr_t *avr, avr_cycle_count_t when, void *param)
+{
+    int idx = (int)(intptr_t)param;
+    if (idx < 0 || idx >= heater_models_count)
+        return 0;
+    pthread_mutex_lock(&heater_model_lock);
+    struct heater_model *h = &heater_models[idx];
+    heater_model_advance(h, when);
+    heater_model_publish(h);
+    pthread_mutex_unlock(&heater_model_lock);
+    return when + avr->frequency / 200;
+}
+
 /* Data rate from the BW_RATE code klippy wrote (adxl345.py
  * QUERY_RATES: 0x8=25 ... 0xf=3200). */
 static int
@@ -2573,6 +2657,62 @@ adxl_cs_hook(struct avr_irq_t *irq, uint32_t value, void *param)
     pthread_mutex_unlock(&spi_state.lock);
 }
 
+/* heater_model <port> <pin> <adc_ch> <ambient_mv> <full_mv> <tau_ms> */
+static void
+apply_heater_model(struct control_ctx *ctx, int port_ord, int pin,
+                   int adc_ch, int ambient_mv, int full_mv, int tau_ms)
+{
+    if (port_ord < 'A' || port_ord > 'L' || pin < 0 || pin > 7)
+        return;
+    if (adc_ch < 0 || adc_ch > 15 || tau_ms <= 0)
+        return;
+    pthread_mutex_lock(&heater_model_lock);
+    int slot = -1;
+    for (int i = 0; i < heater_models_count; i++) {
+        if (heater_models[i].port == (char)port_ord
+                && heater_models[i].pin == pin) {
+            slot = i;
+            break;
+        }
+    }
+    int existing = slot;
+    if (slot < 0 && heater_models_count < HEATER_MODEL_MAX) {
+        slot = heater_models_count++;
+        struct heater_model *h = &heater_models[slot];
+        memset(h, 0, sizeof(*h));
+        h->port = (char)port_ord;
+        h->pin = pin;
+        h->adc_ch = adc_ch;
+        h->ambient_mv = (double)ambient_mv;
+        h->full_mv = (double)full_mv;
+        h->tau_s = (double)tau_ms / 1000.0;
+        h->avr = ctx->avr;
+        h->temp_mv = h->ambient_mv;
+        h->last_cycle = ctx->avr->cycle;
+    }
+    pthread_mutex_unlock(&heater_model_lock);
+    if (slot < 0)
+        return;
+    if (existing < 0) {
+        struct heater_model *h = &heater_models[slot];
+        avr_irq_t *pin_irq = avr_io_getirq(
+            ctx->avr, AVR_IOCTL_IOPORT_GETIRQ((char)port_ord), pin);
+        if (pin_irq)
+            avr_irq_register_notify(
+                pin_irq, heater_model_pin_hook, (void *)(intptr_t)slot);
+        heater_model_publish(h);
+        avr_cycle_timer_register(
+            ctx->avr, ctx->avr->frequency / 200, heater_model_tick,
+            (void *)(intptr_t)slot);
+        h->timer_armed = 1;
+        fprintf(stderr,
+                "simavr_bridge: heater_model %c%d -> adc%d "
+                "ambient=%dmV full=%dmV tau=%dms\n",
+                (char)port_ord, pin, adc_ch, ambient_mv, full_mv, tau_ms);
+    }
+}
+
+
 /* spi_adxl345_chip <cs_port> <cs_pin> <vib_freq_hz> <amp_raw> <base_z_raw>
  * Register an ADXL345 chip's CS pin. vib_freq_hz / amp_raw give the
  * synthetic x-axis vibration (a pure tone TEST_RESONANCES can find);
@@ -3466,6 +3606,16 @@ apply_control_line(struct control_ctx *ctx, char *line)
         if (sscanf(line + 16, " %c %d %i", &cs_port_ch, &cspin, &idhi) == 3) {
             csp = (int)cs_port_ch;
             apply_spi_ads131_chip(ctx, csp, cspin, idhi);
+        }
+        return;
+    }
+    if (strncmp(line, "heater_model ", 13) == 0) {
+        char port_ch = 0;
+        int pin = -1, ch = -1, amb = 0, full = 0, tau = 0;
+        if (sscanf(line + 13, " %c %d %d %d %d %d",
+                   &port_ch, &pin, &ch, &amb, &full, &tau) == 6) {
+            apply_heater_model(ctx, (int)port_ch, pin, ch,
+                               amb, full, tau);
         }
         return;
     }

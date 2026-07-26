@@ -1,0 +1,14 @@
+{
+    "_comment": "Drives heater.test under the simavr bridge in tick-mode lockstep. heater_model registers a first-order thermal plant on the extruder's heater pin (PB4, software PWM) publishing onto the EPCOS thermistor's ADC channel (PK5 = ADC13): d(temp)/dt = (target - temp)/tau with target = ambient_raw at duty 0 and full_power_raw at duty 1; the exponential integration over the PWM edges averages the duty naturally, so a settled duty d reads ambient + d*(full-ambient). Values are raw 13-bit ADC units (VREF 5 V, 8184 full scale) computed for EPCOS 100K B57560G104F with the 4.7k pullup: ambient_raw 7817 is 25 C, full_power_raw 954 is the ~200 C full-power asymptote - so the PID's ~14% steady duty for the test's 50 C target is comfortably inside the plant's range, the 25->45 C rise takes ~0.5 s of sim time at full duty, and the decay back under 40 C a few tau. tau_s 4 keeps both TEMPERATURE_WAIT phases short while staying far above the soft-PWM period so the duty averaging is smooth. analog_in_default covers the unmodeled ADC channels.",
+    "tick_mode": true,
+    "analog_in_default": {"default_value": 7817},
+    "heater_model": [
+        {
+            "heater_pin": "PB4",
+            "sensor_pin": "PK5",
+            "ambient_raw": 7817,
+            "full_power_raw": 954,
+            "tau_s": 4
+        }
+    ]
+}
