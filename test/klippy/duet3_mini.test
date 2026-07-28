@@ -1,0 +1,47 @@
+# End-to-end EMULATOR test: Duet3 Mini 5+ (Microchip SAME54P20, run on
+# the pin-/register-compatible samd51p20 build) under Renode in tick
+# mode. Boots real firmware, completes identify + clocksync, brings up
+# the full config (4 TMC2209s on multi-drop UART, 2 software-PWM
+# heaters, a heater_fan, endstops, adc_scaled thermistors) and
+# round-trips gcode. See "Per-printer tests" in
+# test/emulator/README.md for the shared conventions.
+#
+# Ground specific to this board (samd51_smoke covers boot only):
+#   - TMC2209 multi-drop UART (uart_pin PA1 / tx_pin PA0 / select_pins
+#     PD0, uart_address 0..3). sw_uart._drive_rx drives the firmware RX
+#     bit through the SAMD51 PORT model (gpio_a.OnGPIO); samd51p20.repl
+#     declares gpio_a..gpio_d as GPIOPort.SAMD21_GPIO, which serves the
+#     layout-identical SAMX5 PortGroup registers.
+#   - adc_scaled thermistors via samd51_adc_stub.py. The SAMX5 ADC
+#     layout differs from SAMD21's (INPUTCTRL@0x04, SWTRIG@0x14,
+#     INTFLAG@0x2E, SYNCBUSY@0x30, RESULT@0x40) so it needs its own
+#     stub, which also returns SYNCBUSY=0 so adc_init's busy-waits fall
+#     through. vref (7) and vssa (6) carry distinct values so
+#     adc_scaled's (vref - vssa) divisor is non-zero.
+DICTIONARY samd51p20.dict
+CONFIG duet3_mini.cfg
+EMULATOR duet3_mini.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,43 @@
+# End-to-end EMULATOR test: Duet3 6HC (SAME70Q20B) under Renode in tick
+# mode. Boots real firmware, completes identify + clocksync, brings up
+# the full config (4 TMC5160s on a shared SPI daisy-chain, 2
+# software-PWM heaters, fans, endstops, adc_scaled thermistors on the
+# SAME70 AFEC) and round-trips M114/M105. See "Per-printer tests" in
+# test/emulator/README.md for the shared conventions.
+#
+# Ground specific to this board: TMC5160 over a SPI DAISY-CHAIN
+# (chain_length 6) on usart1. Renode models no USART-in-SPI-mode
+# peripheral, so the renode_hooks TMC SPI chain responder hooks
+# spidev_transfer by CPU PC, reads MOSI from the firmware buffer,
+# synthesises the chain MISO response with a one-transaction-delay-per-
+# slot model, and PC-skips the real transfer. DUMP_TMC reads back chain
+# positions 1 (stepper_x) and 4 (extruder), proving the chain read path.
+#
+# Runs the serial-mode build (same70q20b.dict, host link UART2 on
+# PD25/PD26) because the pin map is host-link independent;
+# duet3_6hc_usb.test drives the identical config over real USB-CDC.
+DICTIONARY same70q20b.dict
+CONFIG duet3_6hc.cfg
+EMULATOR duet3_6hc.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x30"
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc spi"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

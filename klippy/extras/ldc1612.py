@@ -79,7 +79,17 @@ class LDC1612:
         self.name = config.get_name().split()[-1]
         self.calibration = calibration
         self.dccal = DriveCurrentCalibrate(config, self)
-        self.data_rate = 400
+        # LDC1612 conversion sample rate. Upstream `d2aa4bd7e` raised the
+        # default from 250 to 400 SPS, which exceeds what a slow host link
+        # (e.g. an AVR atmega2560 over the stock 250 kbaud serial) can
+        # sustain end-to-end through bulk_sensor on a busy probe descent -
+        # samples drop and downstream gathers trip "Gaps in the data". The
+        # config knob lets such boards pin the pre-bump 250 SPS rate; the
+        # bound covers the LDC1612 datasheet's usable range against the
+        # RCOUNT0 / SETTLECOUNT0 conversion-time math (the firmware-side
+        # rcount0 = clock_freq / (16 * data_rate) computation).
+        self.data_rate = config.getint("data_rate", 400, minval=100,
+                                       maxval=1000)
         # Setup mcu sensor_ldc1612 bulk query code
         self.i2c = bus.MCU_I2C_from_config(config,
                                            default_addr=LDC1612_ADDR,

@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the BIGTREETECH SKR Pico v1.0 (RP2040) in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous uart0<->pty byte shuttle); RP2040 keeps time with the Timers.RP2040_Timer peripheral (a virtual-time model, so unlike the STM32F1 DWT it tracks simulated time directly and needs no frequency pin). The four TMC2209s share a single software-UART bus (gpio9 rx / gpio8 tx) addressed by multi-drop uart_address; renode_hooks.sw_uart bit-drives the framed reply (always master-addressed 0xff) so klippy's per-driver IFCNT-verified register init succeeds against a shared TMC register file. RP2040's GPIO is modelled as a plain storeback SIO region, so sw_uart drives the firmware-side RX bit by writing the SIO GPIO_IN register (the 'RP' port sentinel in the emitted sw_uart command selects that path). analog_in pins the two thermistor ADC channels to ~0.93 of full scale (raw 7600 / 8184) so both 100K thermistors read ~36 C - inside the extruder [0,250] and bed [0,130] ranges. RP2040 ADC channels: gpio26 = channel 0 (bed), gpio27 = channel 1 (extruder); see src/rp2040/adc.c (chan = pin - 26). Values are served by test/emulator/rp2040_adc_stub.py at 0x4004C000.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_bed": {"default_value": 7600, "channel": 0},
+        "_extruder": {"default_value": 7600, "channel": 1}
+    },
+    "tick_mode": true
+}

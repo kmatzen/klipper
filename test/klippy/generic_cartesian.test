@@ -1,6 +1,7 @@
 # Test cases on printers with dual carriage and multiple extruders
 CONFIG generic_cartesian.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # Configure the input shaper
 SET_DUAL_CARRIAGE CARRIAGE=carriage_u

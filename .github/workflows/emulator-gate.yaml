@@ -1,0 +1,53 @@
+# Full emulator regression gate: builds the emulator-test Docker image
+# and runs its default CMD - the 56-test suite that drives klippy
+# end-to-end against real firmware ELFs under simavr / Renode /
+# linuxprocess (see scripts/Dockerfile.emulator-test for the test list
+# and per-test rationale).
+#
+# Cadence: nightly + on push to the emulator-test branches + manual
+# dispatch. The stock build-test job remains the fast per-PR gate
+# (dict builds + fileoutput, where EMULATOR tests degrade and stay
+# green); this workflow is the authoritative end-to-end check, kept at
+# a coarser cadence because building the emulator image (all
+# toolchains, every .dict/.elf, simavr, Renode) is far heavier than a
+# stock CI cycle. GitHub-hosted runners are ~4 slower cores than the
+# reference 16-core box (~15 min gate there), hence the generous
+# timeout.
+name: Emulator regression gate
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # nightly 05:00 UTC (before the determinism proof)
+  workflow_dispatch:
+  push:
+    branches:
+      - add-mcu-emulator-test-infra
+    paths:
+      - 'src/**'
+      - 'klippy/**'
+      - 'test/klippy/**'
+      - 'test/emulator/**'
+      - 'scripts/test_klippy.py'
+      - 'scripts/Dockerfile.emulator-test'
+
+jobs:
+  gate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      # Standalone and dependency-free (it stubs chelper/greenlet), so it
+      # runs directly on the runner ahead of the heavy image build.
+      - name: Tick-mode reactor guard unit tests
+        run: python3 test/emulator/test_reactor_guard.py
+
+      - name: Build emulator-test image
+        run: |
+          docker build \
+              -t klipper-emu \
+              -f scripts/Dockerfile.emulator-test .
+
+      - name: Run the default emulator gate (56 tests)
+        run: |
+          docker run --rm klipper-emu

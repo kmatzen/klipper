@@ -1,0 +1,40 @@
+# End-to-end EMULATOR test: BIGTREETECH SKR mini E3 v3.0 (STM32G0B1)
+# under Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2209s, 2 software-PWM
+# heaters, 2 fans, endstops, 2 thermistors) and round-trips M114/M105.
+# See "Per-printer tests" in test/emulator/README.md for the shared
+# conventions.
+#
+# Successor of skr_mini_e3_v2.test (STM32F103); the TMC2209 multi-drop
+# UART path is identical and reuses renode_hooks.sw_uart unchanged. The
+# new ground is the G0 ADC: stm32g0_adc_stub.py completes klipper's G0
+# ISR/CR/CHSELR/DR handshake (src/stm32/stm32f0_adc.c). The G0/F0 ADC
+# layout is completely different from F1/F4, and upstream Renode's
+# Analog.STM32G0_ADC neither self-clears ADCAL the way the calibration
+# busy-wait needs nor returns controllable values, so without the stub
+# the firmware either spins in calibration or reads a fixed value.
+DICTIONARY stm32g0b1.dict
+CONFIG skr_mini_e3_v3.cfg
+EMULATOR skr_mini_e3_v3.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

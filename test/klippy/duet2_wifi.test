@@ -1,0 +1,44 @@
+# End-to-end EMULATOR test: Duet2 WiFi/Ethernet (Atmel SAM4E8E) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2660s on USART-SPI, 2
+# software-PWM heaters, a fan, endstops, 2 thermistors on the SAM4E
+# AFEC) and round-trips M114/M105. See "Per-printer tests" in
+# test/emulator/README.md for the shared conventions.
+#
+# Ground specific to this board (sam4e_smoke covers boot only):
+#   - The TMC2660 sub-mode of the renode_hooks spidev_transfer
+#     responder. TMC2660 uses 3-byte (20-bit) datagrams rather than the
+#     5-byte/40-bit datagrams of tmc2130/5160/2240, so spi_tmc_chip
+#     (auto-emitted per [tmc2660 ...] section) switches the responder
+#     into a 3-byte path.
+#   - The SAM4E AFEC, reusing afec_stub.py (src/atsam/sam4e_afec.c is
+#     shared with SAME70). Extruder reads AFEC0 channel index 7 (PC15),
+#     bed index 6 (PC13), both EPCOS 100K. A broken AFEC sits at
+#     temp=0.0 with no shutdown, so the temp=3 assertion is the positive
+#     proof samples arrived.
+DICTIONARY sam4e8e.dict
+CONFIG duet2_wifi.cfg
+EMULATOR duet2_wifi.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+G4 P2000
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

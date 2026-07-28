@@ -1,0 +1,26 @@
+# Divergent per-chip TMC SPI register state. Two TMC SPI chips share
+# the same bus (tmc2130 stepper_x on PG0 and tmc5160 stepper_y on
+# PG1); a write to one chip's CHOPCONF must not poison the other
+# chip's read. Real hardware enforces this because each chip is its
+# own physical register file; the bridge enforces it by keying its
+# 5-byte register table off the active CS pin, with each chip
+# registered via spi_tmc_chip on init.
+#
+# Requires the emulator backend: under the fileoutput fallback,
+# klippy's DUMP_TMC sees the all-zero DummyResponse and the per-chip
+# state can't be observed.
+DICTIONARY atmega2560.dict
+EMULATOR tmc_spi_divergence.fixture.json
+CONFIG tmc_spi.cfg
+REQUIRES_EMULATOR
+
+SET_TMC_FIELD STEPPER=stepper_x FIELD=toff VALUE=3
+SET_TMC_FIELD STEPPER=stepper_y FIELD=toff VALUE=8
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=stepper_y
+
+EXPECT_LOG_CONTAINS "toff=3"
+EXPECT_LOG_CONTAINS "toff=8"
+EXPECT_LOG_NOT_CONTAINS "TMC stepper_x failed to init"
+EXPECT_LOG_NOT_CONTAINS "TMC stepper_y failed to init"
+EXPECT_LOG_CONTAINS "Loaded MCU"

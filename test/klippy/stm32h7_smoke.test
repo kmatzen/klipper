@@ -1,0 +1,20 @@
+# STM32H7 boot/connect smoke test. Brings up the Renode stm32h7
+# backend end-to-end: the local stm32h723.repl (inheriting upstream
+# stm32h743.repl, since Renode ships no h723) plus upstream
+# Miscellaneous.STM32H7_RCC is the H7-specific path - distinct from the
+# F1 (local rcc_stub), F4 (STM32F4_RCC) and G0 paths. printers.test
+# reaches H7 chips via Octopus-Pro-H723 / Kraken-class boards at
+# config-parse depth; this is the firmware-boot regression target.
+# Uses the stm32h723 build.
+DICTIONARY stm32h723.dict
+CONFIG stm32h7_smoke.cfg
+EMULATOR stm32h7_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

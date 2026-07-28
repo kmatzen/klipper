@@ -1,8 +1,15 @@
 # Tests for various temperature sensors
 DICTIONARY atmega2560.dict
 CONFIG temperature.cfg
+EMULATOR temperature.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+# skipped (not degraded to fileoutput) when the emulator backend isn't built
 
-# Set various temperatures
+# Set various temperatures - exercises target setpoints on the
+# extruder + bed without crashing klippy. The bridge does not model
+# heater PWM -> ADC heating, so the temperatures will not actually
+# rise; the dwell at the end keeps klippy alive long enough for at
+# least one stats-poll cycle to log the sensor decoded values.
 M104 S100
 M105
 
@@ -11,7 +18,16 @@ M105
 
 M140 S0
 
-# Test "wait for temp" g-code
-M109 S100
-M109 S60
-M105
+G4 P3000
+
+# Verify klippy decoded each fixture-driven sensor reading. ~24 C
+# is what the per-pin ADC overrides + thermocouple SPI bytes map to
+# in the fixture, so any drift here means a sensor decoder regressed.
+EXPECT_LOG_CONTAINS "test_PT1000: temp=2[34]\."
+EXPECT_LOG_CONTAINS "test_combined: temp=2[34]\."
+# No fault or deviation - the spi_response queue is aligned to give
+# every thermocouple a plausible reading per polling cycle, and the
+# combined sensor's max_deviation=20 must pass.
+EXPECT_LOG_NOT_CONTAINS "Thermocouple reader fault"
+EXPECT_LOG_NOT_CONTAINS "maximum deviation exceeded"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"

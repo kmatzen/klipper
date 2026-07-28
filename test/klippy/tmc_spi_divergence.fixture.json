@@ -1,0 +1,5 @@
+{
+    "_comment": "Same spi_tmc setup as tmc_spi.fixture.json but free-run (tick_mode off). The divergence test only does a pair of SET_TMC_FIELD writes and DUMP_TMC reads - no motion, no timing-sensitive sequencing - so tick-mode lockstep is unnecessary, and skipping it sidesteps the cold-start-identify-race-into-tick-deadlock cascade that occasionally hangs klippy after the first DUMP_TMC. The runner still auto-emits spi_tmc_chip per [tmcXXXX ...] section to register each chip's CS pin with the bridge's per-chip register table.",
+    "spi_tmc": true,
+    "analog_in_default": {"default_value": 5000}
+}

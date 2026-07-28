@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, gc, select, math, time, logging, queue
+import os, gc, select, socket, math, time, logging, queue
 import greenlet
 import chelper, util
 
@@ -104,6 +104,26 @@ class ReactorPreventPause:
 class SelectReactor:
     NOW = _NOW
     NEVER = _NEVER
+    # Tick-mode lockstep (see _tick_request_advance and
+    # TICK_PROTOCOL_DESIGN.md section 2.3): per-advance quantum caps.
+    # _TICK_MAX_QUANTUM bounds an idle reactor's yield-to-bridge;
+    # _TICK_WAIT_QUANTUM is the smaller cap used while a tick MCU is
+    # blocked on a specific reply/trigger. It must stay below the
+    # multi-MCU trsync watchdog (mcu.py TRSYNC_TIMEOUT); mcu.py enforces
+    # that invariant at import time under KLIPPY_TICK_SOCKET.
+    _TICK_MAX_QUANTUM = 0.1
+    _TICK_WAIT_QUANTUM = 0.008
+    # Tick-mode livelock guard (TICK_PROTOCOL_DESIGN.md section 5.1). After this
+    # many consecutive no-progress iterations (timer overdue while
+    # sim_time frozen) fail fast with a diagnosis instead of hanging to
+    # the test deadline. Set well above any healthy-run transient streak
+    # (measured high-water is 0; the one real trigger - the async renode
+    # pty - was removed at the source by the synchronous AF_UNIX link).
+    _TICK_STALL_LIMIT = 64
+    # Hard safety net for the lockstep `done` recv (tick mode); fires
+    # only if a bridge genuinely stops replying, names the socket, and
+    # ends cleanly instead of hanging to the test deadline.
+    _TICK_RECV_TIMEOUT = 60.0
     def __init__(self, gc_checking=False):
         # Main code
         self._process = False
@@ -130,6 +150,44 @@ class SelectReactor:
         self._cached_dispatch_greenlets = []
         self._all_greenlets = []
         self._prevent_pause_count = 0
+        # Tick mode (deterministic-time lockstep with the emulator
+        # bridge). KLIPPY_TICK_SOCKET is a `:`-separated list of bridge
+        # socket paths; the reactor connects to each, broadcasts each
+        # `advance T`, and takes the min reported actual time.
+        # TICK_PROTOCOL_DESIGN.md section 2 has the protocol.
+        tick_env = os.environ.get('KLIPPY_TICK_SOCKET') or ''
+        self._tick_socket_paths = [p for p in tick_env.split(':') if p]
+        self._tick_sockets = []
+        self._tick_recv_bufs = []
+        # Per-transport pre-advance flush + need_prompt callbacks
+        # (registered by serialhdl). Empty off tick mode.
+        self._tick_flush_callbacks = []
+        self._tick_need_prompt_callbacks = []
+        # Determinism-proof trace (TICK_PROTOCOL_DESIGN.md 5.1). When
+        # KLIPPY_TICK_TRACE is set, append one line per advance request; two
+        # runs of the same test give byte-identical traces iff the reactor's
+        # advance decisions are deterministic. Paired with the bridge's
+        # per-advance trace. Disabled (None) otherwise.
+        self._tick_trace_fp = None
+        self._tick_trace_seq = 0
+        # Livelock guard state (see _TICK_STALL_LIMIT / _tick_decide_advance).
+        # _tick_stall_iters counts consecutive dispatch iterations with a timer
+        # overdue while sim_time is frozen; _tick_stall_max is the high-water
+        # mark, logged at finalize when KLIPPY_TICK_STALL_LOG is set so the
+        # limit can be confirmed safely above any healthy-run transient.
+        self._tick_stall_iters = 0
+        self._tick_stall_max = 0
+        # min(actuals) from the previous advance - the slowest bridge's real
+        # sim time. See its use in _tick_request_advance. None until the first
+        # advance completes; always == monotonic() for a single-mcu run.
+        self._tick_last_actual = None
+        self._tick_stall_log = bool(os.environ.get('KLIPPY_TICK_STALL_LOG'))
+        try:
+            self._TICK_STALL_LIMIT = int(
+                os.environ.get('KLIPPY_TICK_STALL_LIMIT',
+                               self._TICK_STALL_LIMIT))
+        except ValueError:
+            pass
     # Python garbage collection
     def get_gc_stats(self):
         return tuple(self._last_gc_times)
@@ -312,6 +370,272 @@ class SelectReactor:
                     self._end_greenlet(g_dispatch)
                     return self.monotonic()
         return eventtime
+    # Tick-mode lockstep with one or more external time drivers
+    def _tick_connect(self):
+        if not self._tick_socket_paths or self._tick_sockets:
+            return
+        deadline = time.monotonic() + 5.0
+        for path in self._tick_socket_paths:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            last_err = None
+            while time.monotonic() < deadline:
+                try:
+                    s.connect(path)
+                    self._tick_sockets.append(s)
+                    self._tick_recv_bufs.append(b'')
+                    s = None
+                    break
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.05)
+            if s is not None:
+                s.close()
+                # Tear down anything we already connected so a partial
+                # connect doesn't leave dangling fds.
+                self._tick_close()
+                raise ReactorError(
+                    "Could not connect KLIPPY_TICK_SOCKET=%s: %s"
+                    % (path, last_err))
+    def _tick_close(self):
+        for s in self._tick_sockets:
+            try:
+                s.close()
+            except OSError:
+                pass
+        self._tick_sockets = []
+        self._tick_recv_bufs = []
+    def register_tick_flush(self, callback):
+        # See _tick_flush_callbacks. callback(target) is invoked with the
+        # next advance target (simulated seconds) before each bridge advance.
+        self._tick_flush_callbacks.append(callback)
+    def unregister_tick_flush(self, callback):
+        try:
+            self._tick_flush_callbacks.remove(callback)
+        except ValueError:
+            pass
+    def register_tick_need_prompt(self, callback):
+        # See _tick_need_prompt_callbacks. callback() -> bool.
+        self._tick_need_prompt_callbacks.append(callback)
+    def unregister_tick_need_prompt(self, callback):
+        try:
+            self._tick_need_prompt_callbacks.remove(callback)
+        except ValueError:
+            pass
+    def _tick_decide_advance(self, timeout, eventtime, after_fds=False):
+        # Decide whether the dispatch loop should hand control to the
+        # bridge(s) this iteration. Returns True to advance, False to keep
+        # running timers. The normal case is "a future timer is pending"
+        # (timeout > 0). The livelock guard covers the case where a timer is
+        # overdue (waketime <= eventtime) yet sim_time is frozen because
+        # _check_timers keeps returning 0 (see _TICK_STALL_LIMIT): after a
+        # streak of such no-progress iterations it raises ReactorError with
+        # a diagnosis, so a wedged protocol state surfaces as a prompt,
+        # attributable failure instead of a hang (or a silent self-heal
+        # that could mask a real protocol bug). Inert on healthy runs (the
+        # overdue-with-frozen-sim streak stays far below the limit; measured
+        # high-water 0 across the full gate). Streak resets on any progress.
+        #
+        # after_fds is True when this iteration already ran _check_fds. Such an
+        # iteration must still be COUNTED: fd readiness is not sim-time
+        # progress, and an fd that goes ready more often than once every
+        # _TICK_STALL_LIMIT iterations (the renode link was an async pty drained
+        # by a background thread and did exactly that; it now uses the same
+        # synchronous AF_UNIX link as simavr, but the guard must not depend on
+        # that) would otherwise reset the streak
+        # forever and the guard could never fire - the livelock survives the
+        # guard. It must not, however, ADVANCE on the healthy timeout > 0 path:
+        # that is deferred to the next iteration, so the guard is only
+        # consulted after the link was drained (the TICK_PROTOCOL_DESIGN.md
+        # 2.5 D-PRE precondition).
+        if timeout > 0.:
+            self._tick_stall_iters = 0
+            return not after_fds
+        if self._next_timer > eventtime:
+            # Overdue timer already rescheduled into the future (e.g. the
+            # _check_timers "busy" short-circuit, or a healthy timer fire):
+            # the next iteration takes the timeout > 0 path. Not a stall.
+            self._tick_stall_iters = 0
+            return False
+        # A timer is overdue but sim_time is not advancing.
+        self._tick_stall_iters += 1
+        if self._tick_stall_iters > self._tick_stall_max:
+            self._tick_stall_max = self._tick_stall_iters
+            if self._tick_stall_log and not (
+                    self._tick_stall_iters & (self._tick_stall_iters - 1)):
+                # Power-of-two milestone: trace how high the streak climbs so
+                # the limit can be confirmed above any healthy transient.
+                logging.warning(
+                    "reactor: tick overdue streak=%d (limit=%d) at sim %.6f",
+                    self._tick_stall_iters, self._TICK_STALL_LIMIT, eventtime)
+        if self._tick_stall_iters < self._TICK_STALL_LIMIT:
+            return False
+        def _timer_id(t):
+            # For a parked greenlet's wake timer, name the first frames
+            # outside reactor.py - the pause() site that is spinning.
+            name = getattr(t.callback, '__qualname__', repr(t.callback))
+            frame = getattr(getattr(t.callback, '__self__', None),
+                            'gr_frame', None)
+            stack = []
+            while frame is not None and len(stack) < 3:
+                if not frame.f_code.co_filename.endswith('reactor.py'):
+                    stack.append('%s:%d:%s' % (
+                        os.path.basename(frame.f_code.co_filename),
+                        frame.f_lineno, frame.f_code.co_name))
+                frame = frame.f_back
+            if stack:
+                name += ' parked at [%s]' % ' < '.join(stack)
+            return '%s@%.6f' % (name, t.waketime)
+        overdue = ', '.join(_timer_id(t) for t in self._timers
+                            if t.waketime <= eventtime) or '<none>'
+        raise ReactorError(
+            "Tick-mode livelock: timer overdue (waketime %.6f) for %d"
+            " consecutive iterations with sim time frozen at %.6f. A"
+            " firmware reply this timer needs is not being produced -"
+            " see TICK_PROTOCOL_DESIGN.md section 5.1 and rerun with"
+            " KLIPPY_TICK_STALL_LOG=1 for the streak trace."
+            " Overdue timers: %s"
+            % (self._next_timer, self._TICK_STALL_LIMIT, eventtime, overdue))
+    def _tick_request_advance(self):
+        # Ask all bridges to advance simulated time, in lockstep.
+        # Returns the minimum reported actual (so klippy never thinks
+        # any bridge is ahead of where it actually is) or None on EOF.
+        target = self._next_timer
+        eventtime = self.monotonic()
+        # monotonic() reads the sim-time mmap of the CANONICAL (first) bridge
+        # only. With more than one mcu that is not the same thing as "the
+        # simulated time every bridge has reached": a bridge may reply `done`
+        # short of the target (the O1 output cap in simavr_bridge.c breaks the
+        # run loop once the tx buffer hits OUTPUT_CAP), so the canonical clock
+        # can be ahead of a slower bridge. Computing the flush horizon from it
+        # then hands that bridge commands whose req_clock it already considers
+        # past -> step-queue underrun / "Timer too close". Clamp to the slowest
+        # bridge's last reported actual - i.e. actually USE the min(actuals)
+        # this function returns, which previously no caller consumed. No-op for
+        # a single mcu, where the min IS the canonical clock.
+        if (self._tick_last_actual is not None
+                and self._tick_last_actual < eventtime):
+            eventtime = self._tick_last_actual
+        # Ask each transport what it is waiting on (TICK_PROTOCOL_DESIGN.md
+        # NEED_PROMPT): >=1 means klippy is blocked on a specific firmware
+        # reply (1 = identify/query/clock-sync) or trigger (2 = trsync homing)
+        # that may arrive before the next timer, so use the small bounded
+        # quantum; 0 means it is merely advancing toward a timer (streaming),
+        # so use the full quantum and let unsolicited output coalesce.
+        mode = 0
+        for need_prompt in self._tick_need_prompt_callbacks:
+            m = need_prompt()
+            if m > mode:
+                mode = m
+        if mode >= 2 and len(self._tick_sockets) == 1:
+            # Mode 2 is an active trsync (homing / probing). With a single
+            # mcu the firmware watchdog is TRSYNC_SINGLE_MCU_TIMEOUT (0.25 s,
+            # mcu.py) rather than the 0.025 s multi-mcu TRSYNC_TIMEOUT, and the
+            # trigger is handled firmware-side (the host only has to learn of
+            # it within a quantum - it never stops the move itself), so the
+            # small wait quantum buys nothing here. Use the full quantum so a
+            # long probe descent advances at streaming speed instead of ~12x
+            # slower (load_cell PROBE / BED_MESH_CALIBRATE was hitting the wall
+            # deadline at the 8 ms cap). The heartbeat stays alive: each
+            # trsync_set_timeout extension is flushed a MIN_REQTIME_DELTA
+            # (0.1 s) lead ahead of its req_clock and read by the firmware at
+            # the start of the crossing advance, always before the 0.25 s
+            # deadline, so the 0.1 s quantum leaves ample margin. Multi-mcu
+            # homing (len > 1, 0.025 s watchdog) keeps the small quantum below.
+            cap = eventtime + self._TICK_MAX_QUANTUM
+        elif mode:
+            cap = eventtime + self._TICK_WAIT_QUANTUM
+        else:
+            cap = eventtime + self._TICK_MAX_QUANTUM
+        if target >= self.NEVER or target > cap:
+            target = cap
+        if target < eventtime:
+            # The next timer is overdue (waketime <= eventtime) on a normal
+            # "advance toward the timer" iteration. Clamp to eventtime; the
+            # bridge's L1 +1-cycle guard then steps the MCU by one cycle,
+            # so sim_time moves forward minimally without overshooting any
+            # queued step.
+            target = eventtime
+        # Transmit any serial commands that are ready to send by `target`
+        # before the mcu runs forward, so they reach the firmware with the
+        # normal pre-transmit lead rather than a whole quantum late. Pass
+        # the current eventtime as the send timestamp (target is only the
+        # look-ahead horizon) so clock-sync timing stays honest.
+        for flush in self._tick_flush_callbacks:
+            flush(eventtime, target)
+        # No early-exit flag: the per-advance quantum above (small while
+        # waiting, full while streaming) already bounds reply/trigger latency,
+        # and a per-byte early-exit would chop concurrent streaming into one
+        # round trip per sample. See TICK_PROTOCOL_DESIGN.md.
+        msg = ('advance %.9f\n' % target).encode('ascii')
+        try:
+            for s in self._tick_sockets:
+                s.sendall(msg)
+        except OSError:
+            return None
+        actuals = []
+        diag = self._tick_stall_log
+        for i, s in enumerate(self._tick_sockets):
+            try:
+                while b'\n' not in self._tick_recv_bufs[i]:
+                    # Bounded wait for `done` (mechanism (2),
+                    # TICK_PROTOCOL_DESIGN.md 4.1): poll the socket so a bridge
+                    # that stops replying surfaces as a prompt failure naming
+                    # the culprit, not a silent hang until the test deadline.
+                    # The done arrives within ms in a healthy run, so this is
+                    # a no-op there; the _TICK_RECV_TIMEOUT net only fires off
+                    # a genuine wedge. KLIPPY_TICK_STALL_LOG adds a per-5s
+                    # progress line for live diagnosis.
+                    waited = 0.
+                    while not select.select([s], [], [], 5.0)[0]:
+                        waited += 5.
+                        if diag:
+                            logging.warning(
+                                "reactor: tick STALL awaiting 'done' from"
+                                " socket %d (%s) for advance %.6f mode %d"
+                                " (%.0fs, sim now %.6f)", i,
+                                self._tick_socket_paths[i], target, mode,
+                                waited, eventtime)
+                        if waited >= self._TICK_RECV_TIMEOUT:
+                            logging.error(
+                                "reactor: tick bridge on socket %d (%s) did"
+                                " not reply 'done' within %.0fs; ending"
+                                " (advance %.6f mode %d, sim %.6f)", i,
+                                self._tick_socket_paths[i],
+                                self._TICK_RECV_TIMEOUT, target, mode,
+                                eventtime)
+                            return None
+                    chunk = s.recv(64)
+                    if not chunk:
+                        if diag:
+                            logging.warning(
+                                "reactor: tick socket %d (%s) returned EOF"
+                                " awaiting 'done' for advance %.6f", i,
+                                self._tick_socket_paths[i], target)
+                        return None
+                    self._tick_recv_bufs[i] += chunk
+                line, self._tick_recv_bufs[i] = (
+                    self._tick_recv_bufs[i].split(b'\n', 1))
+            except OSError:
+                return None
+            if not line.startswith(b'done '):
+                return None
+            try:
+                actuals.append(float(line[5:]))
+            except ValueError:
+                return None
+        try:
+            result = min(actuals)
+        except ValueError:
+            return None
+        # Remember the slowest bridge for the next target computation above.
+        self._tick_last_actual = result
+        if self._tick_trace_fp is not None:
+            self._tick_trace_fp.write(
+                "%d %.9f %d %.9f\n" % (self._tick_trace_seq, target,
+                                       mode, result))
+            self._tick_trace_fp.flush()
+            self._tick_trace_seq += 1
+        return result
     # Main loop
     def _dispatch_loop(self):
         busy = True
@@ -319,16 +643,39 @@ class SelectReactor:
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = select.select(self._read_fds, self._write_fds, [], timeout)
+            in_tick = bool(self._tick_sockets)
+            wait_timeout = 0 if in_tick else timeout
+            res = select.select(self._read_fds, self._write_fds, [],
+                                wait_timeout)
             eventtime = self.monotonic()
-            if res[0] or res[1]:
+            after_fds = bool(res[0] or res[1])
+            if after_fds:
                 busy = True
                 hdls = ([(fd, self._READ) for fd in res[0]]
                         + [(fd, self._WRITE) for fd in res[1]])
+                # Drain first, unconditionally: the advance below must never
+                # run with a readable link still buffered (2.5 D-PRE).
                 eventtime = self._check_fds(eventtime, hdls)
+            # Consult the livelock guard on EVERY tick iteration, including
+            # ones that serviced an fd. It returns True on an fd iteration only
+            # when the stall limit is reached, so healthy runs are unaffected.
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                     after_fds):
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
     def run(self):
         if self._pipe_fds is None:
             self._setup_async_callbacks()
+        if not self._tick_sockets and self._tick_socket_paths:
+            self._tick_connect()
+        if (self._tick_sockets and self._tick_trace_fp is None
+                and os.environ.get('KLIPPY_TICK_TRACE')):
+            self._tick_trace_fp = open(
+                os.environ['KLIPPY_TICK_TRACE'] + '.klippy', 'w')
+            self._tick_trace_fp.write("# seq target mode actual\n")
         self._process = True
         self._prevent_pause_count = 0
         try:
@@ -341,6 +688,11 @@ class SelectReactor:
                 # Control returns here on end() request or switch from pause()
         finally:
             self._g_dispatch = None
+            if self._tick_stall_log and self._tick_socket_paths:
+                logging.warning(
+                    "reactor: tick livelock guard stats: max overdue"
+                    " streak=%d (limit=%d)",
+                    self._tick_stall_max, self._TICK_STALL_LIMIT)
     def end(self):
         self._process = False
     def finalize(self):
@@ -356,6 +708,7 @@ class SelectReactor:
             os.close(self._pipe_fds[0])
             os.close(self._pipe_fds[1])
             self._pipe_fds = None
+        self._tick_close()
 
 class PollReactor(SelectReactor):
     def __init__(self, gc_checking=False):
@@ -386,11 +739,23 @@ class PollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = self._poll.poll(int(math.ceil(timeout * 1000.)))
+            in_tick = bool(self._tick_sockets)
+            wait_ms = 0 if in_tick else int(math.ceil(timeout * 1000.))
+            res = self._poll.poll(wait_ms)
             eventtime = self.monotonic()
-            if res:
+            after_fds = bool(res)
+            if after_fds:
                 busy = True
+                # Drain first (2.5 D-PRE), then let the guard see this
+                # iteration - see _tick_decide_advance.
                 eventtime = self._check_fds(eventtime, res)
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                    after_fds):
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
 
 class EPollReactor(SelectReactor):
     def __init__(self, gc_checking=False):
@@ -421,11 +786,23 @@ class EPollReactor(SelectReactor):
         while self._process:
             timeout = self._check_timers(eventtime, busy)
             busy = False
-            res = self._epoll.poll(timeout)
+            in_tick = bool(self._tick_sockets)
+            wait_timeout = 0. if in_tick else timeout
+            res = self._epoll.poll(wait_timeout)
             eventtime = self.monotonic()
-            if res:
+            after_fds = bool(res)
+            if after_fds:
                 busy = True
+                # Drain first (2.5 D-PRE), then let the guard see this
+                # iteration - see _tick_decide_advance.
                 eventtime = self._check_fds(eventtime, res)
+            if in_tick and self._tick_decide_advance(timeout, eventtime,
+                                                    after_fds):
+                if self._tick_request_advance() is None:
+                    self.end()
+                    continue
+                eventtime = self.monotonic()
+                busy = True
 
 # Use the poll based reactor if it is available
 try:

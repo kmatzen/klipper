@@ -1,6 +1,12 @@
 # Test case for pwm
 CONFIG pwm.cfg
 DICTIONARY atmega2560.dict
+# NOTE: this test does not opt into the EMULATOR backend.  It issues
+# back-to-back SET_PIN ... CYCLE_TIME= changes that the real soft-PWM
+# firmware rejects with "Can not set soft pwm cycle ticks while
+# updates pending" (the same rejection a fast script hitting real
+# hardware would get).  Fileoutput's symbolic backend has no pending-
+# update queue, so the test validates the gcode-parser side only.
 
 # Hard PWM
 # Basic test

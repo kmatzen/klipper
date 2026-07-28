@@ -1,0 +1,14 @@
+{
+    "_comment": "End-to-end fixture for the Duet3 6HC (SAME70Q20B) over the REAL USB-CDC host link (same70q20b-usb build) in deterministic tick mode - the host link rides ARM tick lockstep through identify, unlike duet3_6hc.fixture.json which substitutes the serial-mode build. Same device emulation as duet3_6hc: spi_tmc enables the renode_hooks TMC SPI chain responder for the four TMC5160s on the shared usart1 SPI daisy-chain, and analog_in feeds the adc_scaled reference + thermistor channels on the SAME70 AFEC (afec_stub.py, AFEC1-local channels). USB-CDC tick identify is now fast enough because klippy/serialhdl.py registers the bounded need_prompt quantum for the renode pty.",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_vref": {"default_value": 8000, "channel": 9},
+        "_vssa": {"default_value": 100, "channel": 1},
+        "_bed": {"default_value": 7600, "channel": 2},
+        "_extruder": {"default_value": 7600, "channel": 4}
+    },
+    "spi_tmc": true,
+    "tick_mode": true
+}

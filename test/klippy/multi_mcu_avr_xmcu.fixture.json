@@ -1,0 +1,5 @@
+{
+    "_comment": "Drives test/klippy/multi_mcu_avr_xmcu.test under the EMULATOR multi-bridge fan-out with stepper_z on the second MCU (cross-MCU stepper routing). auto_trsync_trigger_ticks fires each stepper's endstop after 100 step edges so G28 completes; the fixture pusher routes the X/Y step_trigger commands to the main `mcu` bridge and Z's step_trigger to the `other` bridge based on each pin's MCU prefix. tick_mode is ON: the reactor drives both bridges in lockstep (one `advance T` broadcast, min actual), keeping the two clocks aligned deterministically (validated 15/15).",
+    "tick_mode": true,
+    "auto_trsync_trigger_ticks": 100
+}

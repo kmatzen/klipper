@@ -1,0 +1,26 @@
+# HC32F460 boot/connect smoke test. HDSC has no upstream Renode
+# CPU model and no upstream peripheral models for any of its blocks
+# - the chip is end-to-end reachable only through the local
+# hc32f460.repl plus the C# HC32F460_USART model
+# (test/emulator/repl/hc32f460_uart.cs, Roslyn-compiled into the
+# runtime via `i @file.cs` before LoadPlatformDescription) plus the
+# storeback stubs for INTC / PORT / PWC / SYSREG / EFM / AOS / MSTP
+# at the addresses the firmware writes during init. printers.test
+# reaches the chip via creality-ender2pro-hc32 / anycubic-kobra-go-2022
+# / anycubic-kobra-plus-2022 at config-parse depth; this is the
+# firmware-boot regression target for the C# UART and storeback path.
+# The PA3PA2 dict variant is used here (USART1 host link on
+# PA3/PA2); the PA7PA8 variant routes through the same .repl + C#
+# model so a separate test would not exercise additional infrastructure.
+DICTIONARY hc32f460-serial-PA3PA2.dict
+CONFIG hc32f460_smoke.cfg
+EMULATOR hc32f460_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

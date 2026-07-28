@@ -1,0 +1,7 @@
+{
+    "_comment": "spi_tmc switches the bridge's SPI hook to a TMC register file. Each 5-byte (tmc2130/5160/2240) or 3-byte (tmc2660) datagram is decoded; writes are stored, reads return the stored value. The bridge keys the register file off the active CS pin, so two TMC SPI chips on the same bus retain independent state (writes to A don't poison reads from B). Klippy's tmc.write_register / tmc.read_register verify pattern passes because each chip echoes its own write. The runner auto-emits spi_tmc_chip <port> <pin> <proto> per [tmcXXXX ...] section, so registrations happen transparently. analog_in_default stages the heater thermistor ADC (EPCOS 100K on PK5, 4700 pullup): without it the unset ADC reads 0 and the firmware shuts down with 'ADC out of range' before the DUMP_TMC reads run. 5000 maps inside the configured 0..250 C range.",
+    "spi_tmc": true,
+    "analog_in_default": {"default_value": 5000},
+    "auto_trsync_trigger_ticks": 160000,
+    "tick_mode": true
+}

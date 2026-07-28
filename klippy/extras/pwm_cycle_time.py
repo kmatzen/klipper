@@ -3,6 +3,7 @@
 # Copyright (C) 2017-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+from mcu import PWM_START_LEAD
 
 class MCU_pwm_cycle:
     def __init__(self, pin_params, cycle_time, start_value, shutdown_value):
@@ -23,9 +24,6 @@ class MCU_pwm_cycle:
         return self._mcu
     def _build_config(self):
         cmd_queue = self._mcu.alloc_command_queue()
-        curtime = self._mcu.get_printer().get_reactor().monotonic()
-        printtime = self._mcu.estimated_print_time(curtime)
-        self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         if self._shutdown_value not in [0., 1.]:
             raise self._mcu.get_printer().config_error(
@@ -44,14 +42,20 @@ class MCU_pwm_cycle:
             "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
             % (self._oid, cycle_ticks))
         self._cycle_ticks = cycle_ticks
-        svalue = int(self._start_value * cycle_ticks + 0.5)
-        self._mcu.add_config_cmd(
-            "queue_digital_out oid=%d clock=%d on_ticks=%d"
-            % (self._oid, self._last_clock, svalue), is_init=True)
         self._set_cmd = self._mcu.lookup_command(
             "queue_digital_out oid=%c clock=%u on_ticks=%u", cq=cmd_queue)
         self._set_cycle_ticks = self._mcu.lookup_command(
             "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u", cq=cmd_queue)
+        # Defer the first cycle to config-finalize; see
+        # mcu.MCU_pwm._send_initial_pwm for rationale.
+        self._mcu.register_post_init_callback(self._send_initial_pwm)
+    def _send_initial_pwm(self):
+        curtime = self._mcu.get_printer().get_reactor().monotonic()
+        printtime = self._mcu.estimated_print_time(curtime)
+        self._last_clock = self._mcu.print_time_to_clock(printtime
+                                                         + PWM_START_LEAD)
+        svalue = int(self._start_value * self._cycle_ticks + 0.5)
+        self._set_cmd.send([self._oid, self._last_clock, svalue])
     def set_pwm_cycle(self, print_time, value, cycle_time):
         clock = self._mcu.print_time_to_clock(print_time)
         minclock = self._last_clock

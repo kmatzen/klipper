@@ -1,0 +1,19 @@
+# STM32G0 boot/connect smoke test. Brings up the Renode stm32g0
+# backend end-to-end via the upstream @platforms/cpus/stm32g0.repl
+# (which ships its own RCC stub at 0x40021000). Distinct from the F1
+# path (local rcc_stub), the F4 path (STM32F4_RCC) and the H7 path
+# (STM32H7_RCC). printers.test reaches G0 chips (e.g. SKR Mini E3 v3,
+# STM32G0B1) at config-parse depth; this is the firmware-boot
+# regression target. Uses the stm32g0b1 build.
+DICTIONARY stm32g0b1.dict
+CONFIG stm32g0_smoke.cfg
+EMULATOR stm32g0_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

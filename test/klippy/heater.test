@@ -1,0 +1,28 @@
+# Test case for the closed-loop heater path: klippy's PID drives the
+# firmware's software-PWM heater pin, the bridge's thermal plant
+# converts the duty into an evolving thermistor ADC value, and
+# TEMPERATURE_WAIT gates on the measured temperature actually rising
+# (then falling after the target is dropped). REQUIRES_EMULATOR: the
+# assertions match klippy's periodic Stats lines, which only exist in
+# real-MCU mode (fileoutput has no stats loop; it also bypasses
+# TEMPERATURE_WAIT entirely, and there is no upstream fileoutput
+# heater test, so nothing degrades on stock CI). The first assertion
+# proves the plant heated into the wait window ([45,50] or the PID
+# overshoot above it) while the target was 50; the second proves it
+# decayed below 40 after the target was dropped to 0 - both are
+# impossible without the full closed loop (PWM duty -> plant -> ADC ->
+# PID) running.
+CONFIG heater.cfg
+DICTIONARY atmega2560.dict
+EMULATOR heater.fixture.json
+REQUIRES_EMULATOR
+EXPECT_LOG_CONTAINS "target=50 temp=(4[5-9]|5[0-9])\."
+EXPECT_LOG_CONTAINS "target=0 temp=(3[0-9])\."
+
+M104 S50
+TEMPERATURE_WAIT SENSOR=extruder MINIMUM=45
+
+M104 S0
+TEMPERATURE_WAIT SENSOR=extruder MAXIMUM=40
+
+G4 P2000

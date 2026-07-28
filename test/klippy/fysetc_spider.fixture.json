@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the FYSETC Spider (STM32F446) in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous USART1<->pty byte shuttle) so the firmware's clock advances at exactly CONFIG_CLOCK_FREQ instead of the wall-clock-bound free-running JIT rate. The four TMC2208s each have a dedicated single-wire UART pin (PE7/PE15/PD10/PD7); renode_hooks.sw_uart registers one state per pin and broadcasts the framed reply (always master-addressed) onto every registered RX pin, so klippy's sequential per-driver register init/read succeeds against a shared TMC register file. analog_in pins the two thermistor ADC channels to ~0.93 of full scale (raw 7600 / 8184) so both 100K thermistors read ~34 C - inside the extruder [0,250] and bed [0,130] ranges. PC0 = ADC1 channel 10 (extruder), PC3 = ADC1 channel 13 (bed); see src/stm32/adc.c adc_pins[]. Values are served by test/emulator/stm32_adc_stub.py (shared with F1).",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 10},
+        "_bed": {"default_value": 7600, "channel": 13}
+    },
+    "tick_mode": true
+}

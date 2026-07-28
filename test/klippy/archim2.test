@@ -1,0 +1,43 @@
+# End-to-end EMULATOR test: UltiMachine Archim2 (Atmel SAM3X8E) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2130s on software SPI, 2
+# software-PWM heaters, a fan, endstops, 2 thermistors) and round-trips
+# M114/M105. See "Per-printer tests" in test/emulator/README.md for the
+# shared conventions.
+#
+# Notable for reusing two existing pieces intact (sam3x_smoke covers
+# boot only):
+#   - The renode_hooks spi_tmc chain responder. These TMC2130s use
+#     software SPI, but software SPI still routes every datagram through
+#     the firmware's spidev_transfer (src/spicmds.c) - the single hw+sw
+#     SPI chokepoint - so the same PC-skip responder duet3_6hc and
+#     octopus_pro_h723 use serves these reads unchanged.
+#   - sam4s_adc_stub.py verbatim at the SAM3X base 0x400C0000:
+#     src/atsam/adc.c is shared between SAM3X and SAM4S and the ADC
+#     register map is identical. Hotend reads channel index 12 (PB19,
+#     ATC Semitec 104GT-2), bed index 13 (PB20, EPCOS 100K).
+DICTIONARY sam3x8e.dict
+CONFIG archim2.cfg
+EMULATOR archim2.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x30"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

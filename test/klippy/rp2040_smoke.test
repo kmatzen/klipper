@@ -1,0 +1,26 @@
+# RP2040 boot/connect smoke test. Klipper RP2040 firmware does not
+# share generic/armcm_timer.c with the rest of the renode-backed
+# Cortex-M ports - it drives the chip's own 64-bit 1MHz timer
+# (src/rp2040/timer.c against TIMER_BASE 0x40054000). This test
+# exercises that path end-to-end: the C# RP2040_Timer model
+# (test/emulator/repl/rp2040_timer.cs, Roslyn-compiled into the
+# runtime via `i @file.cs` before LoadPlatformDescription) plus the
+# four bit-set synthesis stubs for CLOCKS/RESETS/XOSC/PLL that
+# satisfy clock_setup's busy-wait loops. The RPi RP2040 has zero
+# upstream Renode coverage (no platform, no peripheral models), so
+# this is the only path. printers.test reaches rp2040 via
+# generic-bigtreetech-skr-pico-v1.0 at config-parse depth; this is
+# the firmware-boot regression target for the C# timer + clock
+# stub injection path.
+DICTIONARY rp2040.dict
+CONFIG rp2040_smoke.cfg
+EMULATOR rp2040_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

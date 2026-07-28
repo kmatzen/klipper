@@ -2329,6 +2329,13 @@ sensor_type: ldc1612
 #   value is typically only configured if the software reports a
 #   warning suggesting the value should be increased. The default is
 #   5000000.
+#data_rate:
+#   The LDC1612 conversion sample rate (in samples per second). The
+#   default is 400 and works on all supported MCUs. Boards whose host
+#   link cannot sustain the resulting bulk_sensor frame load (e.g. an
+#   AVR atmega2560 over a 250 kbaud serial link) can lower this value
+#   to recover the pre-2026 default of 250. Must be between 100 and
+#   1000.
 #descend_z:
 #   The nominal distance (in mm) between the nozzle and bed that a
 #   probing attempt should stop at. This parameter must be provided.

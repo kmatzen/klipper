@@ -18,4 +18,20 @@ config CLOCK_FREQ
     int
     default 200000000
 
+config PRU_HOST_BUILD
+    bool "Build PRU code against host gcc (test framework only)"
+    default n
+    help
+        Compile src/pru/ with the host gcc instead of pru-cgt:
+        pru-specific intrinsics, the IEP timer, the PRU INTC, the
+        GPIO MMIO regions, and SHARED_MEM are replaced by host-side
+        stubs (src/pru/host_pru.c + src/pru/host_inc/), and the
+        pru0 rpmsg shuttle is replaced by a pty-based console
+        bridge. The resulting binary is a host-arch process that
+        scripts/test_klippy.py spawns through the linuxprocess
+        backend. This option exists only to bring PRU under the
+        emulator-test framework - PRU is the only chip family in
+        scope without upstream Renode/QEMU CPU support. Do not
+        enable for production firmware builds.
+
 endif

@@ -1,6 +1,7 @@
 # Test case for bed_mesh tests
 CONFIG bed_mesh.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # Start by homing the printer.
 G28

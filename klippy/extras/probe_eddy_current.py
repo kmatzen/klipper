@@ -782,11 +782,15 @@ class EddyTap:
         self._last_tap = None
     # Setup for "tap" probe request
     def _setup_tap(self):
-        # Create sos filter "design"
+        # Create sos filter "design".  The lowpass+derivative cascade looks
+        # for a slope change at bed contact; a Bessel lowpass (constant
+        # group delay, no step-response overshoot) keeps the derivative
+        # from ringing at descent start, which would otherwise trip
+        # diff_peak_gt before contact on a near-noise-free count stream.
         cfg_error = self._printer.config_error
         sps = self._sensor_helper.get_samples_per_second()
         design = trigger_analog.DigitalFilter(sps, cfg_error)
-        design.add_lowpass(25.0, 4)
+        design.add_lowpass_bessel(25.0, 4)
         design.add_derivative()
         self._filter_design = design
         # Create SOS filter
@@ -905,6 +909,12 @@ class EddyTap:
         haltpos[2] += lift_dist
         retract_start_time = toolhead.get_last_move_time()
         toolhead.manual_move(haltpos, lift_speed)
+        # Force a non-lazy lookahead pass so the trapq + stepper history
+        # cover the analysis window before the sensor batch arrives;
+        # otherwise _lookup_toolhead_pos resolves early samples from a
+        # history still ending at haltpos. Real-HW-byte-identical: only
+        # moves the next step-generation pass a few ms earlier.
+        toolhead.get_last_move_time()
         # Extract retract samples
         start_time = retract_start_time - 0.010
         end_time = retract_start_time + 0.150

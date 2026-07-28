@@ -199,6 +199,12 @@ defs_serialqueue = """
         , uint64_t notify_id);
     void serialqueue_pull(struct serialqueue *sq
         , struct pull_queue_message *pqm);
+    void serialqueue_flush_ready(struct serialqueue *sq, double sendtime
+        , double horizon);
+    void serialqueue_tick_input(struct serialqueue *sq, double eventtime);
+    int serialqueue_tick_pull(struct serialqueue *sq
+        , struct pull_queue_message *pqm);
+    int serialqueue_need_prompt(struct serialqueue *sq);
     void serialqueue_set_wire_frequency(struct serialqueue *sq
         , double frequency);
     void serialqueue_set_receive_window(struct serialqueue *sq

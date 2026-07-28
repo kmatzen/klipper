@@ -1,0 +1,12 @@
+{
+    "_comment": "End-to-end fixture for the Duet2 WiFi/Eth (Atmel SAM4E8E) via renode in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous uart0<->pty byte shuttle), so the SAM4E DWT->CYCCNT clock advances at exactly CONFIG_CLOCK_FREQ (120 MHz, pinned in sam4e8e.repl) instead of the wall-clock-bound JIT rate that drifts in free-run (the same drift duet2_maestro fixes for SAM4S). spi_tmc + spi_tmc_chip (auto-emitted for the [tmc2660 ...] sections) switch renode_hooks.spidev_transfer into the TMC2660 3-byte-datagram sub-mode; it serves a non-zero RDSEL2 'se' field so the four TMC2660s init and their periodic check passes. The two EPCOS 100K thermistors read through the SAM4E AFEC0 (0x400B0000), served by test/emulator/afec_stub.py (the same stub SAME70 uses; src/atsam/sam4e_afec.c): analog_in pins each channel to raw 7600 / 8184 (~0.93 of full scale) so the extruder (channel index 7 = PC15) and bed (channel index 6 = PC13) both read ~36 C. Values reach the stub through renode_hooks adc_set, which pokes magic offsets 0x104+ch*4; the stub returns AFE_CDR for whichever channel AFE_CSELR last selected.",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 7},
+        "_bed": {"default_value": 7600, "channel": 6}
+    },
+    "spi_tmc": true,
+    "tick_mode": true
+}

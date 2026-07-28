@@ -1,0 +1,39 @@
+# Tick-mode lockstep regression
+#
+# Variant of emulator_smoke that opts into deterministic-time lockstep:
+# the bridge advances simavr only when klippy's reactor sends an
+# `advance T` over its tick socket, and klippy doesn't process timers
+# or fds past T until simavr has advanced there. This eliminates the
+# host-load timing skew that makes the parallel sim_time path flaky on
+# CPU-contended hosts. We reuse emulator_smoke.cfg unchanged - the
+# only difference is the fixture's `tick_mode: true` flag.
+#
+# This works end-to-end (5/5 on a clean host) after three simavr-tick
+# fixes that all had to land together:
+#   1. The bridge advances to the first cycle STRICTLY past the requested
+#      sim-time (+1) - truncating target*freq stopped the AVR a fraction
+#      of a cycle below a reactor.pause() wakeup, so the greenlet never
+#      fired and tick livelocked.
+#   2. A single-threaded synchronous host-link UART (simavr_bridge.c
+#      suart_*) replaces uart_pty's real-time pump thread in tick mode, so
+#      bytes move deterministically with each advance (no pump-vs-avr_run
+#      race / RX-FIFO loss).
+#   3. SIGPIPE is ignored - klippy closes the fixture control socket after
+#      pushing the fixture, and the control thread's later "OK" ack write
+#      hit EPIPE and SIGPIPE-killed the whole bridge mid-test, read as a
+#      spurious serial EOF on klippy's side.
+# REQUIRES_EMULATOR (assertions need real MCU responses); skipped, not
+# fileoutput-degraded, when no backend is built.
+CONFIG emulator_smoke.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_tick_mode.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

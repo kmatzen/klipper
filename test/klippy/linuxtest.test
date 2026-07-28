@@ -1,5 +1,10 @@
 # Tests for various temperature sensors
 DICTIONARY linuxprocess.dict
 CONFIG linuxtest.cfg
+EMULATOR linuxtest.fixture.json
 
 G4 P1000
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,31 @@
+# End-to-end EMULATOR test for the Duet3 6XD (SAME70Q20B) in
+# DETERMINISTIC TICK MODE. The 6XD is the EXTERNAL-driver Duet3 variant
+# (plain step/dir/enable, no onboard TMC), so unlike duet3_6hc it has no
+# TMC SPI - it exercises the SAME70 backend + adc_scaled vref/vssa-
+# compensated thermistor on the AFEC + steppers + endstops + software-
+# PWM heater/fans + interactive M114/M105 against real firmware.
+#
+# Companion to duet3_6hc.test (the onboard-TMC5160-SPI 6HC variant);
+# together they cover both Duet3 SAME70 board families named in PR §3.
+# Runs the serial-mode build (same70q20b.dict, UART2 host link) in tick
+# mode for the same reasons as duet3_6hc (USB tick byte-shuttle unstable,
+# free-run clocksync drifts under load). Motion-free.
+DICTIONARY same70q20b.dict
+CONFIG duet3_6xd.cfg
+EMULATOR duet3_6xd.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+G4 P1500
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

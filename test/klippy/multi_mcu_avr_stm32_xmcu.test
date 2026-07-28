@@ -1,0 +1,20 @@
+# Cross-architecture cross-MCU stepper validation -- atmega2560 X/Y +
+# stm32f103 Z. Like multi_mcu_avr_stm32.test, but stepper_z's pins
+# live on the renode-backed satellite via `other:`-prefixed pin
+# values. G28 has to home Z by emitting a step_trigger command on the
+# renode bridge's control socket (translated into a Python call to
+# renode_hooks.step_trigger() that registers a Renode GPIO StateChanged
+# hook), while X/Y step_triggers fire on the simavr bridge. If the
+# fixture pusher routes the Z step_trigger to the wrong bridge -- or
+# skips the prefixed pins entirely as the pre-MCU-aware pusher would
+# -- Z homing would hang until klippy's home_wait timeout fires.
+DICTIONARY atmega2560.dict other=stm32f103.dict
+CONFIG multi_mcu_avr_stm32_xmcu.cfg
+EMULATOR multi_mcu_avr_stm32_xmcu.fixture.json
+
+G28
+M114
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'other'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

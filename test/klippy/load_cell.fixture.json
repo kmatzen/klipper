@@ -1,0 +1,23 @@
+{
+    "_comment": "Drives load_cell.test under the simavr bridge. spi_ads1220 puts the bridge into ADS1220 register-file + continuous-conversion mode so the chip init's write-then-verify succeeds and continuous-mode reads serve real samples. The runner auto-emits a spi_ads1220_chip command per [load_cell ...] section so the bridge pulses each chip's data_ready_pin (PA1 for [load_cell my_ads1220], PJ3 for [load_cell_probe]) at the configured sample_rate (default 660 SPS) instead of holding it perpetually low - which the earlier gpio-fixture approach did and overflowed the firmware's wake-task drain under stepper load. config_overrides pins the parse-coverage-only [load_cell my_ads1220] chip to the ADS1220's minimum 20 SPS on the emulator's materialized copy (the shared cfg fileoutput CI parses stays byte-identical to upstream): two 660 SPS bulk streams genuinely exceed the AVR's 96-byte UART TX buffer (src/generic/serial_irq.c::console_sendf) - both sensors fill it back-to-back from one ads1220_capture_task tick, dropping every second sensor_bulk_data until the tare collector times out; production runs one ADS1220 per AVR. The runner parses sample rates from the materialized copy, so the bridge's DRDY pulse rate follows the override. load_cell_probe_trigger hooks the Z step pin (PL3) and synthesizes a ramped 24-bit sample = steps_in_burst * force_per_step on each ADS1220 read while Z is descending, returning 0 during quiet (tare) stretches. With counts_per_gram=100, force_per_step=50 means 0.5 g/step; at the configured probe_speed=10 mm/s on a 400 step/mm Z stepper that's 2000 g/s of ramp, crossing the default 75 g trigger about 38 ms into the descent - well before the 2000 g safety limit. auto_trsync_trigger_ticks fires the cartesian endstops on G28 so homing completes; analog_in supplies plausible thermistor readings for heater min/max checks. tick_mode runs the bridge in tick-socket lockstep with klippy on one simulated clock, so the probe ramp + trigger are deterministic regardless of host load (validated 15/15).",
+    "spi_ads1220": true,
+    "sim_time": true,
+    "auto_trsync_trigger_ticks": 160000,
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_hot_extruder_0": {
+            "default_value": 1200
+        }
+    },
+    "load_cell_probe_trigger": {
+        "z_step_pin": "PL3",
+        "reset_quiet_us": 50000,
+        "force_per_step": 50
+    },
+    "tick_mode": true,
+    "config_overrides": {
+        "load_cell my_ads1220": {"sample_rate": "20"}
+    }
+}

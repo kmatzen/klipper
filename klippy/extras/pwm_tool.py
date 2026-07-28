@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import chelper
+from mcu import PWM_START_LEAD
 
 class error(Exception):
     pass
@@ -28,6 +29,7 @@ class MCU_queued_pwm:
         self._last_clock = self._last_value = self._default_value = 0
         self._duration_ticks = 0
         self._pwm_max = 0.
+        self._set_cmd = None
         self._set_cmd_tag = None
         self._toolhead = None
         printer.register_event_handler("klippy:connect", self._handle_connect)
@@ -53,9 +55,6 @@ class MCU_queued_pwm:
             raise config_error("Pin with max duration must have start"
                                " value equal to shutdown value")
         cmd_queue = self._mcu.alloc_command_queue()
-        curtime = printer.get_reactor().monotonic()
-        printtime = self._mcu.estimated_print_time(curtime)
-        self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         if cycle_ticks >= 1<<31:
             raise config_error("PWM pin cycle time too large")
@@ -75,34 +74,37 @@ class MCU_queued_pwm:
                    self._start_value * self._pwm_max,
                    self._default_value, self._duration_ticks))
             self._last_value = int(self._start_value * self._pwm_max + 0.5)
-            self._mcu.add_config_cmd("queue_pwm_out oid=%d clock=%d value=%d"
-                                     % (self._oid, self._last_clock,
-                                        self._last_value),
-                                     on_restart=True)
-            self._set_cmd_tag = self._mcu.lookup_command(
-                "queue_pwm_out oid=%c clock=%u value=%hu",
-                cq=cmd_queue).get_command_tag()
-            return
-        # Software PWM
-        if self._shutdown_value not in [0., 1.]:
-            raise config_error("shutdown value must be 0.0 or 1.0 on soft pwm")
-        self._mcu.add_config_cmd(
-            "config_digital_out oid=%d pin=%s value=%d"
-            " default_value=%d max_duration=%d"
-            % (self._oid, self._pin, self._start_value >= 1.0,
-               self._shutdown_value >= 0.5, self._duration_ticks))
-        self._default_value = int(self._shutdown_value >= 0.5) * cycle_ticks
-        self._mcu.add_config_cmd(
-            "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
-            % (self._oid, cycle_ticks))
-        self._pwm_max = float(cycle_ticks)
-        self._last_value = int(self._start_value * self._pwm_max + 0.5)
-        self._mcu.add_config_cmd(
-            "queue_digital_out oid=%d clock=%d on_ticks=%d"
-            % (self._oid, self._last_clock, self._last_value), is_init=True)
-        self._set_cmd_tag = self._mcu.lookup_command(
-            "queue_digital_out oid=%c clock=%u on_ticks=%u",
-            cq=cmd_queue).get_command_tag()
+            self._set_cmd = self._mcu.lookup_command(
+                "queue_pwm_out oid=%c clock=%u value=%hu", cq=cmd_queue)
+        else:
+            # Software PWM
+            if self._shutdown_value not in [0., 1.]:
+                raise config_error(
+                    "shutdown value must be 0.0 or 1.0 on soft pwm")
+            self._mcu.add_config_cmd(
+                "config_digital_out oid=%d pin=%s value=%d"
+                " default_value=%d max_duration=%d"
+                % (self._oid, self._pin, self._start_value >= 1.0,
+                   self._shutdown_value >= 0.5, self._duration_ticks))
+            self._default_value = (int(self._shutdown_value >= 0.5)
+                                   * cycle_ticks)
+            self._mcu.add_config_cmd(
+                "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
+                % (self._oid, cycle_ticks))
+            self._pwm_max = float(cycle_ticks)
+            self._last_value = int(self._start_value * self._pwm_max + 0.5)
+            self._set_cmd = self._mcu.lookup_command(
+                "queue_digital_out oid=%c clock=%u on_ticks=%u", cq=cmd_queue)
+        self._set_cmd_tag = self._set_cmd.get_command_tag()
+        # Defer the first cycle to config-finalize; see
+        # mcu.MCU_pwm._send_initial_pwm for rationale.
+        self._mcu.register_post_init_callback(self._send_initial_pwm)
+    def _send_initial_pwm(self):
+        curtime = self._mcu.get_printer().get_reactor().monotonic()
+        printtime = self._mcu.estimated_print_time(curtime)
+        self._last_clock = self._mcu.print_time_to_clock(printtime
+                                                         + PWM_START_LEAD)
+        self._set_cmd.send([self._oid, self._last_clock, self._last_value])
     def _send_update(self, clock, val):
         self._last_clock = clock = max(self._last_clock, clock)
         self._last_value = val

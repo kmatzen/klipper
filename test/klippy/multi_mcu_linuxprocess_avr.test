@@ -1,0 +1,19 @@
+# Linux-host + AVR multi-MCU validation -- atmega2560 + linuxprocess.
+# Exercises the EMULATOR multi-bridge fan-out across two backends with
+# very different lifecycle shapes: simavr (cycle-accurate AVR sim with
+# control-socket fixture push) and linuxprocess (host-arch klipper.elf
+# that opens its own pty and runs with no fixture push at all). klippy
+# connects to both ptys in parallel and identifies each MCU
+# independently. Mirrors the Replicape pattern of using `host` as the
+# linuxprocess MCU name.
+DICTIONARY atmega2560.dict host=linuxprocess.dict
+CONFIG multi_mcu_linuxprocess_avr.cfg
+EMULATOR multi_mcu_linuxprocess_avr.fixture.json
+
+G28
+M114
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Loaded MCU 'host'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"

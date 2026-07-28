@@ -1,0 +1,46 @@
+# End-to-end EMULATOR test for the Duet3 6HC (SAME70Q20B) over its REAL
+# USB-CDC host link, in DETERMINISTIC TICK MODE. This is the USB-CDC
+# sibling of duet3_6hc.test: same duet3-6hc pin map, same four TMC5160s on
+# the shared usart1 SPI daisy-chain (chain_length 6, renode_hooks TMC SPI
+# chain responder), same adc_scaled vref/vssa-compensated AFEC thermistors,
+# same interactive gcode - but klippy connects over the synthetic USBHS
+# BULK_IN/BULK_OUT pipe (CONFIG_ATSAM_USB firmware, same70q20b-usb.dict)
+# instead of the serial-mode UART2 substitute.
+#
+# The real Duet3 6HC is USB+CAN only, so this exercises the host link the
+# board actually ships with. duet3_6hc.test had to fall back to the
+# serial-mode build because the SAME70 USB tick byte-shuttle was unusable
+# during identify: the renode pty advanced a full QMAX (100 ms) of
+# simulated time per host<->mcu round trip, so the identify dictionary scan
+# plus the SPI-chain / AFEC config phase took far too long in simulated
+# time and the link drifted. klippy/serialhdl.py now registers the
+# serialqueue_need_prompt predicate for every tick MCU (not just the simavr
+# AF_UNIX socket), so identify / clock-sync / config round trips advance at
+# the small QWAIT (8 ms) quantum and complete promptly over USB-CDC, while
+# streaming still coalesces at QMAX. Motion-free, as with the other
+# per-printer tests.
+DICTIONARY same70q20b-usb.dict
+CONFIG duet3_6hc.cfg
+EMULATOR duet3_6hc_usb.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x30"
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc spi"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

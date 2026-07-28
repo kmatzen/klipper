@@ -1,0 +1,20 @@
+# STM32F4 boot/connect smoke test. Brings up the Renode stm32f4
+# backend end-to-end: the local stm32f4.repl (upstream stm32f4.repl +
+# ADC1/2/3) plus upstream Miscellaneous.STM32F4_RCC is the F4-specific
+# path - distinct from the F1 path (stm32f103_smoke, local rcc_stub)
+# and the G0/H7 paths. printers.test reaches F4 chips via SKR-Pro /
+# Octopus-class boards at config-parse depth; this is the firmware-boot
+# regression target. Uses the stm32f446 build (F401/F405/F407/F446 all
+# share stm32f4.repl; F446 is the most common 3D-printer-board variant).
+DICTIONARY stm32f446.dict
+CONFIG stm32f4_smoke.cfg
+EMULATOR stm32f4_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

@@ -1,0 +1,45 @@
+# End-to-end EMULATOR test: synthetic SAMD21G18 (Cortex-M0+) printer
+# under Renode in tick mode. No shipped config/ board exists for this
+# chip, so this is the SAMD21 per-printer test in spirit: a
+# realistically-shaped cartesian pin map driven through the same
+# TMC-UART + ADC infrastructure the real-board tests use, where
+# samd21_smoke covers boot only. Clock is TC4-driven; host link is
+# SERCOM0 on PA10/PA11. See "Per-printer tests" in
+# test/emulator/README.md for the shared conventions.
+#
+# Ground specific to this chip:
+#   - TMC2209 multi-drop UART (uart_pin PA6 / tx_pin PA7, uart_address
+#     0..3). sw_uart._drive_rx drives the firmware RX bit through the
+#     SAMD21 PORT model (gpio_a.OnGPIO). First SAMD-family sw_uart
+#     test, so it also covers the renode_hooks CPU resolver accepting
+#     `cpu0` (the SAMD repls' name) as well as `cpu`.
+#   - samd21_adc_stub.py: the SAMD21 ADC register map differs from the
+#     SAMX5 one. Hotend reads channel index 4 (PA4), bed index 5 (PA5).
+#     A broken ADC sits at temp=0.0 with no shutdown, so the temp=3
+#     assertion below is the positive proof samples arrived.
+DICTIONARY samd21g18.dict
+CONFIG samd21_printer.cfg
+EMULATOR samd21_printer.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

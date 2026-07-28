@@ -1,0 +1,43 @@
+# End-to-end EMULATOR test: BIGTREETECH Octopus Pro v1.0 (STM32H723)
+# under Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC5160s on software SPI,
+# software-PWM heaters, fan, endstops, 2 thermistors) and round-trips
+# M114/M105. See "Per-printer tests" in test/emulator/README.md for the
+# shared conventions.
+#
+# Ground specific to this board:
+#   - SOFTWARE SPI TMC5160s. klipper's src/stm32/spi.c has no hardware
+#     SPI bus for MACH_STM32H7, so H7 boards bit-bang it. Both paths
+#     funnel through spidev_transfer (src/spicmds.c), which the
+#     renode_hooks TMC SPI chain responder hooks, so it serves the
+#     software path unchanged. IOIN version=0x30 proves the round trip.
+#   - H7 ADC via stm32h7_adc_stub.py, completing the ISR/CR/SQR1/DR
+#     handshake of src/stm32/stm32h7_adc.c. Upstream Renode models the
+#     H7 ADC with the F0-family Analog model, which neither matches that
+#     handshake nor returns controllable values, so stm32h723.repl omits
+#     it and the launcher maps this stub at 0x40022000 instead (the
+#     0x400 window also covers the ADC12 common CCR at +0x308).
+DICTIONARY stm32h723.dict
+CONFIG octopus_pro_h723.cfg
+EMULATOR octopus_pro_h723.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x30"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc spi"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc spi"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

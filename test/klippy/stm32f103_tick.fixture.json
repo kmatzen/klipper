@@ -1,0 +1,4 @@
+{
+    "_comment": "ARM tick-mode lockstep probe on STM32F103 (clean USART1, no analog/i2c). Deterministic-time variant of stm32f103_smoke to exercise the renode tick-socket byte shuttle.",
+    "tick_mode": true
+}

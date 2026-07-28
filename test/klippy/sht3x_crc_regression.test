@@ -1,0 +1,24 @@
+# Regression test for the SHT3X CRC bug where _split_bytes() drops a
+# leading-zero high byte and _crc8() therefore validates against a CRC
+# computed over the wrong number of bytes.
+#
+# The fixture's first scripted i2c read is bytes [0x00, 0x10, 0xc2]:
+#  - 0x0010 is the SHT3X status register reading after a soft reset
+#    (only the "system reset detected" bit, bit 4, is set)
+#  - 0xc2 is the correct CCITT-CRC8 of [0x00, 0x10] with poly=0x31
+#    init=0xff, as computed and emitted by a real SHT3X
+#
+# A correct sht3x driver computes _crc8([0x00, 0x10]) -> 0xc2 and the
+# values match. The buggy driver computes _crc8([0x10]) -> 0xef and
+# logs "sht3x: Reading status - checksum error!".
+#
+# This test fails on a klippy revision that still has the bug, and
+# passes once the fix from PR #1 is merged.
+CONFIG emulator_smoke.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_smoke.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "sht3x: Reading status - checksum error"
+EXPECT_LOG_NOT_CONTAINS "sht3x: Checksum error"

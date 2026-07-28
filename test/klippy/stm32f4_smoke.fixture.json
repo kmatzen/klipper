@@ -1,0 +1,3 @@
+{
+    "_comment": "Minimal fixture for the STM32F4 boot/connect smoke test. No analog_in / i2c / step_trigger entries - the test just verifies that the firmware boots through SystemInit (upstream Miscellaneous.STM32F4_RCC satisfies the HSE/PLL ready busy-waits), TIM2 advances generic/armcm_timer's view of the system clock, and klippy completes its identify + clocksync handshake over the USART1 pty Renode exposes. Uses the stm32f446 build (DICTIONARY stm32f446.dict)."
+}

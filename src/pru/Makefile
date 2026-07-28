@@ -1,5 +1,36 @@
 # Additional PRU build rules
 
+ifeq ($(CONFIG_PRU_HOST_BUILD),y)
+
+# Host-emulation build: produce a single host-arch klipper.elf that
+# contains the PRU pru1 firmware code (src/pru/main.c + gpio.c) plus
+# generic timer_irq, with a host-side replacement for the pru-cgt
+# intrinsics, the IEP timer, the PRU INTC and the pru0 rpmsg shuttle.
+# scripts/test_klippy.py treats the resulting linuxpru.dict as a
+# linuxprocess-style backend (host binary spawned with -I<slave-link>;
+# the binary creates the pty itself - see src/pru/host_pru.c).
+
+CROSS_PREFIX=
+
+dirs-y += src/pru src/generic
+
+# Force-include host_pru.h before every translation unit so the
+# PRU sources don't need per-file #include reshuffling, and add
+# host_inc/ to the include search path so `<pru/io.h>` and
+# `<pru_iep.h>` resolve to the host stubs (the real headers ship
+# with pru-cgt and aren't on the host gcc include path anyway).
+CFLAGS += -Isrc/pru/host_inc -include src/pru/host_pru.h
+CFLAGS_klipper.elf += -lpthread -lutil -lrt
+
+src-y += pru/main.c pru/gpio.c pru/host_pru.c generic/timer_irq.c
+# command.c (pulled in by src/Makefile) calls crc16_ccitt for the
+# message-block trailer; on real PRU that lives in the pru0 ELF
+# alongside command.c. The host build links command.c into the
+# single host ELF, so it needs crc16_ccitt.c too.
+src-y += generic/crc16_ccitt.c
+
+else
+
 # Setup the toolchain
 CROSS_PREFIX=pru-
 
@@ -40,3 +71,5 @@ $(OUT)pru1.elf: $(OUT)klipper.elf
 flash: $(OUT)pru0.elf $(OUT)pru1.elf
 	@echo "  Flashing"
 	$(Q)sudo ./scripts/flash-pru.sh
+
+endif

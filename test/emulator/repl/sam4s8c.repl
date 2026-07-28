@@ -1,0 +1,138 @@
+// SAM4S8C platform. Mirrors upstream Renode platforms/cpus/sam4s.repl
+// except the `adc` peripheral, which we replace with a Python stub
+// (test/emulator/sam4s_adc_stub.py) so renode_hooks.adc_default /
+// adc_set can drive per-channel overrides through magic-offset pokes
+// (same protocol as test/emulator/afec_stub.py for SAM4E/SAME70).
+// Without this, Renode's Analog.SAM4S_ADC returns 0 for every channel
+// and adc_scaled trips a divide-by-zero in klippy.
+//
+// SAM4S8B and SAM4S8C share the same 512KB flash + 128KB sram layout
+// so the flash/sram sizes here match sam4s8b.repl. The rest of the
+// peripherals (timers, USARTs, EEFC, PMC, GPIO, etc.) are copied
+// verbatim from upstream sam4s.repl - we can't `using` it because
+// Renode rejects re-declaring the same peripheral at the same address
+// from a derived file.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpu }
+    }
+    -> cpu@0
+    systickFrequency: 120000000
+
+// DWT frequency MUST match klipper's CONFIG_CLOCK_FREQ. The firmware
+// reads DWT->CYCCNT as its monotonic clock and converts ticks <->
+// microseconds via CONFIG_CLOCK_FREQ. Upstream sam4s.repl uses
+// 72000000 here, which leaves Renode advancing CYCCNT at 1/1.67 the
+// firmware-expected rate. In tick mode that gap accumulates into a
+// backlog of overdue timers in the firmware's view; the first
+// timer_dispatch_many sees `now - waketime > 1ms` and shutdowns with
+// static_string_id 58 ("Rescheduled timer in the past"). Pinning DWT
+// to CLOCK_FREQ aligns the two clocks.
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 120000000
+
+boot: Memory.MappedMemory @ sysbus 0x0
+    size: 0x400000
+
+flash: Memory.MappedMemory @ sysbus 0x400000
+    size: 0x80000
+
+rom: Memory.MappedMemory @ sysbus 0x800000
+    size: 0x400000
+
+sram_bb: Miscellaneous.BitBanding @ sysbus <0x22000000, 0x23FFFFFF>
+    peripheralBase: 0x20000000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000
+
+tc0_1_2: Timers.SAM_TC @ sysbus 0x40010000
+    [0-2]->nvic@[23-25]
+
+tc3_4_5: Timers.SAM_TC @ sysbus 0x40014000
+    [0-2]->nvic@[26-28]
+
+usart0: UART.SAM_USART @ sysbus 0x40024000
+    enablePdc: true
+    ->nvic@14
+
+usart1: UART.SAM_USART @ sysbus 0x40028000
+    enablePdc: true
+    ->nvic@15
+
+// Replaces Renode upstream's `adc: Analog.SAM4S_ADC @ sysbus 0x40038000`
+// with our Python stub. The launcher (renode_launcher.py) registers
+// this via the afec_block path keyed off _AFEC_BASES_FOR_CHIP['sam4s8c'].
+//
+// NB: upstream sam4s.repl has the adc declared at the same address.
+// We can't pull in upstream sam4s.repl (`using "..."`) here because
+// then both the SAM4S_ADC and our Python stub would try to claim
+// 0x40038000. Hence the verbatim copy of every other sam4s.repl
+// peripheral above.
+
+dacc: Miscellaneous.SAM4S_DACC @ sysbus 0x4003C000
+    ->nvic@30
+
+PMC_SR: Python.PythonPeripheral @ sysbus 0x400E0468
+    size: 0x4
+    initable: true
+    filename: "scripts/pydev/flipflop.py"
+
+uart0: UART.SAM_USART @ sysbus 0x400E0600
+    uartOnlyMode: true
+    enablePdc: true
+    ->nvic@8
+
+uart1: UART.SAM_USART @ sysbus 0x400E0800
+    uartOnlyMode: true
+    enablePdc: true
+    ->nvic@9
+
+eefc: Miscellaneous.SAM4S_EEFC @ sysbus 0x400E0A00
+    underlyingMemory: flash
+    ->nvic@6
+
+rstc: Miscellaneous.SAM4S_RSTC @ sysbus 0x400E1400
+
+wdt: Timers.SAM4S_WDT @ sysbus 0x400E1450
+    resetController: rstc
+    ->nvic@4
+
+peripheral_bb: Miscellaneous.BitBanding @ sysbus <0x42000000, 0x43FFFFFF>
+    peripheralBase: 0x40000000
+
+sram0: Memory.MappedMemory @ sysbus 0x60000000
+    size: 0x1000000
+
+sram1: Memory.MappedMemory @ sysbus 0x61000000
+    size: 0x1000000
+
+sram2: Memory.MappedMemory @ sysbus 0x62000000
+    size: 0x1000000
+
+sram3: Memory.MappedMemory @ sysbus 0x63000000
+    size: 0x1000000
+
+crc: CRC.SAM4S_CRCCU @ sysbus 0x40044000
+    ->nvic@32
+
+pioA: GPIOPort.SAM4S_PIO @ sysbus 0x400E0E00
+    ->nvic@11
+
+pioB: GPIOPort.SAM4S_PIO @ sysbus 0x400E1000
+    ->nvic@12
+
+pioC: GPIOPort.SAM4S_PIO @ sysbus 0x400E1200
+    ->nvic@13
+
+spi: SPI.SAM_SPI @ sysbus 0x40008000
+
+twi1: I2C.SAM4S_TWI @ sysbus 0x4001C000
+    -> nvic@20
+
+twi0: I2C.SAM4S_TWI @ sysbus 0x40018000
+    -> nvic@19

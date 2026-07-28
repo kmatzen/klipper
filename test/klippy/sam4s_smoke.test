@@ -1,0 +1,20 @@
+# SAM4S8C boot/connect smoke test. SAM4S is the only chip in the
+# Renode-backed scope whose platform comes entirely from upstream
+# Renode (platforms/cpus/sam4s8b.repl) - no local repl override and
+# no Python.PythonPeripheral stubs from renode_launcher.py. That
+# makes this the canary for upstream Renode SAM4S regressions: if
+# upstream changes its SAM4S_EEFC / SAM_USART / PMC_SR models in a
+# way that breaks the boot path, this test fails before any of the
+# locally-extended Atmel chips do.
+DICTIONARY sam4s8c.dict
+CONFIG sam4s_smoke.cfg
+EMULATOR sam4s_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

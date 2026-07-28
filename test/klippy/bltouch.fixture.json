@@ -1,0 +1,14 @@
+{
+    "_comment": "Drives bltouch.test under the simavr bridge. The test homes X/Y/Z (Z via the bltouch probe), exercises BLTOUCH_DEBUG/reset, runs BED_MESH_CALIBRATE (many probe points), then a single PROBE + QUERY_PROBE. The bridge's BLTouch state machine handles the deploy/arm cycle on PC5/PC7; auto_trigger_after_steps fires the sensor pin to triggered after 800 edges on the Z step pin (PL3) and the bridge's auto-rearm logic re-arms it on the BLTouch's between-probe sensor reset, so multi-point bed_mesh probing succeeds.",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "auto_trigger_after_steps": 800,
+    "auto_trsync_trigger_ticks": 6400000,
+    "bltouch": {
+        "control_pin": "PC5",
+        "sensor_pin": "PC7",
+        "invert": false
+    },
+    "tick_mode": true
+}

@@ -1,0 +1,48 @@
+# End-to-end EMULATOR test: BIGTREETECH SKR V1.4 (NXP LPC1768) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2208s, 2 software-PWM
+# heaters, fan, endstops, 2 thermistors) and round-trips M114/M105.
+# See "Per-printer tests" in test/emulator/README.md for the shared
+# conventions.
+#
+# Ground specific to this board:
+#   - SINGLE-WIRE-PER-DRIVER TMC UART: each TMC2208 has its own
+#     uart_pin (P1.10/P1.9/P1.8/P1.4, rx == tx, no multi-drop address).
+#     A TMC2208 request carries no pin identity, so renode_hooks.sw_uart
+#     broadcasts each framed reply to every registered RX pin; klippy
+#     initialises and reads the drivers sequentially, so the shared
+#     register file lines up and per-driver IFCNT verify passes.
+#   - IRQ-DRIVEN ADC: src/lpc176x/adc.c collects burst samples in
+#     ADC_IRQHandler, so nothing completes a read unless the interrupt
+#     fires. repl/lpc176x_adc.cs raises ADC_IRQn (nvic@22) per
+#     conversion. The temp=3 assertion below is the positive proof that
+#     the IRQ path delivered samples (a broken IRQ path reads temp=0.0
+#     with no shutdown).
+#   - test_klippy.py emits sw_uart for LPC "Pn.m" pin names, and
+#     sw_uart drives RX via the LPC fast-GPIO FIOPIN register.
+DICTIONARY lpc176x.dict
+CONFIG skr_v1_4.cfg
+EMULATOR skr_v1_4.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

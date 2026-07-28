@@ -1,0 +1,12 @@
+{
+    "_comment": "End-to-end fixture for the Duet3 6XD (SAME70Q20B) in deterministic tick mode. No TMC (external drivers), so no spi_tmc. analog_in feeds the adc_scaled reference + extruder thermistor on the SAME70 AFEC (afec_stub.py). SAME70 AFEC channels are AFEC1-LOCAL (global chan - 12; src/atsam/sam4e_afec.c afec_pins[]): vref_pin PC30 = global 17 -> local 5, vssa_pin PC13 = global 13 -> local 1, extruder PC29 = global 16 -> local 4. vref high / vssa low so (vref - vssa) != 0 (no ZeroDivisionError in adc_scaled); the extruder thermistor reads ~26 C - inside [0,285].",
+    "analog_in_default": {
+        "default_value": 5000
+    },
+    "analog_in": {
+        "_vref": {"default_value": 8000, "channel": 5},
+        "_vssa": {"default_value": 100, "channel": 1},
+        "_extruder": {"default_value": 7600, "channel": 4}
+    },
+    "tick_mode": true
+}

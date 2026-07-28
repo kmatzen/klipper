@@ -1,0 +1,20 @@
+# SAM4E8E boot/connect smoke test. The local sam4e8e.repl is the
+# only path - Renode upstream has no SAM4E platform, and using
+# upstream sam4s.repl as a base would have caused address conflicts
+# (SAM4E PIOD at 0x400E1400 vs SAM4S RSTC, SAM4E WDT at 0x400E1850
+# vs nothing on SAM4S, SAM4E AFEC0/AFEC1 vs SAM4S_ADC at a different
+# base). printers.test reaches sam4e8e via duet2 boards at config-
+# parse depth; this is the end-to-end firmware-boot regression
+# target for the chip's standalone repl + AFEC stub injection path.
+DICTIONARY sam4e8e.dict
+CONFIG sam4e_smoke.cfg
+EMULATOR sam4e_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

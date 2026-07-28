@@ -1,0 +1,23 @@
+# Smoke test for the in-process MCU emulator
+#
+# Drives klippy in real-mcu mode against the test/emulator package:
+# klippy connects to the emulator over a pty, exchanges identify+
+# clocksync, finalizes config, and exercises the SHT3X i2c sensor with
+# scripted responses. The fixture supplies CRC-correct bytes so the
+# sensor reports valid temperatures.
+#
+# This test only runs when the host can compile klippy's chelper module
+# (Linux today; the protocol code itself is OS-independent).
+CONFIG emulator_smoke.cfg
+DICTIONARY atmega2560.dict
+EMULATOR emulator_smoke.fixture.json
+REQUIRES_EMULATOR  # assertions depend on real MCU responses;
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

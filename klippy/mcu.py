@@ -3,14 +3,30 @@
 # Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, zlib, logging, math, struct
+import sys, os, stat, zlib, logging, math, struct
 import serialhdl, msgproto, pins, chelper, clocksync
 
 class error(Exception):
     pass
 
+def _is_unix_socket(path):
+    # The MCU emulator can present its host link as a Unix domain socket
+    # (a synchronous transport - see serialhdl.connect_unix) rather than a
+    # tty/pty. Detect that so _attach() uses connect_unix(). Inert on real
+    # hardware: a real serial port is a character device, never a socket.
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
 # Minimum time host needs to get scheduled events queued into mcu
 MIN_SCHEDULE_TIME = 0.100
+# Lead between the post-init send of the first PWM cycle command and the
+# clock at which that cycle fires. Only needs to cover the
+# "post-init-send -> firmware-process-command" latency (sub-millisecond
+# on real hardware, ~one tick stride in the deterministic emulator) plus
+# the serialqueue's minimum pre-transmit horizon.
+PWM_START_LEAD = 0.200
 # The maximum number of clock cycles an MCU is expected
 # to schedule into the future, due to the protocol and firmware.
 MAX_SCHEDULE_TICKS = (1<<31) - 1
@@ -217,7 +233,7 @@ class MCU_trsync:
         state_tag = state_cmd.get_command_tag()
         ffi_main, ffi_lib = chelper.get_ffi()
         self._trdispatch_mcu = ffi_main.gc(ffi_lib.trdispatch_mcu_alloc(
-            self._trdispatch, mcu._serial.get_serialqueue(), # XXX
+            self._trdispatch, mcu.get_serial().get_serialqueue(),
             self._cmd_queue, self._oid, set_timeout_tag, trigger_tag,
             state_tag), ffi_lib.free)
     def _shutdown(self):
@@ -482,9 +498,6 @@ class MCU_pwm:
             raise pins.error("Pin with max duration must have start"
                              " value equal to shutdown value")
         cmd_queue = self._mcu.alloc_command_queue()
-        curtime = self._mcu.get_printer().get_reactor().monotonic()
-        printtime = self._mcu.estimated_print_time(curtime)
-        self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
         mdur_ticks = self._mcu.seconds_to_clock(self._max_duration)
         if mdur_ticks > MAX_SCHEDULE_TICKS:
@@ -499,35 +512,39 @@ class MCU_pwm:
                 % (self._oid, self._pin, cycle_ticks,
                    self._start_value * self._pwm_max,
                    self._shutdown_value * self._pwm_max, mdur_ticks))
-            svalue = int(self._start_value * self._pwm_max + 0.5)
-            self._mcu.add_config_cmd("queue_pwm_out oid=%d clock=%d value=%d"
-                                     % (self._oid, self._last_clock, svalue),
-                                     on_restart=True)
             self._set_cmd = self._mcu.lookup_command(
                 "queue_pwm_out oid=%c clock=%u value=%hu", cq=cmd_queue)
-            return
-        # Software PWM
-        if self._shutdown_value not in [0., 1.]:
-            raise pins.error("shutdown value must be 0.0 or 1.0 on soft pwm")
-        if cycle_ticks > MAX_SCHEDULE_TICKS:
-            raise pins.error("PWM pin cycle time too large")
-        self._mcu.request_move_queue_slot()
-        self._oid = self._mcu.create_oid()
-        self._mcu.add_config_cmd(
-            "config_digital_out oid=%d pin=%s value=%d"
-            " default_value=%d max_duration=%d"
-            % (self._oid, self._pin, self._start_value >= 1.0,
-               self._shutdown_value >= 0.5, mdur_ticks))
-        self._mcu.add_config_cmd(
-            "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
-            % (self._oid, cycle_ticks))
-        self._pwm_max = float(cycle_ticks)
-        svalue = int(self._start_value * cycle_ticks + 0.5)
-        self._mcu.add_config_cmd(
-            "queue_digital_out oid=%d clock=%d on_ticks=%d"
-            % (self._oid, self._last_clock, svalue), is_init=True)
-        self._set_cmd = self._mcu.lookup_command(
-            "queue_digital_out oid=%c clock=%u on_ticks=%u", cq=cmd_queue)
+        else:
+            # Software PWM
+            if self._shutdown_value not in [0., 1.]:
+                raise pins.error(
+                    "shutdown value must be 0.0 or 1.0 on soft pwm")
+            if cycle_ticks > MAX_SCHEDULE_TICKS:
+                raise pins.error("PWM pin cycle time too large")
+            self._mcu.request_move_queue_slot()
+            self._oid = self._mcu.create_oid()
+            self._mcu.add_config_cmd(
+                "config_digital_out oid=%d pin=%s value=%d"
+                " default_value=%d max_duration=%d"
+                % (self._oid, self._pin, self._start_value >= 1.0,
+                   self._shutdown_value >= 0.5, mdur_ticks))
+            self._mcu.add_config_cmd(
+                "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
+                % (self._oid, cycle_ticks))
+            self._pwm_max = float(cycle_ticks)
+            self._set_cmd = self._mcu.lookup_command(
+                "queue_digital_out oid=%c clock=%u on_ticks=%u", cq=cmd_queue)
+        # Defer the first PWM cycle until config-finalize; PWM_START_LEAD
+        # then bounds post-init-send -> firmware-process latency only,
+        # not config flush latency.
+        self._mcu.register_post_init_callback(self._send_initial_pwm)
+    def _send_initial_pwm(self):
+        curtime = self._mcu.get_printer().get_reactor().monotonic()
+        printtime = self._mcu.estimated_print_time(curtime)
+        self._last_clock = self._mcu.print_time_to_clock(printtime
+                                                         + PWM_START_LEAD)
+        svalue = int(self._start_value * self._pwm_max + 0.5)
+        self._set_cmd.send([self._oid, self._last_clock, svalue])
     def next_aligned_print_time(self, print_time, allow_early=0.):
         # Filter cases where there is no need to sync anything
         if self._hardware_pwm:
@@ -861,6 +878,9 @@ class MCUConnectHelper:
                 nodeid = cbid.get_nodeid(self._serialport)
                 self._serial.connect_canbus(self._serialport, nodeid,
                                             self._canbus_iface)
+            elif _is_unix_socket(self._serialport):
+                # MCU emulator host link over a synchronous Unix socket.
+                self._serial.connect_unix(self._serialport)
             elif self._baud:
                 rts = self._restart_helper.lookup_attach_uart_rts()
                 self._serial.connect_uart(self._serialport, self._baud, rts)
@@ -1166,6 +1186,12 @@ class MCU:
         return self._name
     def get_printer(self):
         return self._printer
+    def get_serial(self):
+        # Public accessor for the low-level SerialReader (e.g. MCU_trsync
+        # needs the serialqueue to wire trdispatch). The MCU owns the
+        # serial via its MCUConnectHelper; expose it rather than have
+        # callers reach into the private _serial attribute.
+        return self._serial
     def is_fileoutput(self):
         return self._printer.get_start_args().get('debugoutput') is not None
     # MCU Configuration wrappers
@@ -1175,6 +1201,8 @@ class MCU:
         return self._config_helper.create_oid()
     def register_config_callback(self, cb):
         self._config_helper.register_config_callback(cb)
+    def register_post_init_callback(self, cb):
+        self._config_helper.register_post_init_callback(cb)
     def add_config_cmd(self, cmd, is_init=False, on_restart=False):
         self._config_helper.add_config_cmd(cmd, is_init, on_restart)
     def request_move_queue_slot(self):

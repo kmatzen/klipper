@@ -277,9 +277,10 @@ class PrinterMotionQueuing:
             curtime = self.reactor.monotonic()
             est_print_time = self.mcu.estimated_print_time(curtime)
             wait_time = flush_time - est_print_time - DRIP_TIME
-            if wait_time > 0. and self.can_pause:
+            wait_until = curtime + wait_time
+            if wait_time > 0. and wait_until > curtime and self.can_pause:
                 # Pause before sending more steps
-                drip_completion.wait(curtime + wait_time)
+                drip_completion.wait(wait_until)
                 continue
             flush_time = min(flush_time + DRIP_SEGMENT_TIME, end_time)
             self.note_mcu_movequeue_activity(flush_time)

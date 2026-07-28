@@ -1,0 +1,44 @@
+# End-to-end EMULATOR test: BIGTREETECH SKR Pico v1.0 (RP2040) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2209s, 2 software-PWM
+# heaters, 3 fans, endstops, 2 thermistors) and round-trips M114/M105.
+# See "Per-printer tests" in test/emulator/README.md for the shared
+# conventions.
+#
+# Ground specific to this board:
+#   - TMC2209 multi-drop UART (four drivers sharing gpio9/gpio8,
+#     distinguished by uart_address 0/2/1/3). Replies are always
+#     master-addressed, so renode_hooks.sw_uart serves every address
+#     from one register file; DUMP_TMC reads addr 0 and addr 3.
+#   - test_klippy.py emits sw_uart for RP2040 "gpioN" pin names, and
+#     sw_uart drives RX via the SIO GPIO_IN register (0xD0000004),
+#     because RP2040 GPIO is a plain storeback region.
+#   - rp2040_adc_stub.py: the local rp2040.repl leaves 0x4004C000
+#     unmapped, so without the stub thermistor reads never complete.
+#   - RP2040 keeps time with Timers.RP2040_Timer, a virtual-time model,
+#     so (unlike the STM32F1 DWT) it needs no frequency pin under tick.
+DICTIONARY rp2040.dict
+CONFIG skr_pico.cfg
+EMULATOR skr_pico.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

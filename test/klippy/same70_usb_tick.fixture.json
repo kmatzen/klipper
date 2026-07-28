@@ -1,0 +1,4 @@
+{
+    "_comment": "Deterministic tick-mode variant of same70_usb_smoke: the SAME70Q20B USB-CDC host link driven under tick lockstep instead of free-run. Proves the renode/ARM tick byte-shuttle now survives identify over USB-CDC, once the bounded need_prompt quantum is honored for the renode pty (klippy/serialhdl.py registers serialqueue_need_prompt for every tick MCU, not just the simavr socket) so the identify dictionary scan advances at the small QWAIT quantum rather than a full QMAX per host<->mcu round trip.",
+    "tick_mode": true
+}

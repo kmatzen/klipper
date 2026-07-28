@@ -1,0 +1,35 @@
+# End-to-end EMULATOR test: Duet2 Maestro (SAM4S) under Renode in tick
+# mode. Boots real firmware, completes identify + clocksync, brings up
+# the full config (4 TMC2208s, 2 software-PWM heaters, fan, endstops,
+# adc_scaled) and round-trips M114/M105. See "Per-printer tests" in
+# test/emulator/README.md for the conventions shared by these tests.
+#
+# Ground specific to this board:
+#   - sw_uart drives PA9 RX from CPU-PC hooks on tmcuart_read_event
+#     (the firmware uses separate uart_pin/tx_pin, not single-wire).
+#   - sam4s_adc_stub.py replaces Renode's read-only Analog.SAM4S_ADC so
+#     per-channel vref/vssa overrides land and adc_scaled has a divisor.
+#   - The local sam4s8c.repl pins DWT.frequency to CONFIG_CLOCK_FREQ.
+#   - renode_launcher early-binds the control socket so the fixture
+#     pusher hits a listening socket while Renode is still booting.
+DICTIONARY sam4s8c.dict
+CONFIG duet2_maestro.cfg
+EMULATOR duet2_maestro.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'stepper_x'"
+EXPECT_LOG_CONTAINS "Enabling TMC virtual enable for 'extruder'"
+EXPECT_LOG_NOT_CONTAINS "ZeroDivisionError"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

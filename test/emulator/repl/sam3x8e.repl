@@ -1,0 +1,86 @@
+// Renode platform description for ATSAM3X8E (Cortex-M3).
+//
+// Renode upstream has no SAM3X platform and no SAM3-specific
+// peripheral models in renode-infrastructure (search:repo:renode/
+// renode-infrastructure SAM3 returns 0). The SAM3X system controller
+// shares the basic Atmel UART/PMC/EEFC register layout with the
+// SAM4 family, but lives at different base addresses:
+//
+//   SAM3X        SAM4S/SAM4E
+//   PMC   0x400E0600   0x400E0400   (SAM3X is +0x200 inside SC)
+//   UART  0x400E0800   0x400E0600 (SAM4E) / 0x400E0800 (SAM4S UART1)
+//   EFC0  0x400E0A00   0x400E0A00 (same)
+//   EFC1  0x400E0C00   - (SAM4E has only single EFC)
+//   ADC   0x400C0000   0x40038000 (SAM4S) / 0x400B0000 (SAM4E AFEC0)
+//
+// Standalone with only what klipper SAM3X firmware drives:
+// CPU + NVIC + DWT + memory (boot mirror at 0x0 + flash at
+// 0x00080000 + sram at 0x20000000) + UART (single, unnumbered;
+// host link on PA8/PA9) + PMC_SR flipflop (SystemInit's
+// MOSCXTS/MOSCSELS/MCKRDY/LOCKA waits) + EFC0/EFC1
+// (bootloader_request reads EFC0->EEFC_FSR.FRDY; the SAM4S_EEFC
+// model raises FRDY=1 by default, and the EEFC register layout is
+// family-uniform so the SAM4S model serves SAM3X correctly).
+//
+// klipper SAM3X uses generic/armcm_timer.c (DWT + SysTick), so no
+// chip-specific timer modeling is needed. Watchdog, MATRIX, RSTC,
+// RTC writes go to unmapped addresses (0x400E1A00..0x400E1A60) and
+// produce harmless log warnings; the firmware never reads them
+// back to gate progress.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m3"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+    systickFrequency: 84000000
+
+dwt: Miscellaneous.DWT @ sysbus 0xE0001000
+    frequency: 84000000
+
+// SAM3X8E: 512KB flash linked at 0x00080000 (klipper's
+// CONFIG_FLASH_APPLICATION_ADDRESS for MACH_SAM3X). The boot
+// region at 0x0 is a placeholder so stray accesses don't fault;
+// Renode's LoadELF sets the CPU PC to the ELF entry point so the
+// boot mirror itself never executes. Sized to 512KB so it covers
+// the full address window the SAM3X boot ROM mirrors flash into.
+boot: Memory.MappedMemory @ sysbus 0x0
+    size: 0x80000
+
+flash: Memory.MappedMemory @ sysbus 0x80000
+    size: 0x80000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x18000
+
+// PMC_SR is a status-bit register that klipper's SAM3X SystemInit
+// busy-waits on (lib/sam3x/gcc/system_sam3xa.c). flipflop.py
+// alternates 0/0xFFFFFFFF between reads, so every "is bit X set"
+// check eventually sees a non-zero readback and the wait loops
+// complete. PMC base on SAM3X is 0x400E0600 (vs 0x400E0400 on
+// SAM4), so PMC_SR (offset 0x68) lands at 0x400E0668.
+PMC_SR: Python.PythonPeripheral @ sysbus 0x400E0668
+    size: 0x4
+    initable: true
+    filename: "scripts/pydev/flipflop.py"
+
+uart: UART.SAM_USART @ sysbus 0x400E0800
+    uartOnlyMode: true
+    enablePdc: true
+    ->nvic@8
+
+// SAM3X has TWO flash controllers (EFC0 / EFC1, 256KB each) where
+// SAM4E has just one. SystemInit writes both EEFC_FMR registers;
+// bootloader_request only reads EFC0->EEFC_FSR.FRDY but EFC1's
+// presence is required so the second FMR write doesn't go to
+// unmapped (would log a warning but not break the boot - we still
+// model it for parity with real silicon and to keep the log
+// clean). Both back into the same flash region; klipper doesn't
+// hit a partition boundary in test scope.
+eefc0: Miscellaneous.SAM4S_EEFC @ sysbus 0x400E0A00
+    underlyingMemory: flash
+    ->nvic@6
+eefc1: Miscellaneous.SAM4S_EEFC @ sysbus 0x400E0C00
+    underlyingMemory: flash
+    ->nvic@7

@@ -1,0 +1,21 @@
+# SAM3X8E boot/connect smoke test. The local sam3x8e.repl is the
+# only path - Renode upstream has no SAM3X platform and no SAM3-
+# specific peripheral models. The repl reuses the SAM4S_EEFC model
+# (EEFC register layout is family-uniform across SAM3X / SAM4S /
+# SAM4E) and the PMC_SR flipflop pattern. Both sam3x8c and sam3x8e
+# point at this same repl in renode_launcher.py so the test exercises
+# the shared path. printers.test reaches sam3x8e via radds + alligator
+# / archim2 boards, but only at config-parse depth; this is the
+# end-to-end firmware-boot regression target.
+DICTIONARY sam3x8e.dict
+CONFIG sam3x_smoke.cfg
+EMULATOR sam3x_smoke.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

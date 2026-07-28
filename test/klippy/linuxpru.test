@@ -1,0 +1,20 @@
+# PRU host-emulation boot/connect smoke test. Klipper's PRU port
+# has no upstream Renode/QEMU coverage (the TI PRU instruction set
+# isn't modelled by either), so we instead build src/pru/ against
+# host gcc and replace the pru-cgt intrinsics + IEP timer + PRU INTC
+# + pru0 rpmsg shuttle with the host-side stubs in
+# src/pru/host_pru.c. linuxpru.dict is dispatched through the
+# linuxprocess backend (the binary opens its own pty and symlinks
+# the slave end to -I<slave-link>, same shape as src/linux/console.c).
+DICTIONARY linuxpru.dict
+CONFIG linuxpru.cfg
+EMULATOR linuxpru.fixture.json
+
+M114
+M105
+M105
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

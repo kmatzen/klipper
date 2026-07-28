@@ -1,0 +1,11 @@
+{
+    "_comment": "End-to-end fixture for the BIGTREETECH SKR mini E3 v2.0 (STM32F103) in DETERMINISTIC TICK MODE. tick_mode puts klippy and Renode in lockstep over the tick socket (one `emulation RunFor` per klippy `advance T`, with a synchronous USART1<->pty byte shuttle) so the firmware's clock advances at exactly CONFIG_CLOCK_FREQ instead of the wall-clock-bound free-running JIT rate - the same mechanism stm32f103_tick / duet2_maestro use. The four TMC2209s share a single software-UART bus (PC11 rx / PC10 tx) and are addressed by multi-drop uart_address; renode_hooks.sw_uart attaches CPU PC hooks at tmcuart_read_event etc and bit-drives the framed response (always master-addressed 0xff), so klippy's per-driver IFCNT-verified register init succeeds against a shared TMC register file. analog_in pins the two thermistor ADC channels to ~0.93 of full scale (raw 7600 / 8184) so both 100K thermistors read ~34 C - comfortably inside the extruder [0,250] and bed [0,130] ranges, no 'ADC out of range'. PA0 = ADC1 channel 0 (extruder), PC3 = ADC1 channel 13 (bed); see src/stm32/adc.c adc_pins[].",
+    "analog_in_default": {
+        "default_value": 7600
+    },
+    "analog_in": {
+        "_extruder": {"default_value": 7600, "channel": 0},
+        "_bed": {"default_value": 7600, "channel": 13}
+    },
+    "tick_mode": true
+}

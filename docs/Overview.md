@@ -76,6 +76,9 @@ communication with the Klipper developers.
   format.
 - [Debugging](Debugging.md): Information on how to test and debug
   Klipper.
+- [MCU Emulator](MCU_Emulator.md): A real-firmware MCU emulator test
+  framework (simavr / Renode / linuxprocess / PRU host build) used by
+  the test/klippy regression suite.
 - [Benchmarks](Benchmarks.md): Information on the Klipper benchmark
   method.
 - [Contributing](CONTRIBUTING.md): Information on how to submit

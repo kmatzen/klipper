@@ -1,0 +1,36 @@
+# End-to-end EMULATOR test: Anycubic Kobra Go (HDSC HC32F460) under
+# Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 plain step/dir steppers, 2
+# software-PWM heaters, fans, endstops, 2 thermistors) and reads both
+# thermistors. See "Per-printer tests" in test/emulator/README.md for
+# the shared conventions.
+#
+# The Kobra Go has no Trinamic drivers, so there is no TMC round-trip
+# here; the new ground (hc32f460_smoke covers boot only) is the HC32 ADC:
+# hc32f460_adc_stub.py serves M4_ADC1 @ 0x40040000. klipper's
+# src/hc32f460/adc.c kicks a conversion by writing STR=1, polls
+# ISR.EOCAF, then reads the 16-bit DRn result (DR0 @ 0x50, channel index
+# = (off-0x50)/2). The HC32 ADC layout matches no upstream Renode model
+# and hc32f460.repl maps no ADC, so the stub is the only thing at that
+# base. A broken ADC sits at temp=0.0 with no shutdown, so the temp=3
+# assertion below is the positive proof samples arrived. Hotend reads
+# channel 13 (PC3, ATC Semitec 104GT-2), bed channel 11 (PC1, EPCOS).
+DICTIONARY hc32f460-serial-PA3PA2.dict
+CONFIG anycubic_kobra_go.cfg
+EMULATOR anycubic_kobra_go.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+G4 P2000
+M105
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "temp=3"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"

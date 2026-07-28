@@ -26,7 +26,14 @@
 #define R31_WRITE_IRQ_SELECT (1<<5)
 #define R31_WRITE_IRQ_OFFSET 16
 
+#ifdef CONFIG_PRU_HOST_BUILD
+// Host build collapses the dual-PRU memory map into a single
+// process address space; the XOR'd alias from PRU1 to PRU0's
+// scratchpad becomes a plain identity.
+#define ALT_PRU_PTR(ptr) (ptr)
+#else
 #define ALT_PRU_PTR(ptr) ((typeof(ptr))((uint32_t)(ptr) ^ 0x2000))
+#endif
 
 // Layout of shared memory
 struct shared_mem {
@@ -44,7 +51,12 @@ struct shared_mem {
 #define SIGNAL_PRU0_WAITING 0xefefefef
 #define SIGNAL_PRU1_READY   0xabababab
 
+#ifdef CONFIG_PRU_HOST_BUILD
+extern struct shared_mem _host_shared_mem;
+#define SHARED_MEM (&_host_shared_mem)
+#else
 #define SHARED_MEM ((struct shared_mem *)0x10000)
+#endif
 
 // Hardware ADC registers
 struct beaglebone_adc {
@@ -75,6 +87,11 @@ struct beaglebone_adc {
     uint32_t fifo1data;
 };
 
+#ifdef CONFIG_PRU_HOST_BUILD
+extern struct beaglebone_adc _host_adc;
+#define ADC (&_host_adc)
+#else
 #define ADC ((struct beaglebone_adc *)0x44e0d000)
+#endif
 
 #endif // internal.h

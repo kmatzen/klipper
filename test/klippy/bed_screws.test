@@ -1,6 +1,7 @@
 # Test case for bed screws helper tool
 CONFIG bed_screws.cfg
 DICTIONARY atmega2560.dict
+EMULATOR ../emulator/empty_fixture.json
 
 # Start helper script and then abort it
 G28

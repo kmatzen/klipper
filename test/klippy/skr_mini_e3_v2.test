@@ -1,0 +1,45 @@
+# End-to-end EMULATOR test: BIGTREETECH SKR mini E3 v2.0 (STM32F103)
+# under Renode in tick mode. Boots real firmware, completes identify +
+# clocksync, brings up the full config (4 TMC2209s, 2 software-PWM
+# heaters, 2 fans, endstops, 2 thermistors) and round-trips M114/M105.
+# See "Per-printer tests" in test/emulator/README.md for the shared
+# conventions.
+#
+# Ground specific to this board:
+#   - TMC2209 MULTI-DROP UART: all four drivers share one software-UART
+#     bus (PC11 rx / PC10 tx), distinguished by uart_address (0/2/1/3)
+#     in the datagram rather than a select-pin mux. Replies are always
+#     master-addressed (sync=0x05, addr=0xff) per the TMC datasheet, so
+#     renode_hooks.sw_uart serves every address from one shared register
+#     file; per-driver IFCNT write-verify still lines up because klippy
+#     initialises the drivers sequentially. DUMP_TMC reads addr 0
+#     (stepper_x) and addr 3 (extruder), both ends of the range.
+#   - Plain (non-adc_scaled) thermistors on ADC1 channel 0 (PA0) and 13
+#     (PC3) via stm32_adc_stub.py, which completes klipper's F1
+#     SWSTART -> STRT/EOC -> SQR3/DR handshake (upstream Renode's
+#     Analog.STM32_ADC does not, so every heater would read temp=0.0).
+DICTIONARY stm32f103.dict
+CONFIG skr_mini_e3_v2.cfg
+EMULATOR skr_mini_e3_v2.fixture.json
+REQUIRES_EMULATOR  # deterministic-time lockstep needs the real backend
+
+M114
+M105
+DUMP_TMC STEPPER=stepper_x
+DUMP_TMC STEPPER=extruder
+
+EXPECT_LOG_CONTAINS "Loaded MCU 'mcu'"
+EXPECT_LOG_CONTAINS "Configured MCU 'mcu'"
+EXPECT_LOG_CONTAINS "DUMP_TMC stepper_x"
+EXPECT_LOG_CONTAINS "DUMP_TMC extruder"
+EXPECT_LOG_CONTAINS "version=0x21"
+EXPECT_LOG_NOT_CONTAINS "failed to init"
+EXPECT_LOG_NOT_CONTAINS "Unable to read tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Unable to write tmc uart"
+EXPECT_LOG_NOT_CONTAINS "Internal error"
+EXPECT_LOG_NOT_CONTAINS "Got EOF when reading from device"
+EXPECT_LOG_NOT_CONTAINS "failed to init: Timeout"
+EXPECT_LOG_NOT_CONTAINS "ADC out of range"
+EXPECT_LOG_NOT_CONTAINS "Timer too close"
+EXPECT_LOG_NOT_CONTAINS "Rescheduled timer in the past"
+EXPECT_LOG_NOT_CONTAINS "Klippy is shutdown"
