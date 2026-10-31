@@ -57,8 +57,11 @@ class ClockSync:
         serial.set_clock_est(freq, self.reactor.monotonic(), 0)
     # MCU clock querying (_handle_clock is invoked from background thread)
     def _get_clock_event(self, eventtime):
-        self.serial.raw_send(self.get_clock_cmd, 0, 0, self.cmd_queue)
-        self.queries_pending += 1
+        # Bound queued queries if the MCU stops responding. A late response
+        # resets queries_pending and allows polling to resume.
+        if self.is_active():
+            self.serial.raw_send(self.get_clock_cmd, 0, 0, self.cmd_queue)
+            self.queries_pending += 1
         # Use an unusual time for the next event so clock messages
         # don't resonate with other periodic events.
         return eventtime + .9839
